@@ -1,0 +1,28 @@
+# 编译产物
+*.exe
+*.dll
+*.pdb
+bin/
+obj/
+
+# 构建脚本：忽略其他 bat，但保留随仓库分发的 build.bat（README 引用了它）
+*.bat
+!build.bat
+
+# 临时文件
+*.tmp
+*.log
+*~
+
+# IDE
+.vs/
+.vscode/
+.trae/
+*.user
+*.suo
+
+# Qoder 本地 skill（含私人令牌，勿提交）
+.qoder/
+
+# 敏感配置
+config.json
