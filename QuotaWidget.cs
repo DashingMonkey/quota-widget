@@ -1,4 +1,4 @@
-﻿// QuotaWidget - AI 额度悬浮窗 (GLM Coding Plan + MiniMax Token Plan)
+// QuotaWidget - AI 额度悬浮窗 (GLM Coding Plan / MiniMax Token Plan / Kimi Code Plan / DeepSeek 余额)
 // 编译: csc.exe /nologo /utf8output /target:winexe /optimize+ /win32icon:QuotaWidget.ico /out:QuotaWidget.exe QuotaWidget.cs /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll
 using System;
 using System.Collections;
@@ -548,7 +548,11 @@ namespace QuotaWidget
                 Used = used,
                 Remaining = remaining
             };
-            pool.Percent = pool.Total > 0 ? (int)Math.Round(pool.Used / pool.Total * 100) : 0;
+            // Kimi 字段本身即 0-100 百分制：Percent 直接取 Used，与文字展示的 Remaining 同刻度；
+            // 若按 used/limit 换算（used=30/limit=60 → 50%），进度条与"剩余 30%"文字会互相矛盾
+            pool.Percent = pool.PercentOnly
+                ? (int)Math.Round(pool.Used)
+                : (pool.Total > 0 ? (int)Math.Round(pool.Used / pool.Total * 100) : 0);
             if (pool.Percent < 0) pool.Percent = 0;
             if (pool.Percent > 100) pool.Percent = 100;
             if (J.HasKey(d, "resetTime"))
@@ -1005,21 +1009,27 @@ namespace QuotaWidget
             try { OnLayeredPaint(_g); }
             catch { /* 避免绘制异常导致窗口消失 */ }
 
-            IntPtr screenDc = GetDC(IntPtr.Zero);
-            IntPtr memDc = CreateCompatibleDC(screenDc);
-            IntPtr hBmp = _bmp.GetHbitmap(Color.FromArgb(0));
-            IntPtr oldBmp = SelectObject(memDc, hBmp);
-            var blend = new BLENDFUNCTION { BlendOp = AC_SRC_OVER, SourceConstantAlpha = LayeredAlpha, AlphaFormat = AC_SRC_ALPHA };
-            var size = new Size(Width, Height);
-            var ptDst = new Point(Left, Top);
-            var ptSrc = new Point(0, 0);
-            try { UpdateLayeredWindow(Handle, screenDc, ref ptDst, ref size, memDc, ref ptSrc, 0, ref blend, ULW_ALPHA); }
+            // 句柄获取全部纳入 try/finally：GetHbitmap 在 GDI 紧张时可抛 OutOfMemoryException，
+            // 若获取步骤在 try 外，异常路径会泄漏 screenDc/memDc；本方法每秒执行，泄漏持续累积
+            IntPtr screenDc = IntPtr.Zero, memDc = IntPtr.Zero, hBmp = IntPtr.Zero, oldBmp = IntPtr.Zero;
+            try
+            {
+                screenDc = GetDC(IntPtr.Zero);
+                memDc = CreateCompatibleDC(screenDc);
+                hBmp = _bmp.GetHbitmap(Color.FromArgb(0));
+                oldBmp = SelectObject(memDc, hBmp);
+                var blend = new BLENDFUNCTION { BlendOp = AC_SRC_OVER, SourceConstantAlpha = LayeredAlpha, AlphaFormat = AC_SRC_ALPHA };
+                var size = new Size(Width, Height);
+                var ptDst = new Point(Left, Top);
+                var ptSrc = new Point(0, 0);
+                UpdateLayeredWindow(Handle, screenDc, ref ptDst, ref size, memDc, ref ptSrc, 0, ref blend, ULW_ALPHA);
+            }
             finally
             {
-                SelectObject(memDc, oldBmp);
-                DeleteObject(hBmp);
-                DeleteDC(memDc);
-                ReleaseDC(IntPtr.Zero, screenDc);
+                if (oldBmp != IntPtr.Zero && memDc != IntPtr.Zero) SelectObject(memDc, oldBmp);
+                if (hBmp != IntPtr.Zero) DeleteObject(hBmp);
+                if (memDc != IntPtr.Zero) DeleteDC(memDc);
+                if (screenDc != IntPtr.Zero) ReleaseDC(IntPtr.Zero, screenDc);
             }
         }
 
@@ -1052,6 +1062,8 @@ namespace QuotaWidget
         public NotifyIcon Tray;
         private SettingsForm _settings;
         private TopBarForm _topBar;
+        private bool _exiting;
+        internal bool IsExiting { get { return _exiting; } }
 
         // 懒加载置顶栏（仅在首次切换到 topbar 模式时创建）
         public TopBarForm TopBar
@@ -1071,6 +1083,9 @@ namespace QuotaWidget
         public AppContext()
         {
             Cfg = Config.Load();
+            // 上次崩溃/强杀残留的工作区预留：启动时无条件清理（此前仅进入 topbar 模式才清，
+            // float 模式启动会让"桌面变矮"的残留一直留着）
+            try { TopBarForm.CleanupStartupResidue(); } catch { }
             Floating = new FloatingForm(this);
 
             Tray = new NotifyIcon
@@ -1150,6 +1165,12 @@ namespace QuotaWidget
             // 仅创建窗口句柄，使后台线程能通过 BeginInvoke 回到 UI 线程
             var h = Floating.Handle;
             RefreshData();
+            // 任何退出路径（含未处理异常对话框选"退出"）都兜底恢复工作区；RestoreWorkArea 以
+            // _originalLoaded 哨兵保证幂等，正常退出链路已恢复过时此处为空操作
+            Application.ApplicationExit += delegate
+            {
+                if (_topBar != null) { try { _topBar.UnregisterAppBar(); } catch { } }
+            };
         }
 
         public void ShowSettings()
@@ -1226,12 +1247,18 @@ namespace QuotaWidget
                 {
                     Floating.BeginInvoke((Action)delegate
                     {
-                        Providers = list;
-                        Floating.Rebuild();
-                        if (_topBar != null && _topBar.Visible) _topBar.Rebuild();
-                        UpdateTrayTip();
-                        if (_firstShow) { _firstShow = false; ShowActiveForm(); }
-                        Interlocked.Exchange(ref _fetching, 0);
+                        // 回调体自包 try/finally：外层 catch 只覆盖 BeginInvoke 分发本身，
+                        // 回调内异常（如 GDI OOM / 退出竞态）若不复位 _fetching，此后所有
+                        // 刷新在重入检查处直接 return，自动刷新静默永久失效
+                        try
+                        {
+                            Providers = list;
+                            Floating.Rebuild();
+                            if (_topBar != null && _topBar.Visible) _topBar.Rebuild();
+                            UpdateTrayTip();
+                            if (_firstShow) { _firstShow = false; ShowActiveForm(); }
+                        }
+                        finally { Interlocked.Exchange(ref _fetching, 0); }
                     });
                 }
                 catch { Interlocked.Exchange(ref _fetching, 0); }
@@ -1265,6 +1292,9 @@ namespace QuotaWidget
 
         public void ExitApp()
         {
+            // 防重入：Floating.Close() 会再次触发 OnFormClosing 路由回此处
+            if (_exiting) return;
+            _exiting = true;
             if (_topBar != null) _topBar.UnregisterAppBar();
             Tray.Visible = false;
             Floating.Close();
@@ -1393,6 +1423,9 @@ namespace QuotaWidget
             _refreshTimer.Stop();
             _refreshTimer.Interval = Math.Max(15, cfg.RefreshSec) * 1000;
             _refreshTimer.Start();
+            // 从置顶栏模式切回时 _uiTimer 处于停止态（SuspendTimers 所停），必须在此重启；
+            // 构造函数里的 Start() 只执行一次，缺了这行倒计时/托盘 tip 将永久冻结
+            _uiTimer.Start();
 
             if (St.IsPointOnScreen(new Point(cfg.X, cfg.Y)))
             {
@@ -1411,6 +1444,18 @@ namespace QuotaWidget
         {
             _uiTimer.Stop();
             _refreshTimer.Stop();
+        }
+
+        // Alt+F4 / WM_CLOSE 走正规退出流程（清理托盘图标与工作区），否则消息循环直接结束、
+        // ExitApp 被跳过，托盘留下幽灵图标；ExitApp 内部通过 IsExiting 防止二次路由
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            base.OnFormClosing(e);
+            if (e.CloseReason == CloseReason.UserClosing && !_ctx.IsExiting)
+            {
+                e.Cancel = true;
+                _ctx.ExitApp();
+            }
         }
 
         public void Rebuild()
@@ -2089,6 +2134,48 @@ namespace QuotaWidget
             catch { }
         }
 
+        // 运行中热插显示器：屏数变化时重采集快照。旧屏沿用已保存的原始值（按 Bounds 包含
+        // 关系匹配，容忍屏幕顺序变化），新屏按当前 WorkingArea 入册（本程序从未预留过该屏，
+        // 当前值即原始值）
+        private static void RefreshOriginalWorkAreasForScreenChange()
+        {
+            if (!_originalLoaded) return;
+            var screens = Screen.AllScreens;
+            if (screens.Length == _originalWorkAreas.Count) return;
+            var used = new bool[_originalWorkAreas.Count];
+            var list = new List<Rectangle>();
+            foreach (var s in screens)
+            {
+                int hit = -1;
+                for (int i = 0; i < _originalWorkAreas.Count; i++)
+                {
+                    if (used[i]) continue;
+                    var b = s.Bounds;
+                    var r = _originalWorkAreas[i];
+                    if (r.Left >= b.Left && r.Top >= b.Top && r.Right <= b.Right && r.Bottom <= b.Bottom) { hit = i; break; }
+                }
+                if (hit >= 0) { used[hit] = true; list.Add(_originalWorkAreas[hit]); }
+                // 未命中兜底走净化而非直接取 WorkingArea：同屏重应用时该屏可能仍带着本程序
+                // 的 bar 预留，直接采集会把预留态烙进"原始值"，退出后顶部永久缺一条 bar 高度
+                else list.Add(SanitizeOriginalArea(s));
+            }
+            _originalWorkAreas = list;
+            SaveOriginalWorkAreas();
+        }
+
+        // 启动时无条件清理上次崩溃/强杀残留的 bar 预留（残留文件存在才动作，正常退出无文件则空操作）；
+        // 此前仅进入 topbar 模式才清，float 模式启动会永远留着"桌面变矮"的残留
+        public static void CleanupStartupResidue()
+        {
+            if (!File.Exists(WorkAreaFile)) return;
+            LoadOriginalWorkAreas();
+            foreach (var s in Screen.AllScreens)
+                ResetWorkAreaForScreen(s);
+            try { File.Delete(WorkAreaFile); } catch { }
+            _originalWorkAreas = null;
+            _originalLoaded = false;
+        }
+
         // 净化疑似残留的工作区：顶部留白超出任务栏高度的部分视为上次 bar 预留残留，
         // 将 Top 修回 Bounds.Top + 任务栏在该屏顶部的占位（任务栏不在该屏顶部时记 0）。
         // 仅在检测到上次异常退出（WorkAreaFile 存在）时调用，正常运行不修正，
@@ -2153,7 +2240,10 @@ namespace QuotaWidget
             int idx = -1;
             for (int i = 0; i < screens.Length; i++)
                 if (screens[i].Bounds == screen.Bounds) { idx = i; break; }
-            var r = (idx >= 0 && idx < orig.Count) ? orig[idx] : screen.Bounds;
+            // 索引未命中（分辨率/屏数变化导致快照错位）时跳过恢复：
+            // 用全屏 Bounds 兜底会抹掉任务栏预留，直到 explorer 重算才恢复
+            if (idx < 0 || idx >= orig.Count) return;
+            var r = orig[idx];
             var full = new RECT { Left = r.Left, Top = r.Top, Right = r.Right, Bottom = r.Bottom };
             SystemParametersInfo(SPI_SETWORKAREA, 0, ref full, 0);
             ReflowMaximizedWindows(screen, r);
@@ -2169,11 +2259,13 @@ namespace QuotaWidget
             var orig = LoadOriginalWorkAreas();
             var origRect = (screenIndex >= 0 && screenIndex < orig.Count) ? orig[screenIndex] : bounds;
 
+            // 基于原始工作区（含任务栏预留）收缩而非全屏 Bounds：任务栏贴顶/贴左/贴右时，
+            // Left/Top/Right 保持任务栏占位，仅顶部为 bar 下压，预留结果不吞任务栏区域
             var newRect = new RECT
             {
-                Left = bounds.Left,
-                Top = bounds.Top + _barHeight,
-                Right = bounds.Right,
+                Left = origRect.Left,
+                Top = origRect.Top + _barHeight,
+                Right = origRect.Right,
                 Bottom = origRect.Bottom
             };
 
@@ -2213,6 +2305,9 @@ namespace QuotaWidget
             if (_reservedScreen >= 0 && _reservedScreen != screenIndex)
                 ClearWorkArea(_reservedScreen);
 
+            // 运行中热插显示器：屏数变化时重采集快照，新增屏按当前工作区入册，避免索引错位
+            RefreshOriginalWorkAreasForScreenChange();
+
             // 首次应用：加载/持久化原始工作区；若检测到上次崩溃残留（文件已存在），先恢复所有屏到原始值
             if (!_startupCleaned)
             {
@@ -2229,9 +2324,12 @@ namespace QuotaWidget
             var screen = GetScreen(screenIndex);
             _scale = GetScreenDpi(screen) / 96f;
             _barHeight = (int)(BaseBarHeight * _scale); // 与原实现一致：int 截断（125% 屏为 47px）
-            Width = screen.Bounds.Width;
+            // 位置与宽度基于原始工作区（含任务栏预留）：任务栏贴顶/贴左时置于任务栏内侧，不遮挡任务栏
+            var origAreas = LoadOriginalWorkAreas();
+            var origRect = (screenIndex >= 0 && screenIndex < origAreas.Count) ? origAreas[screenIndex] : screen.Bounds;
+            Width = origRect.Width;
             Height = _barHeight;
-            Location = new Point(screen.Bounds.Left, screen.Bounds.Top);
+            Location = new Point(origRect.Left, origRect.Top);
             _currentScreen = screenIndex;
             // 详情面板跟随目标屏 DPI（跨缩放屏切换时尺寸一致）
             _detail.DpiScale = GetScreenDpi(screen) / 96f;
@@ -2255,7 +2353,9 @@ namespace QuotaWidget
             // 窗口半透明：置顶栏为普通窗口，用 Form.Opacity（悬浮窗/详情窗为分层窗口，走 LayeredAlpha）
             Opacity = pct / 100.0;
             _detail.LayeredAlpha = (byte)(255 * pct / 100);
-            _detail.TopMost = true;
+            // 置顶栏同样消费"窗口置顶"配置（此前硬编码 true，取消勾选后设置静默失效）
+            TopMost = cfg.TopMost;
+            _detail.TopMost = cfg.TopMost;
 
             _refreshTimer.Stop();
             _refreshTimer.Interval = Math.Max(15, cfg.RefreshSec) * 1000;
@@ -2451,6 +2551,19 @@ namespace QuotaWidget
 
         public void ArmHide() { _hideTimer.Stop(); _hideTimer.Start(); }
         public void CancelHide() { _hideTimer.Stop(); }
+
+        // Alt+F4 / WM_CLOSE：恢复工作区并转为隐藏（与托盘左键切换行为一致），
+        // 避免绕过 UnregisterAppBar 导致系统工作区顶部永久残留一条 bar 高度
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            base.OnFormClosing(e);
+            if (e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                UnregisterAppBar();
+                Hide();
+            }
+        }
 
         protected override void Dispose(bool disposing)
         {
@@ -2776,7 +2889,7 @@ namespace QuotaWidget
             // 刷新间隔行
             var secRow = new Panel { Width = contentWidth, Height = S(36) };
             var lblInterval = new Label { Text = "刷新间隔（秒）", AutoSize = false, Bounds = new Rectangle(0, 0, S(120), S(36)), TextAlign = ContentAlignment.MiddleLeft };
-            _numInterval = new NoWheelNumericUpDown { Minimum = 15, Maximum = 3600, Value = Math.Max(15, _ctx.Cfg.RefreshSec), Increment = 15, Bounds = new Rectangle(S(120), S(8), S(100), S(26)) };
+            _numInterval = new NoWheelNumericUpDown { Minimum = 15, Maximum = 3600, Value = Math.Max(15, Math.Min(3600, _ctx.Cfg.RefreshSec)), Increment = 15, Bounds = new Rectangle(S(120), S(8), S(100), S(26)) };
             secRow.Controls.Add(lblInterval);
             secRow.Controls.Add(_numInterval);
             flow.Controls.Add(secRow);
@@ -2784,7 +2897,7 @@ namespace QuotaWidget
             // 不透明度行
             var opRow = new Panel { Width = contentWidth, Height = S(44) };
             var lblO = new Label { Text = "窗口不透明度", AutoSize = false, Bounds = new Rectangle(0, 0, S(120), S(44)), TextAlign = ContentAlignment.MiddleLeft };
-            _trkOpacity = new TrackBar { Minimum = 50, Maximum = 100, Value = _ctx.Cfg.OpacityPct, TickFrequency = 10, Bounds = new Rectangle(S(120), S(4), contentWidth - S(120) - S(50), S(36)) };
+            _trkOpacity = new TrackBar { Minimum = 50, Maximum = 100, Value = Math.Max(50, Math.Min(100, _ctx.Cfg.OpacityPct)), TickFrequency = 10, Bounds = new Rectangle(S(120), S(4), contentWidth - S(120) - S(50), S(36)) };
             _lblOpacity = new Label { Text = _ctx.Cfg.OpacityPct + "%", AutoSize = false, Bounds = new Rectangle(contentWidth - S(50), 0, S(50), S(44)), TextAlign = ContentAlignment.MiddleLeft };
             _trkOpacity.ValueChanged += delegate { _lblOpacity.Text = _trkOpacity.Value + "%"; };
             opRow.Controls.Add(_lblOpacity);
@@ -2863,11 +2976,18 @@ namespace QuotaWidget
                     int gridRow = _grid != null && _grid.CurrentRow != null ? _grid.CurrentRow.Index : -1;
 
                     SuspendLayout();
-                    // 先 Dispose 再 Clear：WinForms 控件无终结器，仅 Clear() 会泄漏 HWND/GDI 资源
-                    foreach (Control c in Controls) c.Dispose();
-                    Controls.Clear();
-                    BuildLayout();
-                    ResumeLayout(true);
+                    try
+                    {
+                        // 先快照再 Dispose：Dispose 会把控件从 Controls 移除，直接 foreach 枚举会因
+                        // 集合被修改抛 InvalidOperationException（被外层 catch 吞掉后重建中断、按钮
+                        // 区永久丢失）。快照后逐个 Dispose 仍是为避免仅 Clear() 泄漏 HWND/GDI 资源
+                        var snapshot = new Control[Controls.Count];
+                        Controls.CopyTo(snapshot, 0);
+                        foreach (Control c in snapshot) c.Dispose();
+                        Controls.Clear();
+                        BuildLayout();
+                    }
+                    finally { ResumeLayout(true); }
 
                     // 回填重建前的编辑状态
                     _numInterval.Value = Math.Max(15, Math.Min(3600, interval));
@@ -2893,7 +3013,9 @@ namespace QuotaWidget
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
-            if (e.Button == MouseButtons.Left) { _drag = true; _dragOffset = e.Location; }
+            // 偏移取屏幕坐标系（MousePosition - Location）：标题栏被 WM_NCHITTEST 转为客户区后
+            // 点击标题栏时 e.Location.Y 为负，若用客户区偏移对屏幕坐标运算，首次移动窗口跳变
+            if (e.Button == MouseButtons.Left) { _drag = true; _dragOffset = new Point(MousePosition.X - Left, MousePosition.Y - Top); }
         }
         protected override void OnMouseMove(MouseEventArgs e)
         {
