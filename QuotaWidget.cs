@@ -20,7 +20,7 @@ namespace QuotaWidget
     // ============================= 应用信息 =============================
     internal static class AppInfo
     {
-        public const string Version = "1.1.3";
+        public const string Version = "1.1.5";
     }
 
     // ============================= 数据模型 =============================
@@ -127,6 +127,10 @@ namespace QuotaWidget
             // 从旧格式迁移：如果 Providers 为空但旧字段有值，则迁移
             if ((cfg.Providers == null || cfg.Providers.Count == 0) && cfg.HasLegacyKeys())
                 cfg.MigrateLegacy();
+            // "Providers": null 是合法 JSON，反序列化后仍为 null 且无旧 Key 可迁移；
+            // 不归一化的话 RefreshData 在线程池线程访问 Providers.Count 抛 NRE，
+            // 未处理异常直接终止进程，形成启动即崩的死循环，用户无法进入设置页自救
+            if (cfg.Providers == null) cfg.Providers = new List<ProviderConfig>();
             // 主题字段为空时默认浅色
             if (string.IsNullOrEmpty(cfg.Theme)) cfg.Theme = "light";
             return cfg;
@@ -147,7 +151,8 @@ namespace QuotaWidget
             GlmKey = ""; GlmRegion = "cn"; MxKey = ""; MxRegion = "cn";
         }
 
-        public void Save()
+        /// 保存成功返回 true；失败（磁盘满/文件被占用等）返回 false，供调用方提示用户
+        public bool Save()
         {
             try
             {
@@ -158,8 +163,9 @@ namespace QuotaWidget
                 File.WriteAllText(tmp, ser.Serialize(this), Encoding.UTF8);
                 if (File.Exists(FilePath)) File.Replace(tmp, FilePath, null);
                 else File.Move(tmp, FilePath);
+                return true;
             }
-            catch (Exception ex) { System.Diagnostics.Debug.WriteLine("配置保存失败: " + ex.Message); }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine("配置保存失败: " + ex.Message); return false; }
         }
 
         public static void SetAutoStart(bool on)
@@ -200,6 +206,14 @@ namespace QuotaWidget
     // ============================= 查询服务 =============================
     internal static class QuotaService
     {
+        // 携带 HTTP 状态码的查询异常（当前作为错误信息载体；待验证 MiniMax 两端点鉴权一致后，
+        // 可据此对 401/403 做跳过回退的短路优化）
+        private class HttpException : Exception
+        {
+            public readonly int StatusCode;
+            public HttpException(int statusCode, string message) : base(message) { StatusCode = statusCode; }
+        }
+
         private static string HttpGet(string url, string authorization)
         {
             var req = (HttpWebRequest)WebRequest.Create(url);
@@ -218,15 +232,19 @@ namespace QuotaWidget
             catch (WebException we)
             {
                 string body = "";
+                int status = 0;
                 try
                 {
                     if (we.Response != null)
+                    {
+                        status = (int)((HttpWebResponse)we.Response).StatusCode;
                         using (var sr = new StreamReader(we.Response.GetResponseStream(), Encoding.UTF8))
                             body = sr.ReadToEnd();
+                    }
                 }
                 catch { }
                 if (!string.IsNullOrEmpty(body) && body.Length > 300) body = body.Substring(0, 300);
-                throw new Exception(string.IsNullOrEmpty(body) ? we.Message : body);
+                throw new HttpException(status, string.IsNullOrEmpty(body) ? we.Message : body);
             }
         }
 
@@ -263,19 +281,75 @@ namespace QuotaWidget
         }
 
         // ---------- GLM ----------
+        // 200+success=false+code 1000/1001 = 鉴权失败（Key 无效/被删/填错，或鉴权格式被拒），
+        // 回退循环与最终错误分类共用此判据，避免两处判定不一致
+        private static bool IsAuthFailure(Dictionary<string, object> root)
+        {
+            bool success = false;
+            object sv;
+            if (root.TryGetValue("success", out sv) && sv is bool) success = (bool)sv;
+            if (success) return false;
+            int code = (int)Math.Round(J.D(root, "code"));
+            return code == 1000 || code == 1001;
+        }
+
         public static ProviderStatus FetchGlm(ProviderConfig p)
         {
             string baseUrl = p.Region == "intl" ? "https://api.z.ai" : "https://open.bigmodel.cn";
-            // 注意：GLM 接口 Authorization 直接传 API Key（无 Bearer 前缀），与其他服务商格式不同
-            string json = HttpGet(baseUrl + "/api/monitor/usage/quota/limit", p.Key);
-
+            string url = baseUrl + "/api/monitor/usage/quota/limit";
+            // 鉴权格式：先 Bearer 前缀（现行官方口径，与智谱控制台/主流工具一致），
+            // 失败（401/403 或 200+鉴权失败 JSON）或空响应时回退旧式裸 Key（历史上 GLM 曾要求无 Bearer 前缀）。
+            // 2026-08 起智谱监控接口故障：对有效 Key 返回 200+空 body，空体经
+            // JavaScriptSerializer 反序列化得 null，后续 root.TryGetValue 会抛
+            // NullReferenceException（"未将对象引用设置到对象的实例"），必须在此拦截
+            string json = null;            // 有效（非空、非鉴权失败）响应体
+            Exception firstErr = null;     // 首个鉴权相关失败（401/403 或 200+鉴权失败 JSON）；双失败时抛出，保留真实根因
             var ser = new JavaScriptSerializer();
+            foreach (var auth in new[] { "Bearer " + p.Key, p.Key })
+            {
+                try
+                {
+                    string body = HttpGet(url, auth);
+                    if (string.IsNullOrWhiteSpace(body)) continue;   // 200 空体：服务端故障特征
+                    // 服务端可能用 200+success=false+code 1000/1001 表达"鉴权失败/格式被拒"而非 HTTP 4xx：
+                    // 该形态视为本轮失败，继续回退下一种鉴权格式，避免仅兼容裸 Key 的合法 Key 被误判为无效
+                    Dictionary<string, object> probe = null;
+                    try { probe = ser.Deserialize<Dictionary<string, object>>(body); }
+                    catch { }   // 不可解析的响应体按普通响应处理，交由下方反序列化统一报错
+                    if (probe != null && IsAuthFailure(probe))
+                    {
+                        if (firstErr == null)
+                            firstErr = new Exception("GLM API Key 无效或已失效（" + J.S(probe, "msg") + "）");
+                        continue;
+                    }
+                    json = body; break;
+                }
+                catch (HttpException he)
+                {
+                    // 仅鉴权格式被拒（401/403）才回退下一种格式；超时/5xx/网络错误与鉴权格式无关，
+                    // 重试不会改变结果，直接抛出，避免无谓的第二次请求（最坏 15s→30s 等待）
+                    if (he.StatusCode == 401 || he.StatusCode == 403) { if (firstErr == null) firstErr = he; }
+                    else throw;
+                }
+            }
+            if (json == null)
+            {
+                // 两种格式都未取得有效响应：有真实鉴权错误优先抛出；
+                // 否则说明只收到空体 —— 显式告知服务端故障，而非让空体触发 NRE
+                if (firstErr != null) throw firstErr;
+                throw new Exception("智谱接口返回空响应（服务端故障中，非 Key 或网络问题），请稍后重试");
+            }
+
             var root = ser.Deserialize<Dictionary<string, object>>(json);
+            if (root == null) throw new Exception("智谱接口返回无法解析的响应: " + json.Substring(0, Math.Min(120, json.Length)));
             bool success = false;
             object sv;
             if (root.TryGetValue("success", out sv) && sv is bool) success = (bool)sv;
             if (!success)
+            {
+                // 鉴权失败（code 1000/1001）已在回退循环内拦截并优先抛出，此处只剩通用业务错误
                 throw new Exception("接口返回失败: " + J.S(root, "msg"));
+            }
 
             var st = new ProviderStatus { Name = p.Name, Type = "glm" };
             var data = root["data"] as Dictionary<string, object>;
@@ -387,9 +461,12 @@ namespace QuotaWidget
             // 优先官方文档接口，失败则回退到 coding_plan 接口
             string json = null;
             try { json = HttpGet(baseUrl + "/v1/token_plan/remains", "Bearer " + p.Key); }
-            catch
+            catch (Exception first)
             {
-                json = HttpGet(baseUrl + "/v1/api/openplatform/coding_plan/remains", "Bearer " + p.Key);
+                // 两端点鉴权范围是否一致未经服务端验证，401/403 也保留回退（不缩小既有覆盖面）；
+                // 双失败时抛第一个异常，保留更接近真实根因的 token_plan 错误
+                try { json = HttpGet(baseUrl + "/v1/api/openplatform/coding_plan/remains", "Bearer " + p.Key); }
+                catch { throw first; } // 回退也失败时保留第一个异常（更接近真实根因）
             }
 
             var ser = new JavaScriptSerializer();
@@ -3154,7 +3231,21 @@ namespace QuotaWidget
 
         private void SaveAndClose()
         {
-            _ctx.Cfg.Providers = _editList;
+            // 先快照旧配置：保存失败时回滚，防止"未保存的新配置"留在内存里被定时刷新
+            // 使用（运行配置 ≠ 磁盘配置），或被后续偶发 Save（拖窗/贴边/开关等）静默落盘
+            var oldProviders = _ctx.Cfg.Providers;
+            int oldRefreshSec = _ctx.Cfg.RefreshSec;
+            int oldOpacityPct = _ctx.Cfg.OpacityPct;
+            bool oldTopMost = _ctx.Cfg.TopMost;
+            bool oldAutoStart = _ctx.Cfg.AutoStart;
+            string oldTheme = _ctx.Cfg.Theme;
+            string oldDisplayMode = _ctx.Cfg.DisplayMode;
+            int oldAppBarScreen = _ctx.Cfg.AppBarScreen;
+
+            // 拷贝而非直接赋值：保存失败时窗口保持打开，用户继续增删/移动供应商会突变
+            // _editList；若与 Cfg.Providers 共享同一 List，刷新线程池并行遍历会因列表收缩
+            // 抛 ArgumentOutOfRangeException 并终止进程（详见 RefreshData 的 providers[i]）
+            _ctx.Cfg.Providers = new List<ProviderConfig>(_editList);
             _ctx.Cfg.RefreshSec = (int)_numInterval.Value;
             _ctx.Cfg.OpacityPct = _trkOpacity.Value;
             _ctx.Cfg.TopMost = _chkTopMost.Checked;
@@ -3162,6 +3253,22 @@ namespace QuotaWidget
             _ctx.Cfg.Theme = _cmbTheme.SelectedIndex == 1 ? "dark" : "light";
             _ctx.Cfg.DisplayMode = _cmbMode.SelectedIndex == 1 ? "topbar" : "float";
             _ctx.Cfg.AppBarScreen = _cmbScreen.SelectedIndex;
+            // 保存失败（磁盘满/文件被杀软锁定等）不静默关闭窗口：
+            // 否则用户以为已保存，重启后 API Key 全部丢失且无任何自救提示
+            if (!_ctx.Cfg.Save())
+            {
+                // 回滚到快照：窗口保持打开期间内存配置与磁盘一致，用户取消/关闭不会留下半提交状态
+                _ctx.Cfg.Providers = oldProviders;
+                _ctx.Cfg.RefreshSec = oldRefreshSec;
+                _ctx.Cfg.OpacityPct = oldOpacityPct;
+                _ctx.Cfg.TopMost = oldTopMost;
+                _ctx.Cfg.AutoStart = oldAutoStart;
+                _ctx.Cfg.Theme = oldTheme;
+                _ctx.Cfg.DisplayMode = oldDisplayMode;
+                _ctx.Cfg.AppBarScreen = oldAppBarScreen;
+                MessageBox.Show(this, "配置保存失败（config.json 写入失败，可能磁盘已满或被其他程序占用）。\n窗口保持打开，请先记录本次填写的 API Key，再重试保存。", "保存失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
             _ctx.ApplyConfig();
             Close();
         }
