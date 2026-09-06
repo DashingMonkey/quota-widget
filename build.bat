@@ -37,7 +37,7 @@ set "MANIFEST="
 if exist "app.manifest" set "MANIFEST=/win32manifest:app.manifest"
 
 set "RC=0"
-"%CSC%" /nologo /utf8output /target:winexe /optimize+ %ICON% %MANIFEST% /out:QuotaWidget.exe QuotaWidget.cs /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll
+"%CSC%" /nologo /utf8output /target:winexe /optimize+ %ICON% %MANIFEST% /out:QuotaWidget.exe QuotaWidget.cs /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll /r:System.Security.dll
 
 if errorlevel 1 (
   set "RC=1"

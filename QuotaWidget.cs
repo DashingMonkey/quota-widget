@@ -14,13 +14,14 @@ using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using Microsoft.Win32;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 
 namespace QuotaWidget
 {
     // ============================= 应用信息 =============================
     internal static class AppInfo
     {
-        public const string Version = "1.1.6";
+        public const string Version = "1.1.7";
     }
 
     // ============================= 数据模型 =============================
@@ -28,10 +29,53 @@ namespace QuotaWidget
     {
         public string Type { get; set; }     // "glm" / "mx"
         public string Region { get; set; }   // "cn" / "intl"
+        // 旧明文字段：仅用于读取旧 config.json 完成迁移，序列化时忽略（迁移后恒为空）
+        [ScriptIgnore]
         public string Key { get; set; }
+        // DPAPI(CurrentUser) 加密的 Base64 密文：绑定本机当前 Windows 用户，
+        // config.json 被其他软件扫描/拷走到别的电脑均无法还原
+        public string KeyEnc { get; set; }
         public string Name { get; set; }     // 显示名称
 
-        public ProviderConfig() { Type = "glm"; Region = "cn"; Key = ""; Name = "GLM"; }
+        // 可选熵：恒定值（改动会让历史密文全部失效），提高离线盲解门槛
+        private static readonly byte[] Entropy = Encoding.UTF8.GetBytes("QuotaWidget.ApiKey.v1");
+        // 解密结果缓存（仅进程内存，不序列化）：设置页每次重绘都要画掩码，避免反复走 DPAPI
+        private string _plainCache;
+        private bool _plainLoaded;
+
+        public ProviderConfig() { Type = "glm"; Region = "cn"; Key = ""; KeyEnc = ""; Name = "GLM"; }
+
+        /// 是否配置了 key（旧明文字段或密文任一存在）
+        [ScriptIgnore]
+        public bool HasKey { get { return !string.IsNullOrWhiteSpace(Key) || !string.IsNullOrWhiteSpace(KeyEnc); } }
+
+        /// <summary>解出明文 key：未配置返回 ""；密文解不开（拷贝到其他电脑/Windows 账户）返回 null，由调用方提示重填</summary>
+        public string GetKey()
+        {
+            if (_plainLoaded) return _plainCache;
+            _plainLoaded = true;
+            // 尚未走完迁移的旧明文直接返回（Config.Load 迁移后即清空该字段）
+            if (!string.IsNullOrWhiteSpace(Key)) { _plainCache = Key; return _plainCache; }
+            if (string.IsNullOrWhiteSpace(KeyEnc)) { _plainCache = ""; return _plainCache; }
+            try
+            {
+                _plainCache = Encoding.UTF8.GetString(ProtectedData.Unprotect(Convert.FromBase64String(KeyEnc), Entropy, DataProtectionScope.CurrentUser));
+            }
+            catch { _plainCache = null; }   // 密文损坏或环境变化：保持 null，查询时报"无法解密"
+            return _plainCache;
+        }
+
+        /// 加密保存明文 key（空串视为清除）
+        public void SetKey(string plain)
+        {
+            _plainLoaded = true;
+            _plainCache = plain ?? "";
+            if (string.IsNullOrEmpty(plain)) { KeyEnc = ""; Key = ""; return; }
+            KeyEnc = Convert.ToBase64String(ProtectedData.Protect(Encoding.UTF8.GetBytes(plain), Entropy, DataProtectionScope.CurrentUser));
+            Key = "";
+        }
+
+        public ProviderConfig Clone() { return new ProviderConfig { Type = Type, Region = Region, Key = Key, KeyEnc = KeyEnc, Name = Name }; }
 
         [ScriptIgnore]
         public string TypeName
@@ -136,6 +180,20 @@ namespace QuotaWidget
             if (string.IsNullOrEmpty(cfg.Theme)) cfg.Theme = "light";
             // 悬浮窗排列字段为空时默认条形灵动岛
             if (string.IsNullOrEmpty(cfg.FloatLayout)) cfg.FloatLayout = "island";
+            // 旧明文 key 就地迁移为 DPAPI 密文并立即落盘；迁移成功后顺手清掉可能残留明文的损坏备份
+            bool keyMigrated = false;
+            if (cfg.Providers != null)
+                foreach (var p in cfg.Providers)
+                {
+                    if (string.IsNullOrWhiteSpace(p.Key)) continue;
+                    try { p.SetKey(p.Key); keyMigrated = true; }
+                    catch { /* DPAPI 异常：保留明文字段下次启动重试，避免迁移失败丢 key */ }
+                }
+            if (keyMigrated)
+            {
+                cfg.Save();
+                try { File.Delete(FilePath + ".bak"); } catch { }
+            }
             return cfg;
         }
 
@@ -296,10 +354,20 @@ namespace QuotaWidget
             return code == 1000 || code == 1001;
         }
 
+        // 解出明文 key；密文解不开（换电脑/换 Windows 账户）时抛出可读异常，
+        // 由刷新/测试的 catch 展示；未配置 key 的供应商由调用方先行跳过
+        private static string RequireKey(ProviderConfig p)
+        {
+            string k = p.GetKey();
+            if (k == null) throw new Exception("密钥无法解密（可能已更换电脑或 Windows 账户），请在设置中重新填写");
+            return k;
+        }
+
         public static ProviderStatus FetchGlm(ProviderConfig p)
         {
             string baseUrl = p.Region == "intl" ? "https://api.z.ai" : "https://open.bigmodel.cn";
             string url = baseUrl + "/api/monitor/usage/quota/limit";
+            string key = RequireKey(p);
             // 鉴权格式：先 Bearer 前缀（现行官方口径，与智谱控制台/主流工具一致），
             // 失败（401/403 或 200+鉴权失败 JSON）或空响应时回退旧式裸 Key（历史上 GLM 曾要求无 Bearer 前缀）。
             // 2026-08 起智谱监控接口故障：对有效 Key 返回 200+空 body，空体经
@@ -308,7 +376,7 @@ namespace QuotaWidget
             string json = null;            // 有效（非空、非鉴权失败）响应体
             Exception firstErr = null;     // 首个鉴权相关失败（401/403 或 200+鉴权失败 JSON）；双失败时抛出，保留真实根因
             var ser = new JavaScriptSerializer();
-            foreach (var auth in new[] { "Bearer " + p.Key, p.Key })
+            foreach (var auth in new[] { "Bearer " + key, key })
             {
                 try
                 {
@@ -461,14 +529,15 @@ namespace QuotaWidget
         public static ProviderStatus FetchMiniMax(ProviderConfig p)
         {
             string baseUrl = p.Region == "intl" ? "https://www.minimax.io" : "https://www.minimaxi.com";
+            string key = RequireKey(p);
             // 优先官方文档接口，失败则回退到 coding_plan 接口
             string json = null;
-            try { json = HttpGet(baseUrl + "/v1/token_plan/remains", "Bearer " + p.Key); }
+            try { json = HttpGet(baseUrl + "/v1/token_plan/remains", "Bearer " + key); }
             catch (Exception first)
             {
                 // 两端点鉴权范围是否一致未经服务端验证，401/403 也保留回退（不缩小既有覆盖面）；
                 // 双失败时抛第一个异常，保留更接近真实根因的 token_plan 错误
-                try { json = HttpGet(baseUrl + "/v1/api/openplatform/coding_plan/remains", "Bearer " + p.Key); }
+                try { json = HttpGet(baseUrl + "/v1/api/openplatform/coding_plan/remains", "Bearer " + key); }
                 catch { throw first; } // 回退也失败时保留第一个异常（更接近真实根因）
             }
 
@@ -645,7 +714,7 @@ namespace QuotaWidget
 
         public static ProviderStatus FetchKimi(ProviderConfig p)
         {
-            string json = HttpGet("https://api.kimi.com/coding/v1/usages", "Bearer " + p.Key);
+            string json = HttpGet("https://api.kimi.com/coding/v1/usages", "Bearer " + RequireKey(p));
 
             var ser = new JavaScriptSerializer();
             var root = ser.Deserialize<Dictionary<string, object>>(json);
@@ -742,7 +811,7 @@ namespace QuotaWidget
         // 仅认浏览器登录 cookie，API Key 调不通）。故此处只展示账户余额。
         public static ProviderStatus FetchDeepSeek(ProviderConfig p)
         {
-            string json = HttpGet("https://api.deepseek.com/user/balance", "Bearer " + p.Key);
+            string json = HttpGet("https://api.deepseek.com/user/balance", "Bearer " + RequireKey(p));
 
             var ser = new JavaScriptSerializer();
             var root = ser.Deserialize<Dictionary<string, object>>(json);
@@ -1346,7 +1415,7 @@ namespace QuotaWidget
                 System.Threading.Tasks.Parallel.For(0, providers.Count, i =>
                 {
                     var p = providers[i];
-                    if (string.IsNullOrWhiteSpace(p.Key)) return;
+                    if (!p.HasKey) return;   // 未配置 key：跳过（行内显示 "--"）
                     try
                     {
                         ProviderStatus st;
@@ -3059,7 +3128,8 @@ namespace QuotaWidget
             if (existing != null)
             {
                 _typeIndex = existing.Type == "ds" ? 5 : (existing.Type == "kimi" ? 4 : (existing.Type == "mx" ? (existing.Region == "intl" ? 3 : 2) : (existing.Region == "intl" ? 1 : 0)));
-                _txtKey.Text = existing.Key;
+                // 预填解密后的真实 key（输入框本身以 ● 掩码显示）；密文解不开时留空待重填
+                _txtKey.Text = existing.GetKey() ?? "";
                 _txtName.Text = existing.Name;
             }
         }
@@ -3102,7 +3172,9 @@ namespace QuotaWidget
             string type = i == 5 ? "ds" : (i == 4 ? "kimi" : ((i == 2 || i == 3) ? "mx" : "glm"));
             string region = (i == 1 || i == 3) ? "intl" : "cn";
             string fallback = TypeDefaultNames[i];
-            Result = new ProviderConfig { Type = type, Region = region, Key = _txtKey.Text.Trim(), Name = string.IsNullOrWhiteSpace(_txtName.Text) ? fallback : _txtName.Text.Trim() };
+            var r = new ProviderConfig { Type = type, Region = region, Name = string.IsNullOrWhiteSpace(_txtName.Text) ? fallback : _txtName.Text.Trim() };
+            r.SetKey(_txtKey.Text.Trim());   // 明文仅存在于输入框与本次加密调用，配置文件里只落 DPAPI 密文
+            Result = r;
             DialogResult = DialogResult.OK;
             Close();
         }
@@ -3831,7 +3903,7 @@ namespace QuotaWidget
         {
             _ctx = ctx;
             foreach (var p in _ctx.Cfg.Providers)
-                _editList.Add(new ProviderConfig { Type = p.Type, Region = p.Region, Key = p.Key, Name = p.Name });
+                _editList.Add(p.Clone());   // 克隆保留 KeyEnc 密文，未编辑的 key 原样往返
 
             // 与旧版一致：缩放跟随光标所在屏，PerMonitorV2 下手动布局
             var curScreen = Screen.FromPoint(Cursor.Position);
@@ -4353,8 +4425,9 @@ namespace QuotaWidget
                 g.FillPath(b, path);
             TextRenderer.DrawText(g, badge, fs[5], br, p.PillText, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
 
-            // 打码 Key（与旧表格同规则：前 4 + ****** + 后 4）
-            string key = prov.Key;
+            // 打码 Key（与旧表格同规则：前 4 + ****** + 后 4）：内存解密后仅取首尾字符画掩码，
+            // 完整明文不出进程内存、不落盘；解不开或未配置时统一显示 ****
+            string key = prov.GetKey() ?? "";
             string masked = key.Length > 8 ? key.Substring(0, 4) + "******" + key.Substring(key.Length - 4) : "****";
             int keyMax = (card.Right - S(14) - S(30) * 2 - S(6)) - S(12) - (br.Right + S(12));
             if (keyMax > S(40))
@@ -5142,7 +5215,7 @@ namespace QuotaWidget
                 var sb = new StringBuilder();
                 foreach (var pr in snapshot)
                 {
-                    if (string.IsNullOrWhiteSpace(pr.Key)) continue;
+                    if (!pr.HasKey) continue;   // 未配置 key 的供应商跳过（密文解不开的由 RequireKey 报可读错误）
                     try
                     {
                         ProviderStatus st;
