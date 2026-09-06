@@ -25,6 +25,62 @@ namespace QuotaWidget
         public const string Version = "1.1.7";
     }
 
+    // ============================= 崩溃日志 =============================
+    // winexe 无控制台、无调试器时 Debug.WriteLine 不可见，未处理异常只闪一下系统
+    // WER 对话框就消失，用户侧表现为"双击没反应"且无从排查。启动失败/未处理异常
+    // 统一落盘到这里，让任何机器上的错误都能事后取证。
+    internal static class CrashLog
+    {
+        // 崩溃路径上的日志 IO 任何情况下不得再抛异常（二次异常会把根因彻底吞掉）
+        public static void Write(string context, Exception ex)
+        {
+            try
+            {
+                string path = ResolvePath();
+                if (string.IsNullOrEmpty(path)) return;
+                // 超 1MB 轮转：改名保留上一份（error.old.log），避免长期运行无限增长
+                try
+                {
+                    if (File.Exists(path) && new FileInfo(path).Length > 1024 * 1024)
+                    {
+                        string old = path + ".old";
+                        if (File.Exists(old)) File.Delete(old);
+                        File.Move(path, old);
+                    }
+                }
+                catch { }
+                string entry = "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] v" + AppInfo.Version
+                    + " " + context + Environment.NewLine
+                    + (ex == null ? "(无异常对象)" :
+                        ex.GetType().Name + ": " + ex.Message + Environment.NewLine + ex.StackTrace)
+                    + Environment.NewLine + Environment.NewLine;
+                File.AppendAllText(path, entry, Encoding.UTF8);
+            }
+            catch { }
+        }
+
+        // 优先 exe 同目录 error.log（与 config.json 约定一致，用户最容易找到）；
+        // exe 位于不可写目录（如 Program Files）时回退 %LOCALAPPDATA%\QuotaWidget\
+        private static string ResolvePath()
+        {
+            try
+            {
+                string local = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "error.log");
+                try
+                {
+                    // 用打开方式探测可写性：AppendAllText 到只读目录会抛 UnauthorizedAccessException
+                    using (File.Open(local, FileMode.Append, FileAccess.Write, FileShare.Read)) { }
+                    return local;
+                }
+                catch { }
+                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "QuotaWidget");
+                Directory.CreateDirectory(dir);
+                return Path.Combine(dir, "error.log");
+            }
+            catch { return null; }
+        }
+    }
+
     // ============================= 数据模型 =============================
     internal class ProviderConfig
     {
@@ -1305,12 +1361,22 @@ namespace QuotaWidget
         public static Color Green { get { return Theme == 1 ? Color.FromArgb(52, 211, 153) : Color.FromArgb(46, 139, 87); } }
         public static Color Amber { get { return Theme == 1 ? Color.FromArgb(251, 191, 36) : Color.FromArgb(190, 120, 24); } }
         public static Color Red { get { return Theme == 1 ? Color.FromArgb(248, 113, 113) : Color.FromArgb(198, 64, 48); } }
-        public static Color GlmAccent { get { return Theme == 1 ? Color.FromArgb(129, 140, 248) : Color.FromArgb(92, 105, 224); } }
-        public static Color MxAccent { get { return Theme == 1 ? Color.FromArgb(56, 189, 248) : Color.FromArgb(2, 132, 199); } }
-        public static Color KimiAccent { get { return Theme == 1 ? Color.FromArgb(167, 139, 250) : Color.FromArgb(109, 40, 217); } }
-        public static Color DsAccent { get { return Theme == 1 ? Color.FromArgb(96, 165, 250) : Color.FromArgb(24, 119, 242); } }
-        public static Color ClaudeAccent { get { return Theme == 1 ? Color.FromArgb(232, 149, 111) : Color.FromArgb(201, 100, 66); } }   // Claude 珊瑚色
-        public static Color CodexAccent { get { return Theme == 1 ? Color.FromArgb(52, 211, 153) : Color.FromArgb(16, 163, 127); } }    // OpenAI 绿
+        // 各服务商 accent 的唯一定义：t=1 深色（为深底对比提亮的变体）/ t=2 浅色（高饱和原色）
+        static Color Acc(string type, int t)
+        {
+            if (type == "mx") return t == 1 ? Color.FromArgb(56, 189, 248) : Color.FromArgb(2, 132, 199);
+            if (type == "kimi") return t == 1 ? Color.FromArgb(167, 139, 250) : Color.FromArgb(109, 40, 217);
+            if (type == "ds") return t == 1 ? Color.FromArgb(96, 165, 250) : Color.FromArgb(24, 119, 242);
+            if (type == "claude") return t == 1 ? Color.FromArgb(232, 149, 111) : Color.FromArgb(201, 100, 66);   // Claude 珊瑚色
+            if (type == "codex") return t == 1 ? Color.FromArgb(52, 211, 153) : Color.FromArgb(16, 163, 127);    // OpenAI 绿
+            return t == 1 ? Color.FromArgb(129, 140, 248) : Color.FromArgb(92, 105, 224);
+        }
+        public static Color GlmAccent { get { return Acc("glm", Theme); } }
+        public static Color MxAccent { get { return Acc("mx", Theme); } }
+        public static Color KimiAccent { get { return Acc("kimi", Theme); } }
+        public static Color DsAccent { get { return Acc("ds", Theme); } }
+        public static Color ClaudeAccent { get { return Acc("claude", Theme); } }
+        public static Color CodexAccent { get { return Acc("codex", Theme); } }
 
         // 基于剩余百分比(0-100)返回颜色：100=绿 → 50=琥珀 → 0=红，中间线性插值
         public static Color RemainColor(int remainPct)
@@ -1329,15 +1395,9 @@ namespace QuotaWidget
                 (int)Math.Round(a.B + (b.B - a.B) * t));
         }
 
-        public static Color AccentFor(string type)
-        {
-            if (type == "mx") return MxAccent;
-            if (type == "kimi") return KimiAccent;
-            if (type == "ds") return DsAccent;
-            if (type == "claude") return ClaudeAccent;
-            if (type == "codex") return CodexAccent;
-            return GlmAccent;
-        }
+        public static Color AccentFor(string type) { return Acc(type, Theme); }
+        // 不随主题切换的 accent（恒用浅色高饱和原色）：深色模式下详情面板徽标保持与浅色一致的浓度
+        public static Color AccentForFixed(string type) { return Acc(type, 2); }
 
         // ---- 横向徽标（置顶栏 / 悬浮窗条形灵动岛共用）----
         public struct BadgeInfo
@@ -1357,15 +1417,17 @@ namespace QuotaWidget
         }
 
         // 品牌图标 + 外圈环形进度（图标模式的核心绘制）：底环常显，弧长=剩余百分比，0 时只画底环。
-        // 几何：内圈（图标）恒 18 DIP，ringD 为环外径（灵动岛 40 / 置顶栏 26），penW 环粗，内壁间隙随二者推导
+        // 几何：内圈（图标）恒 18 DIP，ringD 为环外径 DIP（灵动岛 38 / 置顶栏 0 无环），penW 环粗 DIP。
+        // ringD / penW 必须与图标一样按 s 缩放绘制——此前漏乘 s，高 DPI 下环外径与环粗不随面板/图标放大
         public static void DrawRingIcon(Graphics g, string type, int ringPct, Color ringColor, float cx, float cy, float s, float ringD, float penW, bool dark)
         {
             int isz = SiF(18, s);
-            var rc = new RectangleF(cx - ringD / 2 + penW / 2, cy - ringD / 2 + penW / 2, ringD - penW, ringD - penW);
-            using (var pen = new Pen(BarBg, penW))
+            float d = ringD * s, pw = penW * s;
+            var rc = new RectangleF(cx - d / 2 + pw / 2, cy - d / 2 + pw / 2, d - pw, d - pw);
+            using (var pen = new Pen(BarBg, pw))
                 g.DrawEllipse(pen, rc);
             if (ringPct > 0)
-                using (var pen = new Pen(ringColor, penW) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                using (var pen = new Pen(ringColor, pw) { StartCap = LineCap.Round, EndCap = LineCap.Round })
                     g.DrawArc(pen, rc, -90, Math.Max(1f, ringPct * 3.6f));   // 满环留 1° 露出端点圆帽
             BrandIcons.Draw(g, type, dark, (int)Math.Round(cx - isz / 2f), (int)Math.Round(cy - isz / 2f), isz);
         }
@@ -1406,7 +1468,7 @@ namespace QuotaWidget
         // 两端必须同源测量，否则灵动岛按此定宽后徽标会被裁切）
         public static List<BadgeInfo> BuildBadges(List<ProviderStatus> providers, Graphics g, float s, out float totalW, int ringD, float penW, bool dark)
         {
-            float gap = 24f * s;
+            float gap = 12f * s;   // 徽标间距（灵动岛 / 置顶栏绘制处与此必须同源）
             var fs = FontsForScale(s); // [1]=FNorm
             var badges = new List<BadgeInfo>(providers.Count);
             totalW = 0;
@@ -2349,11 +2411,11 @@ namespace QuotaWidget
         // island=true：内容自适应宽的胶囊徽标条，完全复用悬浮窗的贴边吸附机制——
         // 吸附顶边即自动隐藏（收起留缝、移入滑出展开），拖离顶边则退化为普通悬浮条
         private bool _island;
-        private const int IslandH = 56;    // 岛高（DIP）：环外径 46（图标 18 + 内隙 10×2 + 环粗 4×2）+ 上下各 5px 边距
+        private const int IslandH = 54;    // 岛高（DIP）：环外径 38（图标 18 + 内隙 6×2 + 环粗 4×2）+ 上下各 8px 边距
         private const int IslandPeek = 5;  // 收起时露出像素（DIP，比卡片贴边的 3px 略宽便于悬停命中）
-        private const int IslandPad = 16;  // 岛左右内边距（DIP，兼吸收徽标测量误差）
-        private const int VIslandW = 64;   // 竖向岛宽（DIP，左右吸附时）：环 40 居中
-        private const int VRowH = 80;      // 竖向岛每供应商高度（DIP）：环行 44 + 百分比行 22 + 行间呼吸 14
+        private const int IslandPad = 12;  // 岛左右内边距（DIP，兼吸收徽标测量误差）
+        private const int VIslandW = 54;   // 竖向岛宽（DIP，左右吸附时）：环 38 居中
+        private const int VRowH = 70;      // 竖向岛每供应商高度（DIP）：环行 38 + 百分比行 22 + 行间呼吸 10
 
         // 当前是否竖向岛形态（左右吸附，或竖向固定后自由放置）
         private bool VerticalIsland { get { return _island && _vertical; } }
@@ -2611,7 +2673,7 @@ namespace QuotaWidget
             int pad = St.SiF(IslandPad, _scale);
             float totalW = 0;
             using (var g = CreateGraphics())
-                St.BuildBadges(_ctx.Providers, g, _scale, out totalW, 46, 4f, St.Theme == 1);
+                St.BuildBadges(_ctx.Providers, g, _scale, out totalW, 38, 4f, St.Theme == 1);
             return Math.Max(St.SiF(IslandH, _scale), (int)Math.Ceiling(totalW) + pad * 2);
         }
 
@@ -2640,9 +2702,9 @@ namespace QuotaWidget
                 if (_ctx.Providers.Count == 0) return;
 
                 float s = _scale;
-                float gap = 24f * s;
+                float gap = 12f * s;
                 float totalW;
-                var badges = St.BuildBadges(_ctx.Providers, g, s, out totalW, 46, 4f, dark);
+                var badges = St.BuildBadges(_ctx.Providers, g, s, out totalW, 38, 4f, dark);
                 float x = St.SiF(IslandPad, _scale);
                 if (x < 8) x = 8;
 
@@ -2651,7 +2713,7 @@ namespace QuotaWidget
                 float textY = (Height - textH) / 2;
                 for (int i = 0; i < badges.Count; i++)
                 {
-                    x += St.DrawBadge(g, badges[i], x, Height / 2f, textY, s, fs[1], 46, 4f, dark) + gap;
+                    x += St.DrawBadge(g, badges[i], x, Height / 2f, textY, s, fs[1], 38, 4f, dark) + gap;
                 }
                 return;
             }
@@ -2686,7 +2748,7 @@ namespace QuotaWidget
             }
             var fs = St.FontsForScale(_scale);
             int pad = St.SiF(8, _scale);
-            float ringD = St.SiF(46, _scale);
+            float ringD = St.SiF(38, _scale);
             int y = pad;
             foreach (var st in _ctx.Providers)
             {
@@ -2695,7 +2757,7 @@ namespace QuotaWidget
                 int remain = pool == null ? 0 : Math.Max(0, Math.Min(100, 100 - pool.Percent));
                 Color c = err ? St.Red : St.RemainColor(remain);
                 // 第一行：环形进度 + 厂商图标（与横向岛同款大环）
-                St.DrawRingIcon(g, st.Type, err ? 0 : remain, c, Width / 2f, y + ringD / 2f, _scale, 46, 4f, dark);
+                St.DrawRingIcon(g, st.Type, err ? 0 : remain, c, Width / 2f, y + ringD / 2f, _scale, 38, 4f, dark);
                 // 第二行：百分比 / 余额 / 失败
                 string txt = err ? "失败" : (pool == null ? "--" : (pool.IsMoney ? pool.Currency + St.FmtMoney(pool.Remaining) : remain + "%"));
                 using (var b = new SolidBrush(err ? St.Dim : c))
@@ -3152,6 +3214,20 @@ namespace QuotaWidget
             UpdateLayered();
         }
 
+        // 测量文字的「墨迹」边界（实际像素覆盖范围，相对绘制原点的偏移含在 X/Y 中）。
+        // MeasureString 返回的是行盒加内置边距的排版宽度，用它做徽标尺寸会偏宽、文字偏左；
+        // 配合 CharacterRange 的区域边界可实现任意文字（pro / Moderato / 中文）的视觉精确居中
+        private static RectangleF MeasureInk(Graphics g, string text, Font f)
+        {
+            using (var sf = new StringFormat(StringFormat.GenericTypographic))
+            {
+                sf.FormatFlags |= StringFormatFlags.NoWrap;
+                sf.SetMeasurableCharacterRanges(new[] { new CharacterRange(0, text.Length) });
+                using (var r = g.MeasureCharacterRanges(text, f, new RectangleF(0, 0, 4096, 512), sf)[0])
+                    return r.GetBounds(g);
+            }
+        }
+
         protected override void OnLayeredPaint(Graphics g)
         {
             var fs = St.FontsForScale(_dpi); // [0]=FTitle [1]=FNorm [2]=FSmall [3]=FPct
@@ -3166,19 +3242,37 @@ namespace QuotaWidget
             int y = Si(14);
             foreach (var p in _ctx.Providers)
             {
-                using (var b = new SolidBrush(St.AccentFor(p.Type)))
-                    g.FillEllipse(b, Si(16), y + Si(6), Si(9), Si(9));
+                // 标题行左侧品牌图标：浅色主题用彩色源、深色主题用白色变体，随主题自动切换；
+                // 图标垂直对齐标题行文字中心；未定义图标的类型回退为原来的彩色圆点
+                bool dark = St.Theme == 1;
+                int isz = Si(16);
+                if (BrandIcons.Get(p.Type, dark) != null)
+                    BrandIcons.Draw(g, p.Type, dark, Si(16), (int)Math.Round(y + Si(2) + (fs[0].GetHeight(g) - isz) / 2f), isz);
+                else
+                    using (var b = new SolidBrush(St.AccentFor(p.Type)))
+                        g.FillEllipse(b, Si(16), y + Si(6), Si(9), Si(9));
                 using (var b = new SolidBrush(St.Text))
-                    g.DrawString(p.DisplayName, fs[0], b, Si(32), y + Si(2));
+                    g.DrawString(p.DisplayName, fs[0], b, Si(36), y + Si(2));
                 string right = string.IsNullOrEmpty(p.Level) ? "" : p.Level;
                 if (!string.IsNullOrEmpty(right))
                 {
-                    var sz = g.MeasureString(right, fs[2]);
-                    using (var b = new SolidBrush(St.AccentFor(p.Type)))
-                    using (var path = St.RoundRect(new Rectangle(Width - (int)sz.Width - Si(28), y + Si(2), (int)sz.Width + Si(12), Si(17)), Si(8)))
-                        g.FillPath(b, path);
-                    using (var b = new SolidBrush(Color.White))
-                        g.DrawString(right, fs[2], b, Width - sz.Width - Si(22), y + Si(4));
+                    // 徽标文字按「墨迹边界」精确居中：MeasureString 自带 GDI+ 内置边距且基线偏上，
+                    // 直接按行盒排版文字会视觉偏左偏下（如 pro / Moderato）
+                    var ink = MeasureInk(g, right, fs[2]);
+                    if (ink.Width > 0 && ink.Height > 0)
+                    {
+                        int pad = Si(8), ph = Si(17);
+                        int pw = (int)Math.Ceiling(ink.Width) + pad * 2;
+                        var pill = new Rectangle(Width - Si(16) - pw, y + Si(2), pw, ph);
+                        using (var b = new SolidBrush(St.AccentForFixed(p.Type)))
+                        using (var path = St.RoundRect(pill, Si(8)))
+                            g.FillPath(b, path);
+                        using (var b = new SolidBrush(Color.White))
+                        using (var sf = new StringFormat(StringFormat.GenericTypographic))
+                            g.DrawString(right, fs[2], b,
+                                pill.Left + pill.Width / 2f - ink.X - ink.Width / 2f,
+                                pill.Top + pill.Height / 2f - ink.Y - ink.Height / 2f, sf);
+                    }
                 }
                 y += Si(26);
 
@@ -3187,7 +3281,7 @@ namespace QuotaWidget
                     string msg = p.Error;
                     if (msg.Length > 46) msg = msg.Substring(0, 46) + "…";
                     using (var b = new SolidBrush(St.Red))
-                        g.DrawString("⚠ " + msg, fs[2], b, Si(32), y + Si(4));
+                        g.DrawString("⚠ " + msg, fs[2], b, Si(36), y + Si(4));
                     y += Si(34);
                 }
                 else
@@ -3197,7 +3291,7 @@ namespace QuotaWidget
                         if (pool.IsMoney)
                         {
                             using (var b = new SolidBrush(St.Text))
-                                g.DrawString(pool.Label, fs[1], b, Si(32), y);
+                                g.DrawString(pool.Label, fs[1], b, Si(36), y);
                             string moneyTxt = pool.Currency + St.FmtMoney(pool.Remaining);
                             var msz = g.MeasureString(moneyTxt, fs[1]);
                             using (var b = new SolidBrush(St.Text))
@@ -3209,19 +3303,19 @@ namespace QuotaWidget
                         int remain = 100 - pct;
                         Color c = St.RemainColor(remain);
                         using (var b = new SolidBrush(St.Text))
-                            g.DrawString(pool.Label, fs[1], b, Si(32), y);
+                            g.DrawString(pool.Label, fs[1], b, Si(36), y);
                         string pctTxt = remain + "%";
                         var psz = g.MeasureString(pctTxt, fs[1]);
                         using (var b = new SolidBrush(c))
                             g.DrawString(pctTxt, fs[1], b, Width - psz.Width - Si(18), y);
                         y += Si(19);
-                        St.DrawBar(g, new Rectangle(Si(32), y, Width - Si(50), Si(6)), remain, c);
+                        St.DrawBar(g, new Rectangle(Si(36), y, Width - Si(54), Si(6)), remain, c);
                         y += Si(11);
                         string nums = pool.PercentOnly
                             ? "剩余 " + St.FmtNum(pool.Remaining) + "%" + (string.IsNullOrEmpty(pool.Note) ? "" : "　" + pool.Note)
                             : "已用 " + St.FmtNum(pool.Used) + " / " + St.FmtNum(pool.Total) + "　剩余 " + St.FmtNum(pool.Remaining);
                         using (var b = new SolidBrush(St.Dim))
-                            g.DrawString(nums, fs[2], b, Si(32), y);
+                            g.DrawString(nums, fs[2], b, Si(36), y);
                         if (pool.ResetLocal.HasValue)
                         {
                             string cd = "重置 " + St.FmtCountdown(pool.ResetLocal, pool.ResetEstimated);
@@ -3725,7 +3819,7 @@ namespace QuotaWidget
 
             // 徽标绘制（数据与测量均来自 St.BuildBadges）
             float s = _scale; // 当前屏缩放因子（直接保存的 DPI/96，避免 int 截断反推的精度误差）
-            float gap = 24f * s;
+            float gap = 12f * s;
             float totalW;
             var badges = St.BuildBadges(providers, g, s, out totalW, 0, 0, St.Theme == 1);   // 置顶栏：无环纯图标
 
@@ -6343,7 +6437,15 @@ namespace QuotaWidget
             // 单实例保护：置顶栏模式会修改系统工作区，多实例会导致工作区记录混乱
             bool createdNew;
             var mutex = new Mutex(true, "Global\\QuotaWidget_SingleInstance", out createdNew);
-            if (!createdNew) return;
+            if (!createdNew)
+            {
+                // 已有实例（含卡死残留的僵尸进程、其他用户会话）时直接 return 会让用户以为
+                // "双击没反应"；弹窗说明情况。用系统 MessageBox：此时 DPI/缩放初始化尚未执行，
+                // 自绘 StyledMsg 不可用，且崩溃路径要求零依赖的最大健壮性
+                MessageBox.Show("QuotaWidget 已在运行。\n\n请检查任务栏托盘区（Win11 可能收纳在 ^ 溢出区），\n或任务管理器中是否有残留的 QuotaWidget.exe 进程。",
+                    "AI 额度工具", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
 
             // Per-Monitor V2 感知：窗口 DPI（含标题栏文字、系统绘制控件）跟随所在屏，跨屏拖动自动切换
             try
@@ -6382,7 +6484,34 @@ namespace QuotaWidget
             try { using (var g = System.Drawing.Graphics.FromHwnd(IntPtr.Zero)) mainDpi = (int)g.DpiX; }
             catch { /* 主屏 DPI 查询失败时按 96（100%）处理，缩放因子为 1.0 */ }
             St.InitScale(mainDpi);
-            Application.Run(new AppContext());
+            // UI 线程事件中的未处理异常：记录并弹窗，替代默认的 ThreadExceptionDialog
+            //（默认对话框只有堆栈无日志，用户关掉就丢根因）
+            Application.ThreadException += delegate(object s, System.Threading.ThreadExceptionEventArgs e)
+            {
+                CrashLog.Write("UI 线程异常", e.Exception);
+                MessageBox.Show("发生错误，已记录到 error.log：\n\n" + e.Exception.Message,
+                    "AI 额度工具", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            };
+            // UI 线程之外的未处理异常（线程池/自建线程，进程即将终止）：尽力落盘；
+            // 终止中的进程弹窗可能来不及展示，日志优先
+            AppDomain.CurrentDomain.UnhandledException += delegate(object s, UnhandledExceptionEventArgs e)
+            {
+                CrashLog.Write("未处理异常（进程终止）", e.ExceptionObject as Exception
+                    ?? new Exception(Convert.ToString(e.ExceptionObject)));
+            };
+            try
+            {
+                Application.Run(new AppContext());
+            }
+            catch (Exception ex)
+            {
+                // AppContext 构造（悬浮窗/托盘创建等）抛异常发生在消息循环开始之前，
+                // WinForms 默认 ThreadException 对话框不生效，此前会静默崩溃只闪一下系统
+                // WER 对话框；落盘 + 弹窗把"双击没反应"变成可读的错误
+                CrashLog.Write("启动失败", ex);
+                MessageBox.Show("启动失败，已记录到 error.log：\n\n" + ex.Message,
+                    "AI 额度工具", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
             GC.KeepAlive(mutex); // 确保 Mutex 在应用程序整个生命周期内存活
         }
     }
