@@ -20,7 +20,7 @@ namespace QuotaWidget
     // ============================= 应用信息 =============================
     internal static class AppInfo
     {
-        public const string Version = "1.1.5";
+        public const string Version = "1.1.6";
     }
 
     // ============================= 数据模型 =============================
@@ -93,13 +93,14 @@ namespace QuotaWidget
         public bool LockPosition { get; set; }   // 固定位置：禁止拖拽悬浮窗
         public string DisplayMode { get; set; }  // "float"(悬浮窗) / "topbar"(置顶栏)
         public int AppBarScreen { get; set; }    // 置顶栏模式：显示在哪个屏幕（索引，默认0=主屏）
+        public string FloatLayout { get; set; }  // 悬浮窗排列："island"(条形灵动岛，默认) / "card"(矩形卡片)
 
         public Config()
         {
             Providers = new List<ProviderConfig>();
             GlmKey = ""; GlmRegion = "cn"; MxKey = ""; MxRegion = "cn";
             RefreshSec = 60; OpacityPct = 95; TopMost = true; Theme = "light"; X = -1; Y = -1; AutoStart = false; MiniMode = false; LockPosition = false;
-            DisplayMode = "float"; AppBarScreen = 0;
+            DisplayMode = "float"; AppBarScreen = 0; FloatLayout = "island";
         }
 
         public static string FilePath
@@ -133,6 +134,8 @@ namespace QuotaWidget
             if (cfg.Providers == null) cfg.Providers = new List<ProviderConfig>();
             // 主题字段为空时默认浅色
             if (string.IsNullOrEmpty(cfg.Theme)) cfg.Theme = "light";
+            // 悬浮窗排列字段为空时默认条形灵动岛
+            if (string.IsNullOrEmpty(cfg.FloatLayout)) cfg.FloatLayout = "island";
             return cfg;
         }
 
@@ -903,6 +906,44 @@ namespace QuotaWidget
             return GlmAccent;
         }
 
+        // ---- 横向徽标（置顶栏 / 悬浮窗条形灵动岛共用）----
+        public struct BadgeInfo
+        {
+            public string Name, Value;
+            public Color DotColor;
+            public float NameW, ValW;
+        }
+
+        // 按当前数据与字体测量所有徽标；totalW 为去掉末尾间距后的内容总宽（岛宽计算与绘制共用，
+        // 两端必须同源测量，否则灵动岛按此定宽后徽标会被裁切）
+        public static List<BadgeInfo> BuildBadges(List<ProviderStatus> providers, Graphics g, float s, out float totalW)
+        {
+            float gap = 24f * s;
+            float dx1 = 8f * s, dx2 = 6f * s, dx3 = 10f * s;
+            var fs = FontsForScale(s); // [1]=FNorm
+            var badges = new List<BadgeInfo>(providers.Count);
+            totalW = 0;
+            foreach (var st in providers)
+            {
+                var bi = new BadgeInfo { Name = st.Name };
+                bool err = st.Error != null;
+                var pool = st.Primary5h;
+                int usedPct = pool != null ? Math.Max(0, Math.Min(100, pool.Percent)) : 0;
+                int remain = 100 - usedPct;
+                bi.DotColor = err ? Red : RemainColor(remain);
+                bi.Value = err ? "失败"
+                    : (pool != null
+                        ? (pool.IsMoney ? pool.Currency + FmtMoney(pool.Remaining) : remain + "%")
+                        : "--");
+                bi.NameW = g.MeasureString(bi.Name, fs[1]).Width;
+                bi.ValW = g.MeasureString(bi.Value, fs[1]).Width;
+                badges.Add(bi);
+                totalW += dx1 + dx2 + bi.NameW + dx3 + bi.ValW + gap;
+            }
+            if (badges.Count > 0) totalW -= gap;
+            return badges;
+        }
+
         public static string FmtNum(double n)
         {
             return n.ToString("#,0", CultureInfo.InvariantCulture);
@@ -1234,15 +1275,17 @@ namespace QuotaWidget
             menu.AddItem("立即刷新", false, false, delegate { RefreshData(); });
             if (Cfg.DisplayMode != "topbar")
             {
-                menu.AddItem("mini 模式", true, Cfg.MiniMode, delegate
-                {
-                    Cfg.MiniMode = !Cfg.MiniMode;
-                    Cfg.Save();
-                    Floating.ApplyFromConfig();
-                    Floating.Rebuild();
-                    // 吸附态下切换 mini 会因高度变化导致窗口消失，直接取消吸附贴顶部展开
-                    Floating.RestoreFromEdge();
-                });
+                // mini 模式仅矩形卡片有意义（条形灵动岛本身已是极简单行）
+                if (Cfg.FloatLayout != "island")
+                    menu.AddItem("mini 模式", true, Cfg.MiniMode, delegate
+                    {
+                        Cfg.MiniMode = !Cfg.MiniMode;
+                        Cfg.Save();
+                        Floating.ApplyFromConfig();
+                        Floating.Rebuild();
+                        // 吸附态下切换 mini 会因高度变化导致窗口消失，直接取消吸附贴顶部展开
+                        Floating.RestoreFromEdge();
+                    });
                 menu.AddItem("固定位置", true, Cfg.LockPosition, delegate
                 {
                     Cfg.LockPosition = !Cfg.LockPosition;
@@ -1415,6 +1458,14 @@ namespace QuotaWidget
         private int WinWidth { get { return St.SiF(St.Mini ? WidthMini : WidthFull, _scale); } }
         private int PadYS { get { return St.SiF(PadY, _scale); } }
 
+        // ---- 条形灵动岛排列 ----
+        // island=true：内容自适应宽的胶囊徽标条，完全复用悬浮窗的贴边吸附机制——
+        // 吸附顶边即自动隐藏（收起留缝、移入滑出展开），拖离顶边则退化为普通悬浮条
+        private bool _island;
+        private const int IslandH = 38;    // 岛高（DIP，与置顶栏同高）
+        private const int IslandPeek = 5;  // 收起时露出像素（DIP，比卡片贴边的 3px 略宽便于悬停命中）
+        private const int IslandPad = 16;  // 岛左右内边距（DIP，兼吸收徽标测量误差）
+
         // 更新为所在屏缩放（并同步详情面板 DPI）
         private void UpdateScale()
         {
@@ -1426,8 +1477,8 @@ namespace QuotaWidget
                 {
                     _scale = n;
                     _detail.DpiScale = n;
-                    Width = WinWidth;
-                    Rebuild();
+                    if (!_island) Width = WinWidth;
+                    Rebuild(); // 窗口尺寸（岛宽高 / 卡片高）统一由 Rebuild 按当前排列重算
                 }
             }
             catch (Exception ex)
@@ -1452,6 +1503,11 @@ namespace QuotaWidget
             _uiTimer = new System.Windows.Forms.Timer { Interval = 1000 };
             _uiTimer.Tick += delegate
             {
+                // 灵动岛吸附兜底：初始显示/切换排列后鼠标不在窗口上时贴顶收起
+                //（MouseLeave 覆盖不到"从未进入过窗口"的场景）
+                if (_island && _edgeDocked && !_edgeCollapsed && !_dragging && !AnimRunning
+                    && !Bounds.Contains(Cursor.Position))
+                    EdgeCollapse();
                 UpdateLayered();
                 if (_detail.Visible) _detail.UpdateLayered();
                 _ctx.UpdateTrayTip();
@@ -1476,16 +1532,21 @@ namespace QuotaWidget
                 if (Bounds.Contains(Cursor.Position)) ShowDetail();
             };
 
+            _island = _ctx.Cfg.FloatLayout == "island"; // 排列启动即生效（ApplyFromConfig 仅在切换排列时重置位置）
             ApplyFromConfig();
         }
 
         public void ApplyFromConfig()
         {
             var cfg = _ctx.Cfg;
-            // mini 模式（仅主悬浮窗）：隐藏圆点/进度条，字号保持原样
+            // 排列：矩形卡片 / 条形灵动岛（岛复用贴边吸附机制，仅外观与默认停靠不同）
+            bool wasIsland = _island;
+            _island = cfg.FloatLayout == "island";
+            bool layoutChanged = _island != wasIsland;
+            // mini 模式（仅矩形卡片消费）：隐藏圆点/进度条，字号保持原样
             St.Mini = cfg.MiniMode;
             UpdateScale();
-            Width = WinWidth;
+            Width = _island ? IslandWidth() : WinWidth;
             TopMost = cfg.TopMost;
             _detail.TopMost = cfg.TopMost;
 
@@ -1504,7 +1565,34 @@ namespace QuotaWidget
             // 构造函数里的 Start() 只执行一次，缺了这行倒计时/托盘 tip 将永久冻结
             _uiTimer.Start();
 
-            if (St.IsPointOnScreen(new Point(cfg.X, cfg.Y)))
+            if (_island)
+            {
+                if (layoutChanged || !St.IsPointOnScreen(new Point(cfg.X, cfg.Y)))
+                {
+                    // 进入条形排列（或无有效位置）：贴主屏工作区顶边居中，不继承矩形卡片的位置；
+                    // 先展开显示，鼠标不在窗口上时由 _uiTimer 兜底收起
+                    var wa = Screen.PrimaryScreen.WorkingArea;
+                    Height = St.SiF(IslandH, _scale);
+                    Location = new Point(wa.Left + Math.Max(0, (wa.Width - Width) / 2), wa.Top);
+                    _edgeDocked = true;
+                    _edgeCollapsed = false;
+                    _edgeJustUndocked = false;
+                    _edgeTargetX = Left;
+                    cfg.X = Left; cfg.Y = Top; cfg.Save();
+                }
+                else
+                {
+                    Height = St.SiF(IslandH, _scale);
+                    Location = new Point(cfg.X, cfg.Y);
+                    // 位置贴住顶边视为吸附态（与手动拖到顶边等效）；否则为普通悬浮条不自动隐藏
+                    var wa = Screen.FromControl(this).WorkingArea;
+                    _edgeDocked = Top <= wa.Top + St.SiF(EdgeThreshold, _scale);
+                    if (_edgeDocked) _edgeTargetX = Left;
+                    _edgeCollapsed = false;
+                    _edgeJustUndocked = false;
+                }
+            }
+            else if (St.IsPointOnScreen(new Point(cfg.X, cfg.Y)))
             {
                 Location = new Point(cfg.X, cfg.Y);
             }
@@ -1537,14 +1625,79 @@ namespace QuotaWidget
 
         public void Rebuild()
         {
-            Height = PadYS * 2 + _ctx.Providers.Count * RowH;
+            if (_island)
+            {
+                // 数据刷新导致徽标宽度变化：重算岛宽并保持中心点不变（不打断收起/展开状态）
+                int oldW = Width;
+                Width = IslandWidth();
+                Height = St.SiF(IslandH, _scale);
+                if (Width != oldW) Left += (oldW - Width) / 2;
+            }
+            else
+            {
+                Height = PadYS * 2 + _ctx.Providers.Count * RowH;
+            }
             UpdateLayered();
             if (_detail.Visible) ShowDetail();
         }
 
+        // 灵动岛宽度 = 徽标内容宽 + 左右内边距（与绘制同源测量，见 St.BuildBadges）
+        private int IslandWidth()
+        {
+            int pad = St.SiF(IslandPad, _scale);
+            float totalW = 0;
+            using (var g = CreateGraphics())
+                St.BuildBadges(_ctx.Providers, g, _scale, out totalW);
+            return Math.Max(St.SiF(IslandH, _scale), (int)Math.Ceiling(totalW) + pad * 2);
+        }
+
+        // 收起时露出的高度：灵动岛 5px（便于悬停命中），矩形卡片维持原 3px
+        private int PeekPx { get { return St.SiF(_island ? IslandPeek : EdgePeek, _scale); } }
+        private bool AnimRunning { get { return _animTimer != null && _animTimer.Enabled; } }
+
         protected override void OnLayeredPaint(Graphics g)
         {
-            // 圆角背景：圆角外像素 alpha=0 → 完全透明；抗锯齿过渡由系统 alpha 混合，无色键残留
+            if (_island)
+            {
+                // 条形灵动岛：圆角胶囊底 + 全周 1px 细边（曲度与悬浮窗卡片一致，参考系统圆角）+ 横向徽标
+                using (var path = St.RoundRect(new Rectangle(0, 0, Width - 1, Height - 1), St.SiF(12, _scale)))
+                {
+                    using (var brush = new SolidBrush(St.Bg))
+                        g.FillPath(brush, path);
+                    using (var pen = new Pen(St.Border, 1f))
+                        g.DrawPath(pen, path);
+                }
+                if (_ctx.Providers.Count == 0) return;
+
+                float s = _scale;
+                float gap = 24f * s;
+                float dot = 8f * s;
+                float dx1 = 8f * s, dx2 = 6f * s, dx3 = 10f * s;
+                float totalW;
+                var badges = St.BuildBadges(_ctx.Providers, g, s, out totalW);
+                float x = St.SiF(IslandPad, _scale);
+                if (x < 8) x = 8;
+
+                var fs = St.FontsForScale(s);
+                float textH = g.MeasureString("Ay", fs[1]).Height;
+                float textY = (Height - textH) / 2;
+                for (int i = 0; i < badges.Count; i++)
+                {
+                    var bi = badges[i];
+                    using (var b = new SolidBrush(bi.DotColor))
+                        g.FillEllipse(b, x, Height / 2 - dot / 2, dot, dot);
+                    float tx = x + dx1 + dx2;
+                    using (var b = new SolidBrush(St.Text))
+                        g.DrawString(bi.Name, fs[1], b, tx, textY);
+                    tx += bi.NameW + dx3;
+                    using (var b = new SolidBrush(bi.DotColor))
+                        g.DrawString(bi.Value, fs[1], b, tx, textY);
+                    x += dx1 + dx2 + bi.NameW + dx3 + bi.ValW + gap;
+                }
+                return;
+            }
+
+            // 矩形卡片（原样）：圆角背景，圆角外像素 alpha=0 → 完全透明
             using (var path = St.RoundRect(new Rectangle(0, 0, Width - 1, Height - 1), St.SiF(12, _scale)))
             {
                 using (var brush = new SolidBrush(St.Bg))
@@ -1681,7 +1834,7 @@ namespace QuotaWidget
             _ctx.Cfg.X = _edgeTargetX; _ctx.Cfg.Y = wa.Top; _ctx.Cfg.Save();
             _edgeDocked = true;
             _edgeCollapsed = true;
-            AnimateTo(new Point(_edgeTargetX, wa.Top - Height + St.SiF(EdgePeek, _scale)));
+            AnimateTo(new Point(_edgeTargetX, wa.Top - Height + PeekPx));
         }
 
         private void EdgeExpand()
@@ -1697,7 +1850,7 @@ namespace QuotaWidget
             if (_edgeCollapsed) return;
             var wa = Screen.FromControl(this).WorkingArea;
             _edgeCollapsed = true;
-            AnimateTo(new Point(_edgeTargetX, wa.Top - Height + St.SiF(EdgePeek, _scale)));
+            AnimateTo(new Point(_edgeTargetX, wa.Top - Height + PeekPx));
         }
 
         // 锁定位置开启时调用：停动画、清吸附态、窗口靠顶部展开固定
@@ -1763,7 +1916,8 @@ namespace QuotaWidget
             int x = Left;
             if (x + _detail.Width > wa.Right) x = wa.Right - _detail.Width - 8;
             if (x < wa.Left) x = wa.Left + 8;
-            int y = Bottom + 8;
+            // 灵动岛吸附态按展开后的底边定位：收起瞬间弹出面板也不与岛体重叠
+            int y = (_island && _edgeDocked ? wa.Top + Height : Bottom) + 8;
             if (y + _detail.Height > wa.Bottom) y = Top - _detail.Height - 8;
             _detail.Location = new Point(x, y);
             if (!_detail.Visible) _detail.Show();
@@ -2006,7 +2160,7 @@ namespace QuotaWidget
     // 不使用 SHAppBarMessage（混合 DPI 下会导致系统疯狂广播 ABN_POSCHANGED → 卡顿）。
     // 改用普通 TopMost 窗口 + SystemParametersInfo(SPI_SETWORKAREA) 手动预留工作区。
     // SPI_SETWORKAREA 只修改系统工作区度量，不触发 AppBar 消息循环，不会卡顿。
-    internal class TopBarForm : Form
+    internal class TopBarForm : LayeredForm
     {
         private readonly AppContext _ctx;
         internal DetailForm _detail;
@@ -2087,11 +2241,6 @@ namespace QuotaWidget
             StartPosition = FormStartPosition.Manual;
             Height = _barHeight;
             TopMost = true;
-            AutoScaleMode = AutoScaleMode.None;
-
-            // 双缓冲自绘，避免闪烁
-            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
-            UpdateStyles();
 
             // 首次显示后强制修正高度（WinForms 首次 Show 时可能因非客户区/自动缩放导致高度偏大）
             Shown += delegate
@@ -2102,6 +2251,7 @@ namespace QuotaWidget
                     // 高度变了，重新预留工作区以匹配
                     if (_currentScreen >= 0) ReserveWorkArea(_currentScreen);
                 }
+                UpdateLayered();
             };
 
             _detail = new DetailForm(ctx);
@@ -2112,7 +2262,7 @@ namespace QuotaWidget
             _uiTimer = new System.Windows.Forms.Timer { Interval = 1000 };
             _uiTimer.Tick += delegate
             {
-                Invalidate();
+                UpdateLayered();
                 if (_detail.Visible) _detail.UpdateLayered();
                 _ctx.UpdateTrayTip();
             };
@@ -2394,7 +2544,7 @@ namespace QuotaWidget
             _reservedScreen = -1;
         }
 
-        // 把置顶栏贴到目标屏顶部，并预留工作区
+        // 把置顶栏贴到目标屏顶部（全宽常驻），并预留工作区
         private void ApplyToScreen(int screenIndex)
         {
             // 切屏时先清除旧屏的预留（恢复旧屏原始工作区）
@@ -2430,7 +2580,7 @@ namespace QuotaWidget
             // 详情面板跟随目标屏 DPI（跨缩放屏切换时尺寸一致）
             _detail.DpiScale = GetScreenDpi(screen) / 96f;
             ReserveWorkArea(screenIndex);
-            Invalidate();
+            UpdateLayered();
         }
 
         // 退出时恢复工作区
@@ -2446,8 +2596,8 @@ namespace QuotaWidget
             St.Theme = cfg.Theme == "dark" ? 1 : 2;
             St.Mini = false; // 置顶栏不使用 mini
             int pct = Math.Max(50, Math.Min(100, cfg.OpacityPct));
-            // 窗口半透明：置顶栏为普通窗口，用 Form.Opacity（悬浮窗/详情窗为分层窗口，走 LayeredAlpha）
-            Opacity = pct / 100.0;
+            // 置顶栏与悬浮窗同为分层窗口：用 LayeredAlpha 控制不透明度（Form.Opacity 对 ULW 窗口无效）
+            LayeredAlpha = (byte)(255 * pct / 100);
             _detail.LayeredAlpha = (byte)(255 * pct / 100);
             // 置顶栏同样消费"窗口置顶"配置（此前硬编码 true，取消勾选后设置静默失效）
             TopMost = cfg.TopMost;
@@ -2461,7 +2611,7 @@ namespace QuotaWidget
             ApplyToScreen(targetScreen);
 
             _uiTimer.Start();
-            Invalidate();
+            UpdateLayered();
         }
 
         // 切回悬浮窗模式后置顶栏隐藏且工作区已恢复，停止其刷新/重绘定时器，
@@ -2474,20 +2624,12 @@ namespace QuotaWidget
 
         public void Rebuild()
         {
-            Invalidate();
+            UpdateLayered();
         }
 
         // ---- 绘制：全宽背景 + 居中横向徽标 ----
-        private struct BadgeInfo
+        protected override void OnLayeredPaint(Graphics g)
         {
-            public string Name, Value;
-            public Color DotColor;
-            public float NameW, ValW;
-        }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
 
@@ -2501,42 +2643,22 @@ namespace QuotaWidget
             var providers = _ctx.Providers;
             if (providers.Count == 0) return;
 
-            // 第一遍：测量每个徽标宽度
+            // 徽标绘制（数据与测量均来自 St.BuildBadges）
             float s = _scale; // 当前屏缩放因子（直接保存的 DPI/96，避免 int 截断反推的精度误差）
             float gap = 24f * s;
             float dot = 8f * s;
             float dx1 = 8f * s, dx2 = 6f * s, dx3 = 10f * s;
-            var fs = St.FontsForScale(s); // [1]=FNorm
-            var badges = new List<BadgeInfo>(providers.Count);
-            float totalW = 0;
-
-            foreach (var st in providers)
-            {
-                var bi = new BadgeInfo { Name = st.Name };
-                bool err = st.Error != null;
-                var pool = st.Primary5h;
-                int usedPct = pool != null ? Math.Max(0, Math.Min(100, pool.Percent)) : 0;
-                int remain = 100 - usedPct;
-                bi.DotColor = err ? St.Red : St.RemainColor(remain);
-                bi.Value = err ? "失败"
-                    : (pool != null
-                        ? (pool.IsMoney ? pool.Currency + St.FmtMoney(pool.Remaining) : remain + "%")
-                        : "--");
-                bi.NameW = g.MeasureString(bi.Name, fs[1]).Width;
-                bi.ValW = g.MeasureString(bi.Value, fs[1]).Width;
-                badges.Add(bi);
-                totalW += dx1 + dx2 + bi.NameW + dx3 + bi.ValW + gap;
-            }
-            totalW -= gap;
+            float totalW;
+            var badges = St.BuildBadges(providers, g, s, out totalW);
 
             // 居中起始 X
             float x = (Width - totalW) / 2;
             if (x < 8) x = 8;
 
+            var fs = St.FontsForScale(s);
             float textH = g.MeasureString("Ay", fs[1]).Height;
             float textY = (Height - textH) / 2;
 
-            // 第二遍：绘制
             for (int i = 0; i < badges.Count; i++)
             {
                 var bi = badges[i];
@@ -2632,6 +2754,13 @@ namespace QuotaWidget
         private void HideGhost()
         {
             if (_ghost != null && _ghost.Visible) _ghost.Hide();
+        }
+
+        // 分层窗口移动后需重新提交位图，否则跨屏切换时画面停留在旧位置
+        protected override void OnLocationChanged(EventArgs e)
+        {
+            base.OnLocationChanged(e);
+            if (IsHandleCreated) UpdateLayered();
         }
 
         // ---- 详情面板 ----
@@ -3618,6 +3747,7 @@ namespace QuotaWidget
         // ---- 待保存设置（纯字段而非控件：跨屏 DPI 重建布局时状态天然保留，无需备份回填） ----
         private int _pendMode;      // 0=悬浮窗 1=置顶栏
         private int _pendScreen;    // 置顶栏停靠屏幕索引
+        private bool _pendIsland;   // 悬浮窗排列：true=条形灵动岛 / false=矩形卡片
         private int _pendInterval;  // 刷新间隔（秒）
         private int _pendOpacity;   // 不透明度 50-100
         private bool _pendTopMost;
@@ -3660,11 +3790,12 @@ namespace QuotaWidget
         private readonly List<int> _visRows = new List<int>();        // 通用页可见行（置顶栏模式才含“显示屏幕”）
         private readonly List<Rectangle> _rowRects = new List<Rectangle>();
         private readonly List<Rectangle> _segModeBtns = new List<Rectangle>();
+        private readonly List<Rectangle> _segLayoutBtns = new List<Rectangle>();
         private readonly List<Rectangle> _segThemeBtns = new List<Rectangle>();
-        private Rectangle _rcSegMode, _rcSegTheme, _rcSelScreen, _rcSelInt, _rcSlider, _rcTglTop, _rcTglAuto;
+        private Rectangle _rcSegMode, _rcSegLayout, _rcSegTheme, _rcSelScreen, _rcSelInt, _rcSlider, _rcTglTop, _rcTglAuto;
 
-        // 通用页行号
-        private const int R_MODE = 0, R_SCREEN = 1, R_INT = 2, R_OP = 3, R_THEME = 4, R_TOP = 5, R_AUTO = 6;
+        // 通用页行号（R_LAYOUT 仅悬浮窗模式显示，R_SCREEN 仅置顶栏模式显示）
+        private const int R_MODE = 0, R_LAYOUT = 1, R_SCREEN = 2, R_INT = 3, R_OP = 4, R_THEME = 5, R_TOP = 6, R_AUTO = 7;
         // 刷新间隔预设（秒）；用户已有自定义值不在预设中时插入列表，保证不丢配置
         private static readonly int[] IntervalPresets = new int[] { 15, 30, 60, 120, 300, 600, 1800, 3600 };
 
@@ -3717,6 +3848,7 @@ namespace QuotaWidget
 
             _pendMode = _ctx.Cfg.DisplayMode == "topbar" ? 1 : 0;
             _pendScreen = Math.Max(0, Math.Min(Screen.AllScreens.Length - 1, _ctx.Cfg.AppBarScreen));
+            _pendIsland = _ctx.Cfg.FloatLayout == "island";
             _pendInterval = Math.Max(15, Math.Min(3600, _ctx.Cfg.RefreshSec));
             _pendOpacity = Math.Max(50, Math.Min(100, _ctx.Cfg.OpacityPct));
             _pendTopMost = _ctx.Cfg.TopMost;
@@ -3808,6 +3940,7 @@ namespace QuotaWidget
             _visRows.Clear();
             _rowRects.Clear();
             _segModeBtns.Clear();
+            _segLayoutBtns.Clear();
             _segThemeBtns.Clear();
         }
 
@@ -3892,6 +4025,7 @@ namespace QuotaWidget
 
             int pad = S(16), rowH = S(52);
             _visRows.Add(R_MODE);
+            if (_pendMode == 0) _visRows.Add(R_LAYOUT); // 仅悬浮窗模式需要选择排列（条形灵动岛 / 矩形卡片）
             if (_pendMode == 1) _visRows.Add(R_SCREEN); // 仅置顶栏模式需要选择停靠屏幕
             _visRows.Add(R_INT);
             _visRows.Add(R_OP);
@@ -3910,6 +4044,12 @@ namespace QuotaWidget
                         SegBtns(_rcSegMode, _segModeBtns);
                         AddHot(_segModeBtns[0], "segmode:0");
                         AddHot(_segModeBtns[1], "segmode:1");
+                        break;
+                    case R_LAYOUT:
+                        _rcSegLayout = SegRect(rr, new string[] { "矩形卡片", "条形灵动岛" });
+                        SegBtns(_rcSegLayout, _segLayoutBtns);
+                        AddHot(_segLayoutBtns[0], "seglayout:0");
+                        AddHot(_segLayoutBtns[1], "seglayout:1");
                         break;
                     case R_SCREEN:
                         _rcSelScreen = new Rectangle(rr.Right - pad - S(210), cy - S(17), S(210), S(34));
@@ -4278,6 +4418,7 @@ namespace QuotaWidget
             switch (rowId)
             {
                 case R_MODE: return "显示模式";
+                case R_LAYOUT: return "排列";
                 case R_SCREEN: return "显示屏幕";
                 case R_INT: return "刷新间隔";
                 case R_OP: return "窗口不透明度";
@@ -4292,7 +4433,8 @@ namespace QuotaWidget
         {
             switch (rowId)
             {
-                case R_MODE: return "悬浮窗为独立小窗，可拖动、可最小化；置顶栏嵌入屏幕顶部并占用工作区。";
+                case R_MODE: return "悬浮窗为独立小窗，可拖动，有矩形/条形两种排列；置顶栏全宽贴屏幕顶边常驻并预留工作区。";
+                case R_LAYOUT: return "条形灵动岛为内容自适应宽的圆角胶囊，贴顶自动隐藏、可拖拽定位，拖离顶边变为普通悬浮条；矩形卡片为多行卡片视图，支持 mini 模式。";
                 case R_SCREEN: return "置顶栏停靠的显示器。";
                 case R_INT: return "自动查询额度的时间间隔。";
                 case R_OP: return "数值越低悬浮窗越透明。";
@@ -4316,9 +4458,12 @@ namespace QuotaWidget
             switch (rowId)
             {
                 case R_MODE:
-                    // 分段顺序：置顶栏在左（默认模式在前）。段位 0=置顶栏 / 1=悬浮窗，
-                    // 与 _pendMode（0=悬浮窗 1=置顶栏）语义相反，读写两端都做换算
-                    PaintSeg(g, p, fs, _rcSegMode, _segModeBtns, new string[] { "置顶栏", "悬浮窗" }, _pendMode == 1 ? 0 : 1, "segmode");
+                    // 分段顺序：悬浮窗在左（默认模式在前）。段位 0=悬浮窗 / 1=置顶栏，与 _pendMode 一致
+                    PaintSeg(g, p, fs, _rcSegMode, _segModeBtns, new string[] { "悬浮窗", "置顶栏" }, _pendMode, "segmode");
+                    break;
+                case R_LAYOUT:
+                    // 分段顺序：条形灵动岛在左（默认排列在前）。段位 0=条形灵动岛 / 1=矩形卡片，与 _pendIsland 一致
+                    PaintSeg(g, p, fs, _rcSegLayout, _segLayoutBtns, new string[] { "条形灵动岛", "矩形卡片" }, _pendIsland ? 0 : 1, "seglayout");
                     break;
                 case R_SCREEN:
                     string[] items = ScreenItems();
@@ -4599,7 +4744,8 @@ namespace QuotaWidget
             }
             else if (_page == 1)
             {
-                if (id != null && id.StartsWith("segmode:")) { SetMode(int.Parse(id.Substring(8)) == 0 ? 1 : 0); return; } // 段位 0=置顶栏 → _pendMode=1
+                if (id != null && id.StartsWith("segmode:")) { SetMode(int.Parse(id.Substring(8))); return; } // 段位 0=悬浮窗 / 1=置顶栏，与 _pendMode 一致
+                if (id != null && id.StartsWith("seglayout:")) { _pendIsland = int.Parse(id.Substring(10)) == 0; Invalidate(); return; } // 段位 0=条形灵动岛 / 1=矩形卡片
                 if (id != null && id.StartsWith("segtheme:")) { _pendDark = int.Parse(id.Substring(9)) == 1; Invalidate(); return; }
                 if (id == "tgl:top") { _pendTopMost = !_pendTopMost; Invalidate(); return; }
                 if (id == "tgl:auto") { _pendAutoStart = !_pendAutoStart; Invalidate(); return; }
@@ -4943,6 +5089,7 @@ namespace QuotaWidget
             string oldTheme = _ctx.Cfg.Theme;
             string oldDisplayMode = _ctx.Cfg.DisplayMode;
             int oldAppBarScreen = _ctx.Cfg.AppBarScreen;
+            string oldFloatLayout = _ctx.Cfg.FloatLayout;
 
             // 拷贝而非直接赋值：保存失败时窗口保持打开，用户继续增删/移动供应商会突变
             // _editList；若与 Cfg.Providers 共享同一 List，刷新线程池并行遍历会因列表收缩
@@ -4955,6 +5102,7 @@ namespace QuotaWidget
             _ctx.Cfg.Theme = _pendDark ? "dark" : "light";
             _ctx.Cfg.DisplayMode = _pendMode == 1 ? "topbar" : "float";
             _ctx.Cfg.AppBarScreen = _pendScreen;
+            _ctx.Cfg.FloatLayout = _pendIsland ? "island" : "card";
             // 保存失败（磁盘满/文件被杀软锁定等）不静默关闭窗口：
             // 否则用户以为已保存，重启后 API Key 全部丢失且无任何自救提示
             if (!_ctx.Cfg.Save())
@@ -4968,6 +5116,7 @@ namespace QuotaWidget
                 _ctx.Cfg.Theme = oldTheme;
                 _ctx.Cfg.DisplayMode = oldDisplayMode;
                 _ctx.Cfg.AppBarScreen = oldAppBarScreen;
+                _ctx.Cfg.FloatLayout = oldFloatLayout;
                 StyledMsg.Show(this, "保存失败", "配置保存失败（config.json 写入失败，可能磁盘已满或被其他程序占用）。\n窗口保持打开，请先记录本次填写的 API Key，再重试保存。", P, _scale);
                 return;
             }
