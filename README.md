@@ -1,4 +1,4 @@
-# QuotaWidget - AI 额度悬浮窗
+# QuotaWidget - AI 额度工具
 
 一个轻量级的 Windows 桌面悬浮窗，实时监控多个 AI 服务商的额度使用情况。纯 C# WinForms 单文件实现，零依赖，双击即用。
 

@@ -1,4 +1,4 @@
-// QuotaWidget - AI 额度悬浮窗 (GLM Coding Plan / MiniMax Token Plan / Kimi Code Plan / DeepSeek 余额)
+// QuotaWidget - AI 额度工具 (GLM Coding Plan / MiniMax Token Plan / Kimi Code Plan / DeepSeek 余额)
 // 编译: csc.exe /nologo /utf8output /target:winexe /optimize+ /win32icon:QuotaWidget.ico /out:QuotaWidget.exe QuotaWidget.cs /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll
 using System;
 using System.Collections;
@@ -861,13 +861,15 @@ namespace QuotaWidget
             return 96;
         }
 
-        public static Color Bg { get { return Theme == 1 ? Color.FromArgb(44, 47, 59) : Color.FromArgb(240, 241, 244); } }
-        public static Color Card { get { return Theme == 1 ? Color.FromArgb(55, 59, 73) : Color.FromArgb(249, 250, 251); } }
+        // 悬浮窗 / 置顶栏 / 明细面板配色。对比度与设置页（contrast-proposal 方案 A）同方向：
+        // 边框 / 分割线提到可见强度，浅色明细面板提纯白与悬浮窗底拉开，深色反向加深底层。
+        public static Color Bg { get { return Theme == 1 ? Color.FromArgb(40, 43, 54) : Color.FromArgb(237, 238, 242); } }
+        public static Color Card { get { return Theme == 1 ? Color.FromArgb(62, 67, 84) : Color.FromArgb(255, 255, 255); } }
         public static Color Text { get { return Theme == 1 ? Color.FromArgb(232, 234, 240) : Color.FromArgb(51, 65, 85); } }
         public static Color Dim { get { return Theme == 1 ? Color.FromArgb(158, 166, 186) : Color.FromArgb(100, 116, 139); } }
-        public static Color BarBg { get { return Theme == 1 ? Color.FromArgb(74, 79, 98) : Color.FromArgb(218, 222, 229); } }
-        // 窗口最外圈细线：深色主题用浅线，浅色主题用比底色深一点的线
-        public static Color Border { get { return Theme == 1 ? Color.FromArgb(68, 73, 90) : Color.FromArgb(204, 208, 217); } }
+        public static Color BarBg { get { return Theme == 1 ? Color.FromArgb(86, 92, 112) : Color.FromArgb(206, 211, 221); } }
+        // 窗口最外圈细线：深色主题用浅线，浅色主题用深线，保证在任何壁纸上都有轮廓
+        public static Color Border { get { return Theme == 1 ? Color.FromArgb(88, 94, 114) : Color.FromArgb(185, 191, 203); } }
         public static Color Green { get { return Theme == 1 ? Color.FromArgb(52, 211, 153) : Color.FromArgb(46, 139, 87); } }
         public static Color Amber { get { return Theme == 1 ? Color.FromArgb(251, 191, 36) : Color.FromArgb(190, 120, 24); } }
         public static Color Red { get { return Theme == 1 ? Color.FromArgb(248, 113, 113) : Color.FromArgb(198, 64, 48); } }
@@ -945,6 +947,17 @@ namespace QuotaWidget
             path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
             path.CloseFigure();
             return path;
+        }
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+        // Win11 圆角：DWMWA_WINDOW_CORNER_PREFERENCE(33) / DWMWCP_ROUND(2)，DWM 抗锯齿裁剪窗口四角；
+        // 旧系统无此 API 调用失败保持直角（兼容策略与 DpiOf 一致）。设置窗 / 下拉弹层 / 右键菜单共用。
+        public static void RoundCorners(IntPtr hwnd)
+        {
+            int pref = 2; // DWMWCP_ROUND
+            DwmSetWindowAttribute(hwnd, 33, ref pref, 4);
         }
 
         public static void DrawBar(Graphics g, Rectangle r, int pct, Color fill)
@@ -1150,8 +1163,6 @@ namespace QuotaWidget
                 if (_topBar == null || _topBar.IsDisposed)
                 {
                     _topBar = new TopBarForm(this);
-                    _topBar.ContextMenuStrip = Floating.ContextMenuStrip;
-                    _topBar._detail.ContextMenuStrip = Floating.ContextMenuStrip;
                 }
                 return _topBar;
             }
@@ -1169,54 +1180,11 @@ namespace QuotaWidget
             {
                 Icon = IconFactory.Create(),
                 Visible = true,
-                Text = "AI 额度悬浮窗 v" + AppInfo.Version
+                Text = "AI 额度工具 v" + AppInfo.Version
             };
-            var menu = new ContextMenuStrip();
-            menu.Items.Add("立即刷新", null, delegate { RefreshData(); });
-            var miMini = new ToolStripMenuItem("mini 模式") { Checked = Cfg.MiniMode };
-            miMini.Click += delegate
-            {
-                Cfg.MiniMode = !Cfg.MiniMode;
-                miMini.Checked = Cfg.MiniMode;
-                Cfg.Save();
-                Floating.ApplyFromConfig();
-                Floating.Rebuild();
-                // 吸附态下切换 mini 会因高度变化导致窗口消失，直接取消吸附贴顶部展开
-                Floating.RestoreFromEdge();
-            };
-            menu.Items.Add(miMini);
-            var miLock = new ToolStripMenuItem("固定位置") { Checked = Cfg.LockPosition };
-            miLock.Click += delegate
-            {
-                Cfg.LockPosition = !Cfg.LockPosition;
-                miLock.Checked = Cfg.LockPosition;
-                if (Cfg.LockPosition) Floating.RestoreFromEdge();
-                else Floating.OnLockReleased();
-                Cfg.Save();
-            };
-            menu.Items.Add(miLock);
-            menu.Items.Add("设置…", null, delegate { ShowSettings(); });
-            menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("退出", null, delegate { ExitApp(); });
-            // 打开菜单时同步勾选状态（兼容设置页等外部改动）
-            menu.Opening += delegate
-            {
-                bool isTopbar = Cfg.DisplayMode == "topbar";
-                miMini.Checked = Cfg.MiniMode;
-                miLock.Checked = Cfg.LockPosition;
-                // 置顶栏模式下 mini / 固定位置 无意义，隐藏
-                miMini.Visible = !isTopbar;
-                miLock.Visible = !isTopbar;
-                // 菜单跟随鼠标所在屏的 DPI，保证各屏物理大小一致；
-                // DPI 查询失败（旧系统无 shcore）时保持默认字体，不影响功能
-                try { menu.Font = St.FontsForScale(St.DpiOf(Screen.FromPoint(Cursor.Position)) / 96f)[1]; }
-                catch { }
-            };
-            Tray.ContextMenuStrip = menu;
-            Floating.ContextMenuStrip = menu;
-            Floating._detail.ContextMenuStrip = menu;
             Tray.MouseClick += delegate(object s, MouseEventArgs e)
             {
+                if (e.Button == MouseButtons.Right) { ShowMenu(); return; }
                 if (e.Button == MouseButtons.Left && !_firstShow)
                 {
                     if (Cfg.DisplayMode == "topbar")
@@ -1255,6 +1223,38 @@ namespace QuotaWidget
             if (_settings == null || _settings.IsDisposed) _settings = new SettingsForm(this);
             _settings.Show();
             _settings.Activate();
+        }
+
+        // 悬浮窗 / 置顶栏 / 托盘图标共用的右键菜单（自绘 WidgetMenu，样式与设置页统一）。
+        // 每次弹出按当前配置构建：勾选态天然实时；置顶栏模式下 mini / 固定位置无意义不显示
+        //（与旧 ContextMenuStrip 行为一致）
+        public void ShowMenu()
+        {
+            var menu = new WidgetMenu();
+            menu.AddItem("立即刷新", false, false, delegate { RefreshData(); });
+            if (Cfg.DisplayMode != "topbar")
+            {
+                menu.AddItem("mini 模式", true, Cfg.MiniMode, delegate
+                {
+                    Cfg.MiniMode = !Cfg.MiniMode;
+                    Cfg.Save();
+                    Floating.ApplyFromConfig();
+                    Floating.Rebuild();
+                    // 吸附态下切换 mini 会因高度变化导致窗口消失，直接取消吸附贴顶部展开
+                    Floating.RestoreFromEdge();
+                });
+                menu.AddItem("固定位置", true, Cfg.LockPosition, delegate
+                {
+                    Cfg.LockPosition = !Cfg.LockPosition;
+                    if (Cfg.LockPosition) Floating.RestoreFromEdge();
+                    else Floating.OnLockReleased();
+                    Cfg.Save();
+                });
+            }
+            menu.AddItem("设置…", false, false, delegate { ShowSettings(); });
+            menu.AddSeparator();
+            menu.AddItem("退出", false, false, delegate { ExitApp(); });
+            menu.ShowAt(Cursor.Position);
         }
 
         public void ApplyConfig()
@@ -1602,6 +1602,7 @@ namespace QuotaWidget
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
+            if (e.Button == MouseButtons.Right) { _ctx.ShowMenu(); return; }
             if (!_dragging) return;
             _dragging = false;
             _edgeJustUndocked = false;
@@ -1867,6 +1868,24 @@ namespace QuotaWidget
         {
             base.OnMouseLeave(e);
             if (RequestArmHide != null) RequestArmHide();
+        }
+        // HUD 详情面板不抢焦点：弹出 / 点击都不激活（WS_EX_NOACTIVATE），
+        // 避免悬停展开时打断其他窗口的前台状态（含刚弹出的右键菜单）
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                var cp = base.CreateParams;
+                cp.ExStyle |= 0x08000000; // WS_EX_NOACTIVATE
+                return cp;
+            }
+        }
+
+        // 右键菜单与悬浮窗共用（自绘 WidgetMenu）
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            if (e.Button == MouseButtons.Right) _ctx.ShowMenu();
         }
         // 与悬浮窗一致，重新定位后刷新分层位图
         protected override void OnLocationChanged(EventArgs e)
@@ -2564,6 +2583,7 @@ namespace QuotaWidget
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
+            if (e.Button == MouseButtons.Right) { _ctx.ShowMenu(); return; }
             if (!_dragging) return;
             _dragging = false;
             HideGhost();
@@ -2667,13 +2687,7 @@ namespace QuotaWidget
         {
             var bmp = new Bitmap(32, 32);
             using (var g = Graphics.FromImage(bmp))
-            {
-                g.SmoothingMode = SmoothingMode.AntiAlias;
-                using (var pen = new Pen(St.GlmAccent, 5f))
-                    g.DrawArc(pen, 5, 5, 22, 22, -90, 270);
-                using (var brush = new SolidBrush(St.MxAccent))
-                    g.FillEllipse(brush, 13, 13, 6, 6);
-            }
+                DrawGlyph(g, new Rectangle(0, 0, 32, 32));
             IntPtr hIcon = bmp.GetHicon();
             bmp.Dispose();
             // Icon.FromHandle 不接管 HICON 所有权，需克隆后手动销毁原始句柄
@@ -2682,6 +2696,18 @@ namespace QuotaWidget
             tmp.Dispose();
             DestroyIcon(hIcon);
             return icon;
+        }
+
+        // 仪表盘图标本体（270° 弧 + 圆点），按目标矩形等比绘制：
+        // 托盘位图 / 设置窗标题栏 / 关于页共用同一造型，保证全应用图标一致
+        public static void DrawGlyph(Graphics g, Rectangle r)
+        {
+            float k = r.Width / 32f;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var pen = new Pen(St.GlmAccent, 5f * k))
+                g.DrawArc(pen, r.X + 5f * k, r.Y + 5f * k, 22f * k, 22f * k, -90, 270);
+            using (var brush = new SolidBrush(St.MxAccent))
+                g.FillEllipse(brush, r.X + 13f * k, r.Y + 13f * k, 6f * k, 6f * k);
         }
     }
 
@@ -2709,526 +2735,2202 @@ namespace QuotaWidget
         }
     }
 
-    // ============================= 添加供应商对话框 =============================
-    internal class AddProviderDialog : Form
+    // ============================= 设置风格对话框基类 =============================
+    // 无边框 + 自绘标题栏（应用图标 / 标题 / 关闭）+ DWM 圆角 + 失焦不画系统框，
+    // 添加/编辑供应商、测试结果、消息提示等弹窗共用，观感与设置窗口完全一致。
+    internal class StyledDialogBase : Form
     {
-        private ComboBox _cmbType;
-        private TextBox _txtKey;
-        private TextBox _txtName;
-        public ProviderConfig Result { get; private set; }
-        // 所在屏缩放（跟随鼠标所在屏，保证各屏物理大小一致）
-        private float _scale = St.Scale;
+        protected readonly SettingsPal Pal;
+        protected readonly float Sf;      // 缩放因子（打开时所在屏，对话框生命周期内固定）
+        protected readonly Font[] Fs;     // St 字体组 [0..3]
+        private Rectangle _rcClose;
+        private bool _hoverClose, _dragWin;
+        private Point _dragOff;
 
-        public AddProviderDialog() : this(null, null) { }
-
-        public AddProviderDialog(ProviderConfig existing) : this(existing, null) { }
-
-        public AddProviderDialog(ProviderConfig existing, Form owner)
+        protected StyledDialogBase(string title, SettingsPal pal, float scale, Size client)
         {
-            Text = existing != null ? "编辑供应商" : "添加供应商";
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            MaximizeBox = false;
-            MinimizeBox = false;
+            Text = title;
+            Pal = pal; Sf = scale; Fs = St.FontsForScale(scale);
+            FormBorderStyle = FormBorderStyle.None;
             StartPosition = FormStartPosition.CenterParent;
-            // 缩放基准取父窗体所在屏而非光标所在屏：键盘触发（如菜单快捷键）时两者可能不一致，
-            // 导致与 CenterParent 定位屏算错 DPI；无 owner（对话框直接弹出）时退回光标所在屏
-            var baseScreen = owner != null ? Screen.FromControl(owner) : Screen.FromPoint(Cursor.Position);
-            _scale = St.DpiOf(baseScreen) / 96f;
-            Func<int, int> S = v => St.SiF(v, _scale);
-            AutoScaleMode = AutoScaleMode.None; // 手动布局，禁用 PerMonitorV2 自动缩放
-            ClientSize = new Size(S(400), S(175));
-            Font = St.FontsForScale(_scale)[1];
-            BackColor = Color.FromArgb(248, 250, 252);
+            ShowInTaskbar = false;
+            // 跟随设置窗口的普通层级（非置顶）
+            AutoScaleMode = AutoScaleMode.None;
+            ClientSize = client;
+            KeyPreview = true;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            UpdateStyles();
+        }
 
-            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Padding = new Padding(S(16)), RowCount = 4 };
-            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, S(90)));
-            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        protected int S(int v) { return St.SiF(v, Sf); }
 
-            // 接口选择
-            layout.Controls.Add(new Label { Text = "接口", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 0);
-            _cmbType = new NoWheelComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
-            _cmbType.Items.AddRange(new object[] { "GLM 国内版 open.bigmodel.cn", "GLM 国际版 api.z.ai", "MiniMax 国内版 minimaxi.com", "MiniMax 国际版 minimax.io", "Kimi Code Plan api.kimi.com", "DeepSeek api.deepseek.com" });
-            _cmbType.SelectedIndex = 0;
-            _cmbType.SelectedIndexChanged += delegate { UpdateDefaultName(); };
-            layout.Controls.Add(_cmbType, 1, 0);
+        protected int TitleH { get { return S(46); } }
 
-            // API Key
-            layout.Controls.Add(new Label { Text = "API Key", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 1);
-            _txtKey = new TextBox { Dock = DockStyle.Fill, PasswordChar = '●' };
-            layout.Controls.Add(_txtKey, 1, 1);
+        // 圆角统一刻度（DIP）：容器 12 > 卡片 10 > 控件 8 > 控件内小件 6；胶囊（徽标/开关）取高度一半
+        protected int R(int v) { return S(v); }
 
-            // 显示名称
-            layout.Controls.Add(new Label { Text = "显示名称", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 2);
-            _txtName = new TextBox { Dock = DockStyle.Fill, Text = "GLM" };
-            layout.Controls.Add(_txtName, 1, 2);
+        protected override CreateParams CreateParams
+        {
+            get { var cp = base.CreateParams; cp.Style |= 0x00040000; return cp; } // WS_THICKFRAME → DWM 阴影 + Win11 圆角
+        }
 
-            // 按钮
-            var btnPanel = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Fill, Height = S(36) };
-            var btnOk = new Button { Text = "确认", Width = S(80), Height = S(28), BackColor = Color.FromArgb(51, 65, 85), ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
-            var btnCancel = new Button { Text = "取消", Width = S(80), Height = S(28), FlatStyle = FlatStyle.Flat, DialogResult = DialogResult.Cancel };
-            btnOk.Click += delegate { OnOk(); };
-            btnPanel.Controls.Add(btnOk);
-            btnPanel.Controls.Add(btnCancel);
-            layout.Controls.Add(btnPanel, 0, 3);
-            layout.SetColumnSpan(btnPanel, 2);
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            St.RoundCorners(Handle);
+        }
 
-            AcceptButton = btnOk;
-            CancelButton = btnCancel;
-            Controls.Add(layout);
+        protected override void WndProc(ref Message m)
+        {
+            const int WM_NCCALCSIZE = 0x0083, WM_NCHITTEST = 0x0084, WM_NCACTIVATE = 0x0086;
+            if (m.Msg == WM_NCCALCSIZE && m.WParam != IntPtr.Zero) { m.Result = IntPtr.Zero; return; }
+            if (m.Msg == WM_NCHITTEST) { m.Result = (IntPtr)1; return; }
+            if (m.Msg == WM_NCACTIVATE) { m.Result = (IntPtr)1; return; } // 失焦不让 DWM 重绘系统边框（同设置窗口）
+            base.WndProc(ref m);
+        }
+
+        // 标题栏 + 关闭按钮 + 外框；子类先调 base.OnPaint 再画自身内容
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            using (var b = new SolidBrush(Pal.Win))
+                g.FillRectangle(b, ClientRectangle);
+
+            var ic = new Rectangle(S(14), (TitleH - S(20)) / 2, S(20), S(20));
+            IconFactory.DrawGlyph(g, ic);
+            TextRenderer.DrawText(g, Text, Fs[1], new Rectangle(ic.Right + S(9), 0, Width - ic.Right - S(60), TitleH), Pal.Text, TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+
+            int bs = S(32);
+            _rcClose = new Rectangle(Width - S(10) - bs, S(7), bs, bs);
+            if (_hoverClose)
+                using (var path = St.RoundRect(_rcClose, S(8)))
+                using (var b = new SolidBrush(Pal.Hover))
+                    g.FillPath(b, path);
+            using (var pen = new Pen(Pal.Text2, 1.4f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+            {
+                float cx = _rcClose.X + bs / 2f, cy = _rcClose.Y + bs / 2f, d = S(5);
+                g.DrawLine(pen, cx - d, cy - d, cx + d, cy + d);
+                g.DrawLine(pen, cx + d, cy - d, cx - d, cy + d);
+            }
+            using (var pen = new Pen(Pal.Line2))
+                g.DrawLine(pen, 0, TitleH - 1, Width, TitleH - 1);
+            using (var pen = new Pen(Pal.Line))
+                g.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left) return;
+            if (_rcClose.Contains(e.Location)) { Close(); return; }
+            if (e.Y < TitleH)
+            {
+                _dragWin = true;
+                _dragOff = new Point(MousePosition.X - Left, MousePosition.Y - Top);
+                Capture = true;
+            }
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            if (_dragWin) { Location = new Point(MousePosition.X - _dragOff.X, MousePosition.Y - _dragOff.Y); return; }
+            bool h = _rcClose.Contains(e.Location);
+            if (h != _hoverClose) { _hoverClose = h; Invalidate(_rcClose); }
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            _dragWin = false;
+            Capture = false;
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            if (_hoverClose) { _hoverClose = false; Invalidate(_rcClose); }
+        }
+
+        // 主/次按钮（与设置窗口同款：TextRenderer 垂直居中 + 悬停态）
+        protected void PaintBtn(Graphics g, Rectangle r, string text, bool primary, bool hot)
+        {
+            using (var path = St.RoundRect(r, S(8)))
+            {
+                if (primary)
+                {
+                    using (var b = new SolidBrush(hot ? SettingsPal.Mix(Pal.Primary, Pal.Win, 0.12) : Pal.Primary))
+                        g.FillPath(b, path);
+                }
+                else
+                {
+                    using (var b = new SolidBrush(hot ? Pal.Hover : Pal.Win))
+                        g.FillPath(b, path);
+                    using (var pen = new Pen(Pal.Line))
+                        g.DrawPath(pen, path);
+                }
+            }
+            Color c = primary ? Pal.PrimaryText : (hot ? Pal.Text : Pal.Text2);
+            TextRenderer.DrawText(g, text, Fs[1], r, c, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+        }
+    }
+
+    // ============================= 添加 / 编辑供应商（设置页同款风格） =============================
+    internal class ProviderEditDialog : StyledDialogBase
+    {
+        private static readonly string[] TypeItems = new string[]
+        {
+            "GLM 国内版 open.bigmodel.cn", "GLM 国际版 api.z.ai",
+            "MiniMax 国内版 minimaxi.com", "MiniMax 国际版 minimax.io",
+            "Kimi Code Plan api.kimi.com", "DeepSeek api.deepseek.com"
+        };
+        private static readonly string[] TypeDefaultNames = new string[] { "GLM", "GLM", "MiniMax", "MiniMax", "Kimi", "DeepSeek" };
+
+        private readonly TextBox _txtKey, _txtName;
+        private readonly Rectangle _rcSelect, _rcKeyBox, _rcNameBox, _rcOk, _rcCancel;
+        private int _typeIndex;
+        private bool _hotOk, _hotCancel, _hotSelect;
+        private SettingsPopupList _popup;
+        public ProviderConfig Result { get; private set; }
+
+        public ProviderEditDialog(ProviderConfig existing, SettingsPal pal, float scale)
+            : base(existing != null ? "编辑供应商" : "添加供应商", pal, scale, new Size(St.SiF(400, scale), St.SiF(310, scale)))
+        {
+            int x = S(20), w = ClientSize.Width - S(40);
+
+            // 三组「标签 + 输入区」，自上而下
+            _rcSelect = new Rectangle(x, S(46) + S(38), w, S(34));
+            _rcKeyBox = new Rectangle(x, S(46) + S(100), w, S(34));
+            _rcNameBox = new Rectangle(x, S(46) + S(162), w, S(34));
+            _rcOk = new Rectangle(ClientSize.Width - S(20) - S(88), ClientSize.Height - S(18) - S(34), S(88), S(34));
+            _rcCancel = new Rectangle(_rcOk.X - S(10) - S(88), _rcOk.Y, S(88), S(34));
+
+            _txtKey = new TextBox { BorderStyle = BorderStyle.None, BackColor = pal.Win, ForeColor = pal.Text, Font = Fs[1], PasswordChar = '●' };
+            _txtName = new TextBox { BorderStyle = BorderStyle.None, BackColor = pal.Win, ForeColor = pal.Text, Font = Fs[1] };
+            Controls.Add(_txtKey);
+            Controls.Add(_txtName);
+            // 单行 TextBox 高度跟随字体，垂直居中在输入框内；边框由 OnPaint 画
+            _txtKey.Bounds = new Rectangle(_rcKeyBox.X + S(10), _rcKeyBox.Y + (S(34) - _txtKey.PreferredHeight) / 2, _rcKeyBox.Width - S(20), _txtKey.PreferredHeight);
+            _txtName.Bounds = new Rectangle(_rcNameBox.X + S(10), _rcNameBox.Y + (S(34) - _txtName.PreferredHeight) / 2, _rcNameBox.Width - S(20), _txtName.PreferredHeight);
+            _txtKey.GotFocus += delegate { Invalidate(); };
+            _txtKey.LostFocus += delegate { Invalidate(); };
+            _txtName.GotFocus += delegate { Invalidate(); };
+            _txtName.LostFocus += delegate { Invalidate(); };
+
+            KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Escape) { e.SuppressKeyPress = true; Close(); }
+                else if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; OnOk(); }
+            };
+            FormClosing += delegate { ClosePopup(); };
 
             // 编辑模式：用现有配置预填
             if (existing != null)
             {
-                int i = existing.Type == "ds" ? 5 : (existing.Type == "kimi" ? 4 : (existing.Type == "mx" ? (existing.Region == "intl" ? 3 : 2) : (existing.Region == "intl" ? 1 : 0)));
-                _cmbType.SelectedIndex = i;
+                _typeIndex = existing.Type == "ds" ? 5 : (existing.Type == "kimi" ? 4 : (existing.Type == "mx" ? (existing.Region == "intl" ? 3 : 2) : (existing.Region == "intl" ? 1 : 0)));
                 _txtKey.Text = existing.Key;
                 _txtName.Text = existing.Name;
             }
         }
 
-        private void UpdateDefaultName()
+        private void ClosePopup()
         {
-            // 仅当名称为空或等于上一个默认值时自动更新
-            int i = _cmbType.SelectedIndex;
-            string defaultName = i == 5 ? "DeepSeek" : (i == 4 ? "Kimi" : ((i == 2 || i == 3) ? "MiniMax" : "GLM"));
-            if (string.IsNullOrWhiteSpace(_txtName.Text) || _txtName.Text == "GLM" || _txtName.Text == "MiniMax" || _txtName.Text == "Kimi" || _txtName.Text == "DeepSeek")
-                _txtName.Text = defaultName;
+            if (_popup != null && !_popup.IsDisposed) _popup.Close();
+            _popup = null;
+        }
+
+        private void OpenTypePopup()
+        {
+            ClosePopup();
+            _popup = new SettingsPopupList(RectangleToScreen(_rcSelect), TypeItems, _typeIndex, Pal, Fs[1], Fs[1], Sf, delegate(int idx)
+            {
+                _typeIndex = idx;
+                // 名称仍为默认名时跟随接口切换（与旧对话框行为一致，手动改过则不动）
+                if (string.IsNullOrWhiteSpace(_txtName.Text) || IsDefaultName(_txtName.Text))
+                    _txtName.Text = TypeDefaultNames[idx];
+                Invalidate();
+            });
+            _popup.Show(this);
+        }
+
+        private static bool IsDefaultName(string n)
+        {
+            foreach (string d in TypeDefaultNames)
+                if (d == n) return true;
+            return false;
         }
 
         private void OnOk()
         {
             if (string.IsNullOrWhiteSpace(_txtKey.Text))
             {
-                MessageBox.Show(this, "请填写 API Key", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                StyledMsg.Show(this, "提示", "请填写 API Key", Pal, Sf);
                 return;
             }
-            int i = _cmbType.SelectedIndex;
+            int i = _typeIndex;
             string type = i == 5 ? "ds" : (i == 4 ? "kimi" : ((i == 2 || i == 3) ? "mx" : "glm"));
             string region = (i == 1 || i == 3) ? "intl" : "cn";
-            string fallbackName = i == 5 ? "DeepSeek" : (i == 4 ? "Kimi" : ((i == 2 || i == 3) ? "MiniMax" : "GLM"));
-            Result = new ProviderConfig { Type = type, Region = region, Key = _txtKey.Text.Trim(), Name = string.IsNullOrWhiteSpace(_txtName.Text) ? fallbackName : _txtName.Text.Trim() };
+            string fallback = TypeDefaultNames[i];
+            Result = new ProviderConfig { Type = type, Region = region, Key = _txtKey.Text.Trim(), Name = string.IsNullOrWhiteSpace(_txtName.Text) ? fallback : _txtName.Text.Trim() };
             DialogResult = DialogResult.OK;
             Close();
+        }
+
+        // 标签 + 输入框边框（聚焦高亮）+ 选择框 + 按钮
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            var g = e.Graphics;
+
+            DrawFieldLabel(g, "接口", S(46) + S(10));
+            PaintSelectBox(g, _rcSelect, TypeItems[_typeIndex], _hotSelect);
+            DrawFieldLabel(g, "API Key", S(46) + S(72));
+            DrawFieldBox(g, _rcKeyBox, _txtKey.Focused);
+            DrawFieldLabel(g, "显示名称", S(46) + S(134));
+            DrawFieldBox(g, _rcNameBox, _txtName.Focused);
+
+            PaintBtn(g, _rcOk, "确认", true, _hotOk);
+            PaintBtn(g, _rcCancel, "取消", false, _hotCancel);
+        }
+
+        private void DrawFieldLabel(Graphics g, string label, int y)
+        {
+            TextRenderer.DrawText(g, label, Fs[1], new Rectangle(S(20), y, ClientSize.Width - S(40), S(20)), Pal.Text, TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+        }
+
+        private void DrawFieldBox(Graphics g, Rectangle r, bool focused)
+        {
+            using (var path = St.RoundRect(r, S(8)))
+            using (var pen = new Pen(focused ? Pal.Primary : Pal.Line))
+                g.DrawPath(pen, path);
+        }
+
+        private void PaintSelectBox(Graphics g, Rectangle r, string text, bool hot)
+        {
+            using (var path = St.RoundRect(r, S(8)))
+            using (var pen = new Pen(hot ? Pal.CardHover : Pal.Line))
+                g.DrawPath(pen, path);
+            int maxW = r.Width - S(34);
+            string s = text;
+            while (s.Length > 1 && TextRenderer.MeasureText(s + "…", Fs[1]).Width > maxW) s = s.Substring(0, s.Length - 1);
+            if (s != text) s += "…";
+            TextRenderer.DrawText(g, s, Fs[1], new Rectangle(r.X + S(12), r.Y, maxW + S(20), r.Height), Pal.Text, TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+            using (var pen = new Pen(Pal.Text2, 1.5f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+            {
+                float cx = r.Right - S(16), cyy = r.Y + r.Height / 2f;
+                g.DrawLine(pen, cx - S(4), cyy - S(2), cx, cyy + S(2));
+                g.DrawLine(pen, cx, cyy + S(2), cx + S(4), cyy - S(2));
+            }
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left) return;
+            if (_rcSelect.Contains(e.Location)) { OpenTypePopup(); return; }
+            if (_rcOk.Contains(e.Location)) { OnOk(); return; }
+            if (_rcCancel.Contains(e.Location)) { Close(); return; }
+            // 点击输入框以外区域让文本框失焦，边框恢复常态
+            if (!_rcKeyBox.Contains(e.Location) && !_rcNameBox.Contains(e.Location))
+                ActiveControl = null;
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            bool hs = _rcSelect.Contains(e.Location), ho = _rcOk.Contains(e.Location), hc = _rcCancel.Contains(e.Location);
+            if (hs != _hotSelect || ho != _hotOk || hc != _hotCancel)
+            {
+                _hotSelect = hs; _hotOk = ho; _hotCancel = hc;
+                Invalidate();
+            }
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            if (_hotSelect || _hotOk || _hotCancel)
+            {
+                _hotSelect = _hotOk = _hotCancel = false;
+                Invalidate();
+            }
+        }
+    }
+
+    // ============================= 测试连接结果（设置页同款风格） =============================
+    internal class TestResultDialog : StyledDialogBase
+    {
+        private readonly Rectangle _rcOk;
+        private bool _hotOk;
+
+        public TestResultDialog(string report, SettingsPal pal, float scale)
+            : base("测试连接", pal, scale, new Size(St.SiF(560, scale), St.SiF(400, scale)))
+        {
+            KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Escape || e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; Close(); }
+            };
+
+            // 结果有多行明细（可能含长行）：只读多行框，纵向 + 横向滚动
+            var txt = new TextBox
+            {
+                Multiline = true,
+                ReadOnly = true,
+                ScrollBars = ScrollBars.Both,
+                WordWrap = false,
+                BorderStyle = BorderStyle.None,
+                BackColor = pal.Win,
+                ForeColor = pal.Text,
+                Font = new Font("Consolas", 12f * scale, FontStyle.Regular, GraphicsUnit.Pixel),
+                Text = report
+            };
+            int x = S(20), y = TitleH + S(14), w = ClientSize.Width - S(40);
+            int h = ClientSize.Height - y - S(12) - S(34) - S(16);
+            txt.Bounds = new Rectangle(x, y, w, h);
+            Controls.Add(txt);
+            // 只读框获得焦点会默认全选文本（显示成大蓝块），显示后取消选区
+            Shown += delegate { txt.SelectionStart = txt.Text.Length; txt.SelectionLength = 0; };
+            _rcOk = new Rectangle(ClientSize.Width - S(20) - S(96), ClientSize.Height - S(16) - S(34), S(96), S(34));
+        }
+
+        public static void Show(Form owner, string report, SettingsPal pal, float scale)
+        {
+            using (var d = new TestResultDialog(report, pal, scale))
+                d.ShowDialog(owner);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            var g = e.Graphics;
+            var box = new Rectangle(S(20), TitleH + S(14), ClientSize.Width - S(40), ClientSize.Height - TitleH - S(14) - S(12) - S(34) - S(16));
+            using (var pen = new Pen(Pal.Line))
+                g.DrawRectangle(pen, box.X - 1, box.Y - 1, box.Width + 1, box.Height + 1);
+            PaintBtn(g, _rcOk, "确定", true, _hotOk);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left) return;
+            if (_rcOk.Contains(e.Location)) Close();
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            bool h = _rcOk.Contains(e.Location);
+            if (h != _hotOk) { _hotOk = h; Invalidate(_rcOk); }
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            if (_hotOk) { _hotOk = false; Invalidate(_rcOk); }
+        }
+    }
+
+    // ============================= 消息提示（替代系统 MessageBox） =============================
+    internal class StyledMsg : StyledDialogBase
+    {
+        private readonly string _msg;
+        private readonly Rectangle _rcText;
+        private readonly Rectangle _rcOk;
+        private bool _hotOk;
+
+        private StyledMsg(string title, string text, SettingsPal pal, float scale)
+            : base(title, pal, scale, CalcSize(text, scale))
+        {
+            _msg = text;
+            _rcText = new Rectangle(S(20), TitleH + S(14), ClientSize.Width - S(40), ClientSize.Height - TitleH - S(14) - S(34) - S(28));
+            _rcOk = new Rectangle(ClientSize.Width - S(20) - S(96), ClientSize.Height - S(16) - S(34), S(96), S(34));
+            KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Escape || e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; Close(); }
+            };
+        }
+
+        private static Size CalcSize(string text, float scale)
+        {
+            Font f = St.FontsForScale(scale)[1];
+            int w = St.SiF(420, scale);
+            // 按宽度折行后的文本高度 + 标题栏 + 按钮 + 边距
+            Size sz = TextRenderer.MeasureText(text, f, new Size(w - St.SiF(40, scale), 100000), TextFormatFlags.WordBreak);
+            int h = St.SiF(46, scale) + St.SiF(14, scale) + sz.Height + St.SiF(28, scale) + St.SiF(34, scale) + St.SiF(16, scale);
+            return new Size(w, Math.Max(St.SiF(150, scale), h));
+        }
+
+        public static void Show(Form owner, string title, string text, SettingsPal pal, float scale)
+        {
+            using (var m = new StyledMsg(title, text, pal, scale))
+                m.ShowDialog(owner);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            var g = e.Graphics;
+            TextRenderer.DrawText(g, _msg, Fs[1], _rcText, Pal.Text, TextFormatFlags.WordBreak | TextFormatFlags.Top);
+            PaintBtn(g, _rcOk, "确定", true, _hotOk);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left) return;
+            if (_rcOk.Contains(e.Location)) Close();
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            bool h = _rcOk.Contains(e.Location);
+            if (h != _hotOk) { _hotOk = h; Invalidate(_rcOk); }
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            if (_hotOk) { _hotOk = false; Invalidate(_rcOk); }
+        }
+    }
+
+    // ============================= 设置窗口配色（局部预览主题） =============================
+    // 设置窗口自带一套明暗配色（Codex 风格中性色）。与 St.Theme 全局主题分离：
+    // 标题栏 🌙 / 「主题」分段控件实时预览时只改本窗口配色，点「保存」后经 ApplyConfig
+    // 才写入 St.Theme，否则未保存的预览会立刻波及悬浮窗 / 置顶栏。
+    internal struct SettingsPal
+    {
+        public Color Win, Side, Text, Text2, Text3, Line, Line2, Hover, Sel, Pill, PillText, Primary, PrimaryText, Track, ToggleOff, CardHover, Danger;
+
+        internal static Color C(int rgb) { return Color.FromArgb((int)(0xFF000000u | (uint)rgb)); }
+
+        // 向背景色靠拢的混合色（主按钮悬停 = 主色向窗底色提亮 12%）
+        public static Color Mix(Color a, Color b, double t)
+        {
+            if (t < 0) t = 0; if (t > 1) t = 1;
+            return Color.FromArgb(
+                (int)Math.Round(a.R + (b.R - a.R) * t),
+                (int)Math.Round(a.G + (b.G - a.G) * t),
+                (int)Math.Round(a.B + (b.B - a.B) * t));
+        }
+
+        // 对比度方案 A（对照 design/contrast-proposal.html）：
+        // 侧栏与窗口拉开一档 / 分割线提到 ≈13% 黑（GitHub Primer 强度）/ 选中项与悬停分离
+        public static SettingsPal For(bool dark)
+        {
+            SettingsPal p = new SettingsPal();
+            if (dark)
+            {
+                p.Win = C(0x1C1C21); p.Side = C(0x141419); p.Text = C(0xF2F2F4); p.Text2 = C(0xA6A6AF);
+                p.Text3 = C(0x6E6E78); p.Line = C(0x3A3A42); p.Line2 = C(0x2E2E36); p.Hover = C(0x26262E);
+                p.Sel = C(0x32323B); p.Pill = C(0x2C2C33); p.PillText = C(0xC9C9D1); p.Primary = C(0xF2F2F4); p.PrimaryText = C(0x18181B);
+                p.Track = C(0x3A3A42); p.ToggleOff = C(0x3F3F46); p.CardHover = C(0x4A4A52); p.Danger = C(0xF87171);
+            }
+            else
+            {
+                p.Win = Color.White; p.Side = C(0xF2F2F4); p.Text = C(0x18181B); p.Text2 = C(0x71717A);
+                p.Text3 = C(0xA1A1AA); p.Line = C(0xD6D6DB); p.Line2 = C(0xD9D9DE); p.Hover = C(0xEBEBEE);
+                p.Sel = C(0xE3E3E8); p.Pill = C(0xF4F4F5); p.PillText = C(0x52525B); p.Primary = C(0x18181B); p.PrimaryText = Color.White;
+                p.Track = C(0xE4E4E7); p.ToggleOff = C(0xD4D4D8); p.CardHover = C(0xC9C9CF); p.Danger = C(0xDC2626);
+            }
+            return p;
+        }
+    }
+
+    // ============================= 设置窗口下拉弹层 =============================
+    // 自绘下拉列表（替代系统 ComboBox 下拉，保证主题与圆角一致）：锚定在触发框下方，
+    // 底部放不下时向上翻。点击外部（Deactivate）/ Esc 关闭，↑↓ 移动、Enter 确认。
+    internal class SettingsPopupList : Form
+    {
+        private readonly string[] _items;
+        private readonly SettingsPal _pal;
+        private readonly Font _fReg, _fBold;
+        private readonly float _scale;
+        private readonly Action<int> _onPick;
+        private readonly int _sel;
+        private int _hover = -1;
+        private readonly int _itemH, _padV;
+
+        public SettingsPopupList(Rectangle anchorScreen, string[] items, int selected,
+            SettingsPal pal, Font fReg, Font fBold, float scale, Action<int> onPick)
+        {
+            _items = items;
+            _sel = Math.Max(0, Math.Min(items.Length - 1, selected));
+            _pal = pal; _fReg = fReg; _fBold = fBold; _scale = scale; _onPick = onPick;
+
+            int itemH = St.SiF(30, scale), padV = St.SiF(5, scale);
+            _itemH = itemH; _padV = padV;
+
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.Manual;
+            ShowInTaskbar = false;
+            TopMost = true;
+            AutoScaleMode = AutoScaleMode.None;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+            UpdateStyles();
+
+            // 宽度取最长项文本 + 左右留白，但不小于触发框宽（视觉对齐）
+            int maxW = anchorScreen.Width;
+            foreach (string it in items)
+                maxW = Math.Max(maxW, TextRenderer.MeasureText(it, fReg).Width + St.SiF(46, scale));
+            Width = maxW;
+            Height = items.Length * _itemH + _padV * 2 + 2;
+
+            var wa = Screen.FromPoint(anchorScreen.Location).WorkingArea;
+            int x = Math.Max(wa.Left + 8, Math.Min(wa.Right - Width - 8, anchorScreen.Left));
+            int y = anchorScreen.Bottom + St.SiF(4, scale);
+            if (y + Height > wa.Bottom - 8) y = anchorScreen.Top - Height - St.SiF(4, scale); // 底部放不下向上翻
+            Location = new Point(x, y);
+
+            Deactivate += delegate { Close(); };
+            KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Escape) Close();
+                else if (e.KeyCode == Keys.Up) { _hover = Math.Max(0, (_hover < 0 ? _sel : _hover) - 1); Invalidate(); e.Handled = true; }
+                else if (e.KeyCode == Keys.Down) { _hover = Math.Min(_items.Length - 1, (_hover < 0 ? _sel : _hover) + 1); Invalidate(); e.Handled = true; }
+                else if (e.KeyCode == Keys.Enter) { Pick(_hover < 0 ? _sel : _hover); e.Handled = true; }
+            };
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            St.RoundCorners(Handle);
+        }
+
+        private void Pick(int idx)
+        {
+            var cb = _onPick;
+            Close();
+            if (cb != null) cb(idx);
+        }
+
+        private int ItemAt(Point p)
+        {
+            int i = (p.Y - _padV) / _itemH;
+            return (i >= 0 && i < _items.Length) ? i : -1;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            using (var b = new SolidBrush(_pal.Win))
+                g.FillRectangle(b, ClientRectangle);
+            using (var pen = new Pen(_pal.Line))
+                g.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+            for (int i = 0; i < _items.Length; i++)
+            {
+                var r = new Rectangle(1 + _padV, _padV + i * _itemH, Width - 2 - _padV * 2, _itemH);
+                if (i == _hover || i == _sel)
+                    using (var path = St.RoundRect(r, St.SiF(6, _scale)))
+                    using (var b = new SolidBrush(_pal.Hover))
+                        g.FillPath(b, path);
+                using (var b = new SolidBrush(_pal.Text))
+                    g.DrawString(_items[i], i == _sel ? _fBold : _fReg, b, new RectangleF(r.X + St.SiF(10, _scale), r.Y, r.Width, r.Height), WidgetMenu.SFLeft);
+            }
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            int i = ItemAt(e.Location);
+            if (i != _hover) { _hover = i; Invalidate(); }
+        }
+
+        protected override void OnMouseClick(MouseEventArgs e)
+        {
+            base.OnMouseClick(e);
+            int i = ItemAt(e.Location);
+            if (i >= 0) Pick(i);
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            if (_hover != -1) { _hover = -1; Invalidate(); }
+        }
+    }
+
+    // ============================= 悬浮窗 / 托盘右键菜单 =============================
+    // 与设置页同一套自绘风格（Codex 中性色 + DWM 圆角 + 悬停高亮），替代系统 ContextMenuStrip。
+    // 每次弹出按当前配置构建（勾选态 / 项可见性天然实时），DPI 跟随光标所在屏。
+    internal class WidgetMenu : Form
+    {
+        private class Item
+        {
+            public string Label;   // null = 分隔线
+            public bool Checked;
+            public Action OnClick;
+        }
+
+        private readonly List<Item> _items = new List<Item>();
+        private readonly List<int> _ys = new List<int>(); // 每项在窗内的 y 偏移（含顶部留白）
+        private int _hover = -1;
+        private float _scale = St.Scale;
+        private int _itemH, _padV;
+        private Font _fItem;
+        private SettingsPal _pal;
+
+        public void AddItem(string label, bool checkable, bool isChecked, Action onClick)
+        {
+            var it = new Item(); it.Label = label; it.Checked = checkable && isChecked; it.OnClick = onClick;
+            _items.Add(it);
+        }
+
+        public void AddSeparator()
+        {
+            var it = new Item();
+            _items.Add(it);
+        }
+
+        public void ShowAt(Point screenPos)
+        {
+            _pal = SettingsPal.For(St.Theme == 1);
+            _scale = St.DpiOf(Screen.FromPoint(screenPos)) / 96f;
+            Func<int, int> S = delegate(int v) { return St.SiF(v, _scale); };
+            _fItem = St.FontsForScale(_scale)[1];
+            _itemH = S(32);
+            _padV = S(6);
+
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.Manual;
+            ShowInTaskbar = false;
+            TopMost = true;
+            AutoScaleMode = AutoScaleMode.None;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+            UpdateStyles();
+
+            // 尺寸：宽度取最长项 + 勾选槽与左右留白；分隔线占独立矮行
+            int w = S(180);
+            _ys.Clear();
+            int y = _padV;
+            foreach (Item it in _items)
+            {
+                _ys.Add(y);
+                if (it.Label == null) { y += S(9); continue; }
+                w = Math.Max(w, TextRenderer.MeasureText(it.Label, _fItem).Width + S(58));
+                y += _itemH;
+            }
+            Width = w;
+            Height = y + _padV + 2;
+
+            // 定位：光标右下优先，越界翻转 / 收敛到工作区
+            var wa = Screen.FromPoint(screenPos).WorkingArea;
+            int x = Math.Max(wa.Left + 8, Math.Min(wa.Right - Width - 8, screenPos.X));
+            int py = screenPos.Y + S(2);
+            if (py + Height > wa.Bottom - 8) py = screenPos.Y - Height - S(2);
+            if (py < wa.Top + 8) py = Math.Min(wa.Bottom - 8 - Height, wa.Top + 8);
+            Location = new Point(x, py);
+
+            Deactivate += delegate { Close(); };
+            KeyDown += delegate(object s, KeyEventArgs e) { if (e.KeyCode == Keys.Escape) Close(); };
+
+            // 无焦点菜单（WS_EX_NOACTIVATE）：不抢前台，其他窗口激活不会波及菜单；
+            // 配合鼠标捕获实现"点击菜单外任意位置关闭"，托盘弹出也无需前台焦点
+            Show();
+            Capture = true;
+        }
+
+        // 无焦点窗口
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                var cp = base.CreateParams;
+                cp.ExStyle |= 0x08000000; // WS_EX_NOACTIVATE
+                return cp;
+            }
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            St.RoundCorners(Handle); // 菜单四周同样走 DWM 抗锯齿圆角
+        }
+
+        private int ItemAt(Point p)
+        {
+            for (int i = _items.Count - 1; i >= 0; i--)
+                if (p.Y >= _ys[i] && p.Y < _ys[i] + (_items[i].Label == null ? St.SiF(9, _scale) : _itemH))
+                    return _items[i].Label == null ? -1 : i;
+            return -1;
+        }
+
+        private void Run(int i)
+        {
+            var a = _items[i].OnClick;
+            Close();
+            if (a != null) a();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            using (var b = new SolidBrush(_pal.Win))
+                g.FillRectangle(b, ClientRectangle);
+            using (var pen = new Pen(_pal.Line))
+                g.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+
+            Func<int, int> S = delegate(int v) { return St.SiF(v, _scale); };
+            for (int i = 0; i < _items.Count; i++)
+            {
+                Item it = _items[i];
+                if (it.Label == null)
+                { // 分隔线
+                    using (var p2 = new Pen(_pal.Line2))
+                        g.DrawLine(p2, S(12), _ys[i] + S(4), Width - S(12), _ys[i] + S(4));
+                    continue;
+                }
+                if (i == _hover)
+                    using (var path = St.RoundRect(new Rectangle(S(4), _ys[i], Width - S(8), _itemH), S(6)))
+                    using (var b = new SolidBrush(_pal.Hover))
+                        g.FillPath(b, path);
+                if (it.Checked)
+                { // 勾选槽：勾选项与普通项文字左缘对齐
+                    using (var p2 = new Pen(_pal.Text, 1.5f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+                    {
+                        float cx = S(15), cy = _ys[i] + _itemH / 2f;
+                        g.DrawLine(p2, cx - S(4), cy, cx - S(1), cy + S(3));
+                        g.DrawLine(p2, cx - S(1), cy + S(3), cx + 4.5f * _scale, cy - 3.5f * _scale);
+                    }
+                }
+                using (var b = new SolidBrush(_pal.Text))
+                    g.DrawString(it.Label, _fItem, b, new RectangleF(S(32), _ys[i], Width - S(40), _itemH), SFLeft);
+            }
+        }
+
+        internal static readonly StringFormat SFLeft = new StringFormat { LineAlignment = StringAlignment.Center };
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            // Capture 生效期间菜单外点击（坐标越界）→ 关闭；右键同样视为关闭
+            if (e.Button != MouseButtons.Left ||
+                e.X < 0 || e.Y < 0 || e.X >= Width || e.Y >= Height)
+                Close();
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            int i = ItemAt(e.Location);
+            if (i != _hover) { _hover = i; Invalidate(); }
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            if (_hover != -1) { _hover = -1; Invalidate(); }
+        }
+
+        protected override void OnMouseClick(MouseEventArgs e)
+        {
+            base.OnMouseClick(e);
+            int i = ItemAt(e.Location);
+            if (i >= 0) Run(i);
+        }
+    }
+
+    // ============================= 行说明气泡 =============================
+    // 悬停设置页行标题后浮现的说明气泡：无焦点 + 点击穿透（WS_EX_TRANSPARENT），
+    // 鼠标事件全部落到下层设置窗口，不打断交互；样式与设置页一致，DWM 圆角。
+    internal class HoverTip : Form
+    {
+        private SettingsPal _pal;
+        private float _scale = St.Scale;
+        private Font _fTip;
+        private string _text;
+
+        public HoverTip()
+        {
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.Manual;
+            ShowInTaskbar = false;
+            TopMost = true;
+            AutoScaleMode = AutoScaleMode.None;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+            UpdateStyles();
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                var cp = base.CreateParams;
+                cp.ExStyle |= 0x08000000 | 0x00000020; // WS_EX_NOACTIVATE | WS_EX_TRANSPARENT
+                return cp;
+            }
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            St.RoundCorners(Handle);
+        }
+
+        public void ShowAt(Point screenPos, string text, SettingsPal pal, float scale)
+        {
+            _pal = pal; _scale = scale; _text = text;
+            _fTip = St.FontsForScale(scale)[1]; // St 字体组仅 [0..3]：[1]=FNorm 9pt
+            Width = TextRenderer.MeasureText(text, _fTip).Width + St.SiF(20, scale);
+            Height = St.SiF(26, scale);
+
+            // 跟随光标右下，越界翻转 / 收敛到工作区
+            var wa = Screen.FromPoint(screenPos).WorkingArea;
+            int x = screenPos.X + St.SiF(14, scale);
+            int y = screenPos.Y + St.SiF(22, scale);
+            if (x + Width > wa.Right - 8) x = wa.Right - 8 - Width;
+            if (y + Height > wa.Bottom - 8) y = screenPos.Y - Height - St.SiF(10, scale);
+            Location = new Point(Math.Max(wa.Left + 8, x), Math.Max(wa.Top + 8, y));
+            if (!Visible) Show();
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var b = new SolidBrush(_pal.Win))
+                g.FillRectangle(b, ClientRectangle);
+            // 边框用 CardHover：气泡底色与窗口同为 Win，普通 Line 在深色主题下几乎不可见
+            using (var pen = new Pen(_pal.CardHover))
+                g.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+            TextRenderer.DrawText(g, _text, _fTip, ClientRectangle, _pal.Text,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
         }
     }
 
     // ============================= 设置窗口 =============================
+    // Codex / ChatGPT 桌面端风格：左侧分类导航（供应商 / 通用 / 关于）+ 卡片式供应商列表 +
+    // 行内开关 / 分段控件 / 滑杆，整窗自绘（与悬浮窗同一工艺），支持明暗主题实时预览。
     internal class SettingsForm : Form
     {
         private readonly AppContext _ctx;
-        private DataGridView _grid;
-        private NumericUpDown _numInterval;
-        private TrackBar _trkOpacity;
-        private Label _lblOpacity;
-        private CheckBox _chkTopMost;
-        private CheckBox _chkAutoStart;
-        private ComboBox _cmbTheme;
-        private ComboBox _cmbMode;
-        private ComboBox _cmbScreen;
-        private Panel _screenRow;
-        private List<ProviderConfig> _editList; // 编辑副本
-        // 所在屏缩放（跟随鼠标所在屏，保证各屏物理大小一致）
-        private float _scale = St.Scale;
+        private readonly List<ProviderConfig> _editList = new List<ProviderConfig>(); // 编辑副本，保存时才写回
+
+        // ---- 待保存设置（纯字段而非控件：跨屏 DPI 重建布局时状态天然保留，无需备份回填） ----
+        private int _pendMode;      // 0=悬浮窗 1=置顶栏
+        private int _pendScreen;    // 置顶栏停靠屏幕索引
+        private int _pendInterval;  // 刷新间隔（秒）
+        private int _pendOpacity;   // 不透明度 50-100
+        private bool _pendTopMost;
+        private bool _pendAutoStart;
+        private bool _pendDark;     // 主题预览：仅本窗口配色，保存后经 ApplyConfig 才影响悬浮窗
+
+        // ---- 窗口状态 ----
+        private int _page;                    // 0=供应商 1=通用 2=关于
+        private float _scrollP, _scrollG;     // 供应商页 / 通用页滚动偏移
+        private string _hover;                // 悬停命中区 id
+        private bool _testing;                // 「测试全部」进行中
+        private SettingsPopupList _popup;
         private bool _built;
-        private Button _btnSave;
-        // 手动拖动状态（标题栏拖动改为程序控制，实现拖动中实时跨屏适配）
-        private bool _drag;
-        private Point _dragOffset;
+
+        // ---- 拖拽状态 ----
+        private bool _dragWindow;
+        private Point _dragOffset;            // 屏幕坐标系（与旧版一致，跨屏重建后仍能贴住鼠标抓点）
+        private int _dragCard = -1;           // 正在拖拽排序的供应商索引
+        private bool _dragSlider;
+        private int _grabDY;                  // 抓点相对卡片顶部的偏移（拖拽跟手用）
+        private float _dragDrawY;             // 拖拽卡片当前绘制 Y（跟随鼠标）
+
+        // ---- 行说明气泡（悬停通用页行标题后浮现） ----
+        private System.Windows.Forms.Timer _tipTimer;
+        private HoverTip _tip;
+        private int _tipRow = -1;
+        private string _tipText;
+
+        private float _scale = St.Scale;
+        private SettingsPal P { get { return SettingsPal.For(_pendDark); } }
+
+        // ---- 布局结果（LayoutAll 重建；矩形为客户区坐标、已含滚动偏移，命中与绘制共用） ----
+        private class Hot { public Rectangle R; public string Id; }
+        private readonly List<Hot> _hots = new List<Hot>();
+        private Rectangle _vp;                // 当前页内容视口
+        private int _contentH;                // 当前页内容总高（与滚动无关，>视口高时出现滚动）
+        private Rectangle _rcMoon, _rcClose, _rcAdd, _rcTest, _rcCancel, _rcSave;
+        private readonly List<Rectangle> _cardRects = new List<Rectangle>();
+        private Rectangle _grp1, _grp2;
+        private readonly List<int> _visRows = new List<int>();        // 通用页可见行（置顶栏模式才含“显示屏幕”）
+        private readonly List<Rectangle> _rowRects = new List<Rectangle>();
+        private readonly List<Rectangle> _segModeBtns = new List<Rectangle>();
+        private readonly List<Rectangle> _segThemeBtns = new List<Rectangle>();
+        private Rectangle _rcSegMode, _rcSegTheme, _rcSelScreen, _rcSelInt, _rcSlider, _rcTglTop, _rcTglAuto;
+
+        // 通用页行号
+        private const int R_MODE = 0, R_SCREEN = 1, R_INT = 2, R_OP = 3, R_THEME = 4, R_TOP = 5, R_AUTO = 6;
+        // 刷新间隔预设（秒）；用户已有自定义值不在预设中时插入列表，保证不丢配置
+        private static readonly int[] IntervalPresets = new int[] { 15, 30, 60, 120, 300, 600, 1800, 3600 };
+
+        // ---- 本窗字体缓存（像素字号随缩放，跨实例共享，随进程存活） ----
+        // [0]=页面标题17 [1]=按钮/行标题13B [2]=导航13 [3]=正文12.5 [4]=说明11.5 [5]=徽标11
+        // [6]=等宽11.5 [7]=图标角标10.5B [8]=正文12.5B
+        private static readonly Dictionary<int, Font[]> _fontCache = new Dictionary<int, Font[]>();
+        private static Font[] Fonts(float s)
+        {
+            int dpi = (int)Math.Round(96f * s);
+            lock (_fontCache)
+            {
+                Font[] f;
+                if (!_fontCache.TryGetValue(dpi, out f))
+                {
+                    f = new Font[9];
+                    f[0] = new Font("Microsoft YaHei UI", 17f * s, FontStyle.Bold, GraphicsUnit.Pixel);
+                    f[1] = new Font("Microsoft YaHei UI", 13f * s, FontStyle.Bold, GraphicsUnit.Pixel);
+                    f[2] = new Font("Microsoft YaHei UI", 13f * s, FontStyle.Regular, GraphicsUnit.Pixel);
+                    f[3] = new Font("Microsoft YaHei UI", 12.5f * s, FontStyle.Regular, GraphicsUnit.Pixel);
+                    f[4] = new Font("Microsoft YaHei UI", 11.5f * s, FontStyle.Regular, GraphicsUnit.Pixel);
+                    f[5] = new Font("Microsoft YaHei UI", 11f * s, FontStyle.Regular, GraphicsUnit.Pixel);
+                    f[6] = new Font("Consolas", 11.5f * s, FontStyle.Regular, GraphicsUnit.Pixel);
+                    f[7] = new Font("Microsoft YaHei UI", 10.5f * s, FontStyle.Bold, GraphicsUnit.Pixel);
+                    f[8] = new Font("Microsoft YaHei UI", 12.5f * s, FontStyle.Bold, GraphicsUnit.Pixel);
+                    _fontCache[dpi] = f;
+                }
+                return f;
+            }
+        }
 
         public SettingsForm(AppContext ctx)
         {
             _ctx = ctx;
-            _editList = new List<ProviderConfig>();
             foreach (var p in _ctx.Cfg.Providers)
                 _editList.Add(new ProviderConfig { Type = p.Type, Region = p.Region, Key = p.Key, Name = p.Name });
 
-            _scale = St.DpiOf(Screen.FromPoint(Cursor.Position)) / 96f;
-            AutoScaleMode = AutoScaleMode.None; // 手动布局，禁用 PerMonitorV2 自动缩放
-            BuildLayout();
-            Shown += delegate { if (_built) _btnSave.Focus(); };
+            // 与旧版一致：缩放跟随光标所在屏，PerMonitorV2 下手动布局
+            var curScreen = Screen.FromPoint(Cursor.Position);
+            _scale = ClampScale(St.DpiOf(curScreen) / 96f, curScreen);
+
+            Text = "设置 - AI 额度工具 v" + AppInfo.Version; // 任务栏 / Alt-Tab 标题
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.CenterScreen;
+            // 非置顶：与常规软件一致，可被其他窗口遮挡
+            AutoScaleMode = AutoScaleMode.None;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            UpdateStyles();
+            KeyPreview = true;
+
+            _pendMode = _ctx.Cfg.DisplayMode == "topbar" ? 1 : 0;
+            _pendScreen = Math.Max(0, Math.Min(Screen.AllScreens.Length - 1, _ctx.Cfg.AppBarScreen));
+            _pendInterval = Math.Max(15, Math.Min(3600, _ctx.Cfg.RefreshSec));
+            _pendOpacity = Math.Max(50, Math.Min(100, _ctx.Cfg.OpacityPct));
+            _pendTopMost = _ctx.Cfg.TopMost;
+            _pendAutoStart = _ctx.Cfg.AutoStart;
+            _pendDark = _ctx.Cfg.Theme == "dark";
+
+            ApplyScaleToSize();
+            LayoutAll();
+
+            KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Escape) Close();
+                else if (e.KeyCode == Keys.Enter || (e.Control && e.KeyCode == Keys.S)) { e.SuppressKeyPress = true; SaveAndClose(); }
+            };
+            FormClosing += delegate { ClosePopup(); HideTip(); };
+            // 行说明气泡：悬停行标题 450ms 后浮现
+            _tipTimer = new System.Windows.Forms.Timer { Interval = 450 };
+            _tipTimer.Tick += delegate
+            {
+                _tipTimer.Stop();
+                if (_tipRow >= 0 && _tipText != null && _hover == "tip:" + _tipRow) ShowTip();
+            };
+            Shown += delegate
+            {
+                // 打开期间插拔显示器后索引可能越界，收敛到有效范围
+                _pendScreen = Math.Max(0, Math.Min(Screen.AllScreens.Length - 1, _pendScreen));
+                Focus();
+            };
             _built = true;
         }
 
-        // 按当前 _scale 构建全部布局（跨屏拖拽时重建，保证各屏物理大小一致）
-        private void BuildLayout()
+        // 物理尺寸不超过所在屏工作区（小屏 + 高缩放屏防溢出；旧窗口等比 DIP 布局存在同样问题）
+        private float ClampScale(float s, Screen screen)
         {
-            Func<int, int> S = v => St.SiF(v, _scale);
-            var fs = St.FontsForScale(_scale); // [0]=FTitle [1]=FNorm [2]=FSmall [3]=FPct
-
-            Text = "设置 - AI 额度悬浮窗 v" + AppInfo.Version;
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            MaximizeBox = false;
-            MinimizeBox = false;
-            StartPosition = FormStartPosition.CenterScreen;
-            TopMost = true;
-            ClientSize = new Size(S(560), S(660));
-            Font = fs[1];
-            BackColor = Color.FromArgb(248, 250, 252);
-
-            // 用 FlowLayoutPanel 自上而下流式布局，每行一个固定高度的 Panel，避免坐标/行高计算错误
-            var flow = new FlowLayoutPanel
-            {
-                Dock = DockStyle.Fill,
-                FlowDirection = FlowDirection.TopDown,
-                WrapContents = false,
-                Padding = new Padding(S(22), S(18), S(22), S(8)),
-                AutoScroll = true
-            };
-
-            // 底部固定区域（保存按钮行 + 提示行，不随内容滚动，始终置底）
-            var bottom = new FlowLayoutPanel
-            {
-                Dock = DockStyle.Bottom,
-                FlowDirection = FlowDirection.TopDown,
-                WrapContents = false,
-                AutoScroll = false,
-                Padding = new Padding(S(22), 0, S(22), S(18)),
-                Height = S(106) // 42+16+22+8+18：按钮行+间距+提示行+间距+底部 padding
-            };
-
-            int contentWidth = S(560) - S(44); // 减去左右 padding
-
-            // ===== 供应商标题 + 添加/删除/排序按钮 =====
-            var header = new Panel { Width = contentWidth, Height = S(36) };
-            var lblTitle = new Label { Text = "供应商配置", Font = fs[0], ForeColor = Color.FromArgb(51, 65, 85), AutoSize = false, Bounds = new Rectangle(0, 0, S(136), S(36)), TextAlign = ContentAlignment.MiddleLeft };
-            var btnAdd = new Button { Text = "+ 添加", Width = S(84), Height = S(32), FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(51, 65, 85), ForeColor = Color.White };
-            var btnEdit = new Button { Text = "编辑", Width = S(84), Height = S(32), FlatStyle = FlatStyle.Flat };
-            var btnDel = new Button { Text = "- 删除", Width = S(84), Height = S(32), FlatStyle = FlatStyle.Flat };
-            var btnUp = new Button { Text = "↑", Width = S(44), Height = S(32), FlatStyle = FlatStyle.Flat };
-            var btnDown = new Button { Text = "↓", Width = S(44), Height = S(32), FlatStyle = FlatStyle.Flat };
-            btnAdd.FlatAppearance.BorderSize = 0;
-            btnEdit.FlatAppearance.BorderColor = Color.FromArgb(203, 213, 225);
-            btnDel.FlatAppearance.BorderColor = Color.FromArgb(203, 213, 225);
-            btnUp.FlatAppearance.BorderColor = Color.FromArgb(203, 213, 225);
-            btnDown.FlatAppearance.BorderColor = Color.FromArgb(203, 213, 225);
-            // 从右往左依次排列，间距 8px
-            int bx = contentWidth;
-            int y2 = S(2);
-            bx -= btnAdd.Width; btnAdd.SetBounds(bx, y2, btnAdd.Width, btnAdd.Height);
-            bx -= S(8) + btnEdit.Width; btnEdit.SetBounds(bx, y2, btnEdit.Width, btnEdit.Height);
-            bx -= S(8) + btnDel.Width; btnDel.SetBounds(bx, y2, btnDel.Width, btnDel.Height);
-            bx -= S(8) + btnDown.Width; btnDown.SetBounds(bx, y2, btnDown.Width, btnDown.Height);
-            bx -= S(8) + btnUp.Width; btnUp.SetBounds(bx, y2, btnUp.Width, btnUp.Height);
-            btnAdd.Click += delegate { AddProvider(); };
-            btnEdit.Click += delegate { EditSelected(); };
-            btnDel.Click += delegate { DeleteSelected(); };
-            btnUp.Click += delegate { MoveSelected(-1); };
-            btnDown.Click += delegate { MoveSelected(1); };
-            header.Controls.Add(btnUp);
-            header.Controls.Add(btnDown);
-            header.Controls.Add(btnDel);
-            header.Controls.Add(btnEdit);
-            header.Controls.Add(btnAdd);
-            header.Controls.Add(lblTitle);
-            flow.Controls.Add(header);
-
-            // ===== 表格 =====
-            BuildGrid();
-            _grid.Width = contentWidth;
-            _grid.Height = S(180);
-            flow.Controls.Add(_grid);
-            flow.SetFlowBreak(_grid, true);
-
-            // ===== 通用设置 标题 =====
-            flow.Controls.Add(new Label { Text = "通用设置", Font = fs[0], ForeColor = Color.FromArgb(51, 65, 85), AutoSize = false, Width = contentWidth, Height = S(28), TextAlign = ContentAlignment.BottomLeft, Margin = new Padding(0, S(6), 0, 0) });
-
-            // 模式行
-            var modeRow = new Panel { Width = contentWidth, Height = S(36) };
-            var lblMode = new Label { Text = "模式", AutoSize = false, Bounds = new Rectangle(0, 0, S(120), S(36)), TextAlign = ContentAlignment.MiddleLeft };
-            // 右侧控件 y=S(8)、高=S(26)：使控件内文字（顶部对齐，距顶约 3px）的中心与
-            // label 文字中心（行高 36 内居中）对齐，实现左右同一水平线
-            _cmbMode = new NoWheelComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Bounds = new Rectangle(S(120), S(8), S(150), S(26)) };
-            _cmbMode.Items.AddRange(new object[] { "悬浮窗", "置顶栏" });
-            _cmbMode.SelectedIndex = _ctx.Cfg.DisplayMode == "topbar" ? 1 : 0;
-            modeRow.Controls.Add(lblMode);
-            modeRow.Controls.Add(_cmbMode);
-            flow.Controls.Add(modeRow);
-
-            // 显示屏幕行（仅置顶栏模式可见）
-            _screenRow = new Panel { Width = contentWidth, Height = S(36) };
-            var lblScreen = new Label { Text = "显示屏幕", AutoSize = false, Bounds = new Rectangle(0, 0, S(120), S(36)), TextAlign = ContentAlignment.MiddleLeft };
-            _cmbScreen = new NoWheelComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Bounds = new Rectangle(S(120), S(8), S(280), S(26)) };
-            var screens = Screen.AllScreens;
-            for (int si = 0; si < screens.Length; si++)
-            {
-                var b = screens[si].Bounds;
-                string label = (si + 1) + ". " + (screens[si].Primary ? "主显示器" : "显示器 " + (si + 1));
-                label += string.Format(" ({0}×{1})", b.Width, b.Height);
-                _cmbScreen.Items.Add(label);
-            }
-            _cmbScreen.SelectedIndex = Math.Max(0, Math.Min(_cmbScreen.Items.Count - 1, _ctx.Cfg.AppBarScreen));
-            _screenRow.Controls.Add(lblScreen);
-            _screenRow.Controls.Add(_cmbScreen);
-            _screenRow.Visible = _cmbMode.SelectedIndex == 1;
-            _cmbMode.SelectedIndexChanged += delegate { _screenRow.Visible = _cmbMode.SelectedIndex == 1; };
-            flow.Controls.Add(_screenRow);
-
-            // 刷新间隔行
-            var secRow = new Panel { Width = contentWidth, Height = S(36) };
-            var lblInterval = new Label { Text = "刷新间隔（秒）", AutoSize = false, Bounds = new Rectangle(0, 0, S(120), S(36)), TextAlign = ContentAlignment.MiddleLeft };
-            _numInterval = new NoWheelNumericUpDown { Minimum = 15, Maximum = 3600, Value = Math.Max(15, Math.Min(3600, _ctx.Cfg.RefreshSec)), Increment = 15, Bounds = new Rectangle(S(120), S(8), S(100), S(26)) };
-            secRow.Controls.Add(lblInterval);
-            secRow.Controls.Add(_numInterval);
-            flow.Controls.Add(secRow);
-
-            // 不透明度行
-            var opRow = new Panel { Width = contentWidth, Height = S(44) };
-            var lblO = new Label { Text = "窗口不透明度", AutoSize = false, Bounds = new Rectangle(0, 0, S(120), S(44)), TextAlign = ContentAlignment.MiddleLeft };
-            _trkOpacity = new TrackBar { Minimum = 50, Maximum = 100, Value = Math.Max(50, Math.Min(100, _ctx.Cfg.OpacityPct)), TickFrequency = 10, Bounds = new Rectangle(S(120), S(4), contentWidth - S(120) - S(50), S(36)) };
-            _lblOpacity = new Label { Text = _ctx.Cfg.OpacityPct + "%", AutoSize = false, Bounds = new Rectangle(contentWidth - S(50), 0, S(50), S(44)), TextAlign = ContentAlignment.MiddleLeft };
-            _trkOpacity.ValueChanged += delegate { _lblOpacity.Text = _trkOpacity.Value + "%"; };
-            opRow.Controls.Add(_lblOpacity);
-            opRow.Controls.Add(_trkOpacity);
-            opRow.Controls.Add(lblO);
-            flow.Controls.Add(opRow);
-
-            // 主题行
-            var themeRow = new Panel { Width = contentWidth, Height = S(36) };
-            var lblTheme = new Label { Text = "主题", AutoSize = false, Bounds = new Rectangle(0, 0, S(120), S(36)), TextAlign = ContentAlignment.MiddleLeft };
-            _cmbTheme = new NoWheelComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Bounds = new Rectangle(S(120), S(8), S(150), S(26)) };
-            _cmbTheme.Items.AddRange(new object[] { "浅色", "深色" });
-            _cmbTheme.SelectedIndex = _ctx.Cfg.Theme == "dark" ? 1 : 0;
-            themeRow.Controls.Add(lblTheme);
-            themeRow.Controls.Add(_cmbTheme);
-            flow.Controls.Add(themeRow);
-
-            // 选项复选框行（FlatStyle.System：勾选框由系统按窗口所在屏 DPI 绘制，跨屏自动适配）
-            var optRow = new Panel { Width = contentWidth, Height = S(32) };
-            _chkTopMost = new CheckBox { Text = "窗口置顶", Checked = _ctx.Cfg.TopMost, AutoSize = false, FlatStyle = FlatStyle.System, Bounds = new Rectangle(0, S(4), S(110), S(24)) };
-            _chkAutoStart = new CheckBox { Text = "开机启动", Checked = _ctx.Cfg.AutoStart, AutoSize = false, FlatStyle = FlatStyle.System, Bounds = new Rectangle(S(130), S(4), S(110), S(24)) };
-            optRow.Controls.Add(_chkTopMost);
-            optRow.Controls.Add(_chkAutoStart);
-            flow.Controls.Add(optRow);
-
-            // 底部按钮行
-            var btnRow = new Panel { Width = contentWidth, Height = S(42), Margin = new Padding(0, S(16), 0, 0) };
-            _btnSave = new Button { Text = "保存", Width = S(100), Height = S(34), FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(51, 65, 85), ForeColor = Color.White };
-            var btnTest = new Button { Text = "测试全部", Width = S(100), Height = S(34), FlatStyle = FlatStyle.Flat };
-            var btnCancel = new Button { Text = "取消", Width = S(100), Height = S(34), FlatStyle = FlatStyle.Flat };
-            _btnSave.FlatAppearance.BorderSize = 0;
-            btnTest.FlatAppearance.BorderColor = Color.FromArgb(203, 213, 225);
-            btnCancel.FlatAppearance.BorderColor = Color.FromArgb(203, 213, 225);
-            btnCancel.SetBounds(contentWidth - S(100), 0, S(100), S(34));
-            btnTest.SetBounds(contentWidth - S(100) * 2 - S(10), 0, S(100), S(34));
-            _btnSave.SetBounds(contentWidth - S(100) * 3 - S(20), 0, S(100), S(34));
-            _btnSave.Click += delegate { SaveAndClose(); };
-            btnCancel.Click += delegate { Close(); };
-            btnTest.Click += delegate { TestConnection(btnTest); };
-            btnRow.Controls.Add(btnCancel);
-            btnRow.Controls.Add(btnTest);
-            btnRow.Controls.Add(_btnSave);
-            bottom.Controls.Add(btnRow);
-
-            // 提示行
-            bottom.Controls.Add(new Label
-            {
-                Text = "配置保存在 exe 同目录 config.json（明文，请勿分享此文件）",
-                ForeColor = Color.Gray, AutoSize = false, Width = contentWidth, Height = S(22), Font = fs[2], TextAlign = ContentAlignment.MiddleLeft, Margin = new Padding(0, S(8), 0, 0)
-            });
-
-            Controls.Add(bottom);
-            Controls.Add(flow);
+            var wa = screen.WorkingArea;
+            return Math.Min(s, Math.Min((wa.Height - 80f) / 660f, (wa.Width - 80f) / 880f));
         }
 
-        // 跨屏实时重建布局：拖动中窗口每次移动都会检测所在屏，
-        // 与手动拖动循环完全同步（与悬浮窗行为一致，无系统拖动竞态）。
+        private int S(int v) { return St.SiF(v, _scale); }
+
+        // 垂直居中（水平左对齐）：行标题/说明、卡片文字、导航等一切行内文字统一用它画，
+        // 避免手算 y 偏移与实际字体行高不一致导致的不居中
+        private static readonly StringFormat SFLeftV = new StringFormat { LineAlignment = StringAlignment.Center };
+
+        private void ApplyScaleToSize()
+        {
+            ClientSize = new Size(S(880), S(660));
+        }
+
+        // ============================= 布局 =============================
+        // 命中区与绘制共用同一批矩形；页面内容总高与滚动无关，先布局再收敛滚动，
+        // 超界时清空重排一次，保证命中区与最终绘制一致
+        private void LayoutAll()
+        {
+            ClearPageLayout();
+            int W = ClientSize.Width, H = ClientSize.Height;
+            int tbH = S(46), footH = S(58), sideW = S(208);
+            _vp = new Rectangle(sideW + S(30), tbH + S(26), W - sideW - S(60), H - tbH - footH - S(26) - S(20));
+            AddChromeHots(tbH);
+
+            for (int pass = 0; pass < 2; pass++)
+            {
+                if (_page == 0) LayoutProviders();
+                else if (_page == 1) LayoutGeneral();
+                else { _contentH = S(420); break; }
+                float c = ClampScroll(_page == 0 ? _scrollP : _scrollG);
+                bool changed = (_page == 0 ? _scrollP : _scrollG) != c;
+                if (_page == 0) _scrollP = c; else _scrollG = c;
+                if (!changed) break;
+                ClearPageLayout();
+                AddChromeHots(tbH);
+            }
+
+            // 底部操作栏按钮（取消 / 保存，右对齐）
+            int btnH = S(34);
+            Font[] fs = Fonts(_scale);
+            int saveW = MeasureW("保存", fs[1]) + S(40);
+            int cancelW = MeasureW("取消", fs[1]) + S(36);
+            _rcSave = new Rectangle(W - S(30) - saveW, H - footH + (footH - btnH) / 2, saveW, btnH);
+            _rcCancel = new Rectangle(_rcSave.X - S(10) - cancelW, _rcSave.Y, cancelW, btnH);
+            AddHot(_rcCancel, "btn:cancel");
+            AddHot(_rcSave, "btn:save");
+        }
+
+        private void ClearPageLayout()
+        {
+            _hots.Clear();
+            _cardRects.Clear();
+            _visRows.Clear();
+            _rowRects.Clear();
+            _segModeBtns.Clear();
+            _segThemeBtns.Clear();
+        }
+
+        // 标题栏 + 侧栏命中区（滚动收敛重排时需补回）
+        private void AddChromeHots(int tbH)
+        {
+            int bs = S(32);
+            _rcMoon = new Rectangle(ClientSize.Width - S(8) - bs * 2 - S(4), S(7), bs, bs);
+            _rcClose = new Rectangle(ClientSize.Width - S(8) - bs, S(7), bs, bs);
+            AddHot(_rcMoon, "moon");
+            AddHot(_rcClose, "close");
+            int navW = S(208) - S(20), navH = S(34);
+            for (int i = 0; i < 3; i++)
+                AddHot(new Rectangle(S(10), tbH + S(14) + i * (navH + S(2)), navW, navH), "nav:" + i);
+        }
+
+        private float ClampScroll(float v)
+        {
+            int max = Math.Max(0, _contentH - _vp.Height);
+            if (v < 0) v = 0;
+            if (v > max) v = max;
+            return v;
+        }
+
+        private void AddHot(Rectangle r, string id)
+        {
+            var h = new Hot(); h.R = r; h.Id = id;
+            _hots.Add(h);
+        }
+
+        // 命中测试从尾部向前：后加入的命中区（卡片内按钮）盖在先加入的（整卡）之上
+        private string Hit(Point p)
+        {
+            for (int i = _hots.Count - 1; i >= 0; i--)
+                if (_hots[i].R.Contains(p)) return _hots[i].Id;
+            return null;
+        }
+
+        private int HoverIdxOf(string prefix)
+        {
+            if (_hover == null || !_hover.StartsWith(prefix + ":")) return -1;
+            int i;
+            return int.TryParse(_hover.Substring(prefix.Length + 1), out i) ? i : -1;
+        }
+
+        private static int MeasureW(string s, Font f)
+        {
+            return TextRenderer.MeasureText(s, f).Width;
+        }
+
+        private void LayoutProviders()
+        {
+            Font[] fs = Fonts(_scale);
+            int y = _vp.Y - (int)_scrollP + S(2);
+
+            int btnH = S(34);
+            int addW = MeasureW("＋ 添加供应商", fs[1]) + S(28);
+            int testW = MeasureW(_testing ? "测试中…" : "测试全部", fs[1]) + S(24);
+            _rcAdd = new Rectangle(_vp.X, y, addW, btnH);
+            _rcTest = new Rectangle(_vp.X + addW + S(10), y, testW, btnH);
+            AddHot(_rcAdd, "add");
+            AddHot(_rcTest, "test");
+
+            int cardH = S(54), gap = S(10);
+            int listY = y + btnH + S(16);
+            for (int i = 0; i < _editList.Count; i++)
+            {
+                var card = new Rectangle(_vp.X, listY + i * (cardH + gap), _vp.Width, cardH);
+                _cardRects.Add(card);
+                AddHot(card, "card:" + i); // 整卡先加（悬停高亮边框），行内按钮后加保证优先命中
+                int cy = card.Y + cardH / 2;
+                AddHot(new Rectangle(card.X + S(10), cy - S(9), S(20), S(18)), "grip:" + i);
+                AddHot(new Rectangle(card.Right - S(14) - S(30) * 2 - S(6), cy - S(15), S(30), S(30)), "edit:" + i);
+                AddHot(new Rectangle(card.Right - S(14) - S(30), cy - S(15), S(30), S(30)), "del:" + i);
+            }
+            _contentH = listY + _editList.Count * (cardH + gap) + S(8) - _vp.Y;
+        }
+
+        private void LayoutGeneral()
+        {
+            int y = _vp.Y - (int)_scrollP;
+
+            int pad = S(16), rowH = S(52);
+            _visRows.Add(R_MODE);
+            if (_pendMode == 1) _visRows.Add(R_SCREEN); // 仅置顶栏模式需要选择停靠屏幕
+            _visRows.Add(R_INT);
+            _visRows.Add(R_OP);
+
+            _grp1 = new Rectangle(_vp.X, y + S(18), _vp.Width, _visRows.Count * rowH);
+            for (int i = 0; i < _visRows.Count; i++)
+            {
+                var rr = new Rectangle(_grp1.X, _grp1.Y + i * rowH, _grp1.Width, rowH);
+                _rowRects.Add(rr);
+                AddHot(new Rectangle(rr.X + pad, rr.Y, S(150), rr.Height), "tip:" + _visRows[i]); // 悬停行标题出说明气泡
+                int cy = rr.Y + rowH / 2;
+                switch (_visRows[i])
+                {
+                    case R_MODE:
+                        _rcSegMode = SegRect(rr, new string[] { "悬浮窗", "置顶栏" });
+                        SegBtns(_rcSegMode, _segModeBtns);
+                        AddHot(_segModeBtns[0], "segmode:0");
+                        AddHot(_segModeBtns[1], "segmode:1");
+                        break;
+                    case R_SCREEN:
+                        _rcSelScreen = new Rectangle(rr.Right - pad - S(210), cy - S(17), S(210), S(34));
+                        AddHot(_rcSelScreen, "sel:screen");
+                        break;
+                    case R_INT:
+                        _rcSelInt = new Rectangle(rr.Right - pad - S(120), cy - S(17), S(120), S(34));
+                        AddHot(_rcSelInt, "sel:int");
+                        break;
+                    case R_OP:
+                        _rcSlider = new Rectangle(rr.Right - pad - S(264), cy - S(2), S(200), S(4));
+                        AddHot(new Rectangle(_rcSlider.X - S(6), cy - S(13), S(212), S(26)), "sld:op");
+                        break;
+                }
+            }
+
+            _grp2 = new Rectangle(_vp.X, _grp1.Bottom + S(16), _vp.Width, 3 * rowH);
+            int[] rows2 = new int[] { R_THEME, R_TOP, R_AUTO };
+            for (int i = 0; i < rows2.Length; i++)
+            {
+                var rr = new Rectangle(_grp2.X, _grp2.Y + i * rowH, _grp2.Width, rowH);
+                _rowRects.Add(rr);
+                AddHot(new Rectangle(rr.X + pad, rr.Y, S(150), rr.Height), "tip:" + rows2[i]);
+                int cy = rr.Y + rowH / 2;
+                switch (rows2[i])
+                {
+                    case R_THEME:
+                        _rcSegTheme = SegRect(rr, new string[] { "☀ 浅色", "☾ 深色" });
+                        SegBtns(_rcSegTheme, _segThemeBtns);
+                        AddHot(_segThemeBtns[0], "segtheme:0");
+                        AddHot(_segThemeBtns[1], "segtheme:1");
+                        break;
+                    case R_TOP:
+                        _rcTglTop = new Rectangle(rr.Right - pad - S(42), cy - S(12), S(42), S(24));
+                        AddHot(_rcTglTop, "tgl:top");
+                        break;
+                    case R_AUTO:
+                        _rcTglAuto = new Rectangle(rr.Right - pad - S(42), cy - S(12), S(42), S(24));
+                        AddHot(_rcTglAuto, "tgl:auto");
+                        break;
+                }
+            }
+
+            _contentH = _grp2.Bottom + S(8) - _vp.Y;
+        }
+
+        // 分段控件容器：右对齐于行，宽度按按钮文本自适应
+        private Rectangle SegRect(Rectangle row, string[] labels)
+        {
+            Font[] fs = Fonts(_scale);
+            int w = S(4);
+            foreach (string l in labels) w += MeasureW(l, fs[3]) + S(24);
+            return new Rectangle(row.Right - S(16) - w, row.Y + (row.Height - S(30)) / 2, w, S(30));
+        }
+
+        private void SegBtns(Rectangle box, List<Rectangle> into)
+        {
+            int bw = (box.Width - S(4)) / 2;
+            into.Add(new Rectangle(box.X + S(2), box.Y + S(2), bw, box.Height - S(4)));
+            into.Add(new Rectangle(box.X + S(2) + bw, box.Y + S(2), box.Width - S(4) - bw, box.Height - S(4)));
+        }
+
+        // ============================= 绘制 =============================
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            SettingsPal p = P;
+            Font[] fs = Fonts(_scale);
+            int W = ClientSize.Width, H = ClientSize.Height;
+            int tbH = S(46), footH = S(58), sideW = S(208);
+
+            using (var b = new SolidBrush(p.Win))
+                g.FillRectangle(b, ClientRectangle);
+
+            PaintTitlebar(g, p, fs, W, tbH);
+            PaintSidebar(g, p, fs, tbH, sideW, H);
+
+            // 内容区裁剪：滚动时页面内容不侵入标题栏 / 侧栏 / 底栏
+            g.SetClip(new Rectangle(sideW, tbH, W - sideW, H - tbH - footH));
+            if (_page == 0) PaintProviders(g, p, fs);
+            else if (_page == 1) PaintGeneral(g, p, fs);
+            else PaintAbout(g, p, fs);
+            g.ResetClip();
+
+            PaintFooter(g, p, fs, sideW, footH, H, W);
+            PaintScrollbar(g, p);
+
+            // 窗口最外圈细边（DWM 阴影之外的补充轮廓，浅色桌面上勾出边界）
+            using (var pen = new Pen(p.Line))
+                g.DrawRectangle(pen, 0, 0, W - 1, H - 1);
+        }
+
+        private void PaintTitlebar(Graphics g, SettingsPal p, Font[] fs, int W, int tbH)
+        {
+            // 应用图标（与托盘 / 任务栏同一枚仪表盘造型）
+            var ic = new Rectangle(S(14), (tbH - S(20)) / 2, S(20), S(20));
+            IconFactory.DrawGlyph(g, ic);
+            using (var b = new SolidBrush(p.Text))
+                TextRenderer.DrawText(g, "设置", fs[1], new Rectangle(ic.Right + S(9), 0, S(80), tbH), p.Text, TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+
+            // 主题预览按钮：浅色显示月亮、深色显示太阳
+            if (_hover == "moon")
+                using (var path = St.RoundRect(_rcMoon, S(8)))
+                using (var b = new SolidBrush(p.Hover))
+                    g.FillPath(b, path);
+            float mcx = _rcMoon.X + _rcMoon.Width / 2f, mcy = _rcMoon.Y + _rcMoon.Height / 2f;
+            if (_pendDark) PaintSun(g, p.Text, mcx, mcy, _scale);
+            else PaintMoon(g, p, mcx, mcy, _scale);
+
+            // 关闭按钮
+            if (_hover == "close")
+                using (var path = St.RoundRect(_rcClose, S(8)))
+                using (var b = new SolidBrush(p.Hover))
+                    g.FillPath(b, path);
+            using (var pen = new Pen(p.Text2, 1.4f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+            {
+                float cx = _rcClose.X + _rcClose.Width / 2f, cy = _rcClose.Y + _rcClose.Height / 2f, d = S(5);
+                g.DrawLine(pen, cx - d, cy - d, cx + d, cy + d);
+                g.DrawLine(pen, cx + d, cy - d, cx - d, cy + d);
+            }
+
+            using (var pen = new Pen(p.Line2))
+                g.DrawLine(pen, 0, tbH - 1, W, tbH - 1);
+        }
+
+        private static void PaintMoon(Graphics g, SettingsPal p, float cx, float cy, float s)
+        {
+            float d = 15f * s;
+            using (var b = new SolidBrush(p.Text))
+            {
+                g.FillEllipse(b, cx - d / 2, cy - d / 2, d, d);
+                using (var b2 = new SolidBrush(p.Win)) // 偏移圆抠出月牙
+                    g.FillEllipse(b2, cx - d / 2 + d * 0.34f, cy - d / 2 - d * 0.16f, d * 0.86f, d * 0.86f);
+            }
+        }
+
+        private static void PaintSun(Graphics g, Color c, float cx, float cy, float s)
+        {
+            float r = 3.6f * s;
+            using (var b = new SolidBrush(c))
+                g.FillEllipse(b, cx - r, cy - r, r * 2, r * 2);
+            using (var pen = new Pen(c, 1.4f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+            {
+                float r1 = 6f * s, r2 = 8.4f * s;
+                for (int i = 0; i < 8; i++)
+                {
+                    double a = Math.PI * i / 4.0;
+                    g.DrawLine(pen, cx + (float)Math.Cos(a) * r1, cy + (float)Math.Sin(a) * r1, cx + (float)Math.Cos(a) * r2, cy + (float)Math.Sin(a) * r2);
+                }
+            }
+        }
+
+        private void PaintSidebar(Graphics g, SettingsPal p, Font[] fs, int tbH, int sideW, int H)
+        {
+            using (var b = new SolidBrush(p.Side))
+                g.FillRectangle(b, 0, tbH, sideW, H - tbH);
+
+            string[] names = new string[] { "供应商", "通用", "关于" };
+            int navH = S(34), navW = sideW - S(20);
+            for (int i = 0; i < 3; i++)
+            {
+                var r = new Rectangle(S(10), tbH + S(14) + i * (navH + S(2)), navW, navH);
+                bool active = _page == i;
+                bool hot = _hover == "nav:" + i && !active;
+                if (active || hot)
+                    using (var path = St.RoundRect(r, S(8)))
+                    // 选中用 Sel（比 Hover 深两档），悬停仍用 Hover：两个状态不再同色
+                    using (var b = new SolidBrush(active ? p.Sel : p.Hover))
+                        g.FillPath(b, path);
+                Color c = (active || hot) ? p.Text : p.Text2;
+                PaintNavIcon(g, i, r.X + S(10), r.Y + (r.Height - S(15)) / 2, c, p.Side);
+                using (var b = new SolidBrush(c))
+                    g.DrawString(names[i], active ? fs[1] : fs[2], b, new RectangleF(r.X + S(35), r.Y, navW - S(35), navH), SFLeftV);
+            }
+
+            // 侧栏底部：应用名 + 版本
+            using (var b = new SolidBrush(p.Text3))
+            {
+                g.DrawString("AI 额度工具", fs[4], b, S(20), H - S(48));
+                g.DrawString("v" + AppInfo.Version, fs[4], b, S(20), H - S(30));
+            }
+        }
+
+        private void PaintNavIcon(Graphics g, int idx, float x, float y, Color c, Color bgFill)
+        {
+            float sc = _scale;
+            using (var pen = new Pen(c, 1.3f))
+            {
+                if (idx == 0)
+                { // 供应商：上下两栏
+                    using (var p1 = St.RoundRect(new Rectangle((int)x, (int)y, S(15), S(6)), S(2)))
+                    using (var p2 = St.RoundRect(new Rectangle((int)x, (int)y + S(9), S(15), S(6)), S(2)))
+                    {
+                        g.DrawPath(pen, p1);
+                        g.DrawPath(pen, p2);
+                    }
+                    using (var b = new SolidBrush(c))
+                    {
+                        g.FillEllipse(b, x + 2.8f * sc, y + 2.2f * sc, 1.6f * sc, 1.6f * sc);
+                        g.FillEllipse(b, x + 2.8f * sc, y + 11.2f * sc, 1.6f * sc, 1.6f * sc);
+                    }
+                }
+                else if (idx == 1)
+                { // 通用：两条调节杆 + 旋钮
+                    g.DrawLine(pen, x + 1 * sc, y + 4.5f * sc, x + 14 * sc, y + 4.5f * sc);
+                    g.DrawLine(pen, x + 1 * sc, y + 11.5f * sc, x + 14 * sc, y + 11.5f * sc);
+                    float kr = 2.2f * sc;
+                    using (var b = new SolidBrush(bgFill))
+                    {
+                        g.FillEllipse(b, x + 10.5f * sc - kr, y + 4.5f * sc - kr, kr * 2, kr * 2);
+                        g.FillEllipse(b, x + 4.7f * sc - kr, y + 11.5f * sc - kr, kr * 2, kr * 2);
+                    }
+                    g.DrawEllipse(pen, x + 10.5f * sc - kr, y + 4.5f * sc - kr, kr * 2, kr * 2);
+                    g.DrawEllipse(pen, x + 4.7f * sc - kr, y + 11.5f * sc - kr, kr * 2, kr * 2);
+                }
+                else
+                { // 关于：圆 + i
+                    g.DrawEllipse(pen, x + 1.5f * sc, y + 1.5f * sc, 12 * sc, 12 * sc);
+                    using (var b = new SolidBrush(c))
+                    {
+                        g.FillEllipse(b, x + 7.1f * sc, y + 4.2f * sc, 1.8f * sc, 1.8f * sc);
+                        g.FillEllipse(b, x + 7.1f * sc, y + 7.2f * sc, 1.8f * sc, 4.4f * sc);
+                    }
+                }
+            }
+        }
+
+        private void PaintProviders(Graphics g, SettingsPal p, Font[] fs)
+        {
+            // 工具栏：＋ 添加供应商（主） / 测试全部（次）
+            PaintButton(g, p, fs, _rcAdd, "＋ 添加供应商", true, _hover == "add");
+            PaintButton(g, p, fs, _rcTest, _testing ? "测试中…" : "测试全部", false, _hover == "test" && !_testing);
+
+            if (_editList.Count == 0)
+            {
+                int ey = _rcAdd.Bottom + S(40);
+                using (var sf = new StringFormat { Alignment = StringAlignment.Center })
+                using (var b = new SolidBrush(p.Text2))
+                    g.DrawString("还没有供应商", fs[1], b, new RectangleF(_vp.X, ey, _vp.Width, S(24)), sf);
+                using (var sf = new StringFormat { Alignment = StringAlignment.Center })
+                using (var b = new SolidBrush(p.Text3))
+                    g.DrawString("点击「＋ 添加供应商」开始监控额度", fs[3], b, new RectangleF(_vp.X, ey + S(28), _vp.Width, S(20)), sf);
+                return;
+            }
+
+            int hovCard = HoverCardIndex();
+            for (int i = 0; i < _cardRects.Count; i++)
+            {
+                if (i == _dragCard) continue; // 拖拽中的卡片最后浮层绘制
+                PaintProviderCard(g, p, fs, _cardRects[i], i, i == hovCard, false);
+            }
+
+            // 拖拽中的卡片：跟随鼠标浮起（投影 + 高亮边框），盖在其他卡片之上
+            if (_dragCard >= 0 && _dragCard < _cardRects.Count)
+            {
+                var src = _cardRects[_dragCard];
+                var dragRect = new Rectangle(src.X, (int)_dragDrawY, src.Width, src.Height);
+                using (var path = St.RoundRect(new Rectangle(dragRect.X + S(2), dragRect.Y + S(5), dragRect.Width, dragRect.Height), S(10)))
+                using (var sb = new SolidBrush(Color.FromArgb(30, 0, 0, 0)))
+                    g.FillPath(sb, path);
+                PaintProviderCard(g, p, fs, dragRect, _dragCard, true, true);
+            }
+        }
+
+        private void PaintProviderCard(Graphics g, SettingsPal p, Font[] fs, Rectangle card, int i, bool hot, bool elevated)
+        {
+            var prov = _editList[i];
+            int cardH = card.Height;
+            using (var path = St.RoundRect(card, S(10)))
+            {
+                using (var b = new SolidBrush(p.Win))
+                    g.FillPath(b, path);
+                using (var pen = new Pen(hot || elevated ? p.CardHover : p.Line))
+                    g.DrawPath(pen, path);
+            }
+
+            // 拖拽手柄（2×3 圆点）
+            using (var b = new SolidBrush(_hover == "grip:" + i ? p.Text2 : p.Text3))
+                for (int r = 0; r < 3; r++)
+                    for (int c = 0; c < 2; c++)
+                        g.FillEllipse(b, card.X + S(13) + c * S(5), card.Y + cardH / 2 - S(6) + r * S(5), S(2), S(2));
+
+            // 服务商标识色圆点（与悬浮窗一致取 AccentFor）
+            using (var b = new SolidBrush(St.AccentFor(prov.Type)))
+                g.FillEllipse(b, card.X + S(34), card.Y + cardH / 2 - S(4), S(8), S(8));
+
+            // 名称（超长省略）
+            string name = Elide(g, prov.Name, fs[1], S(110));
+            float nameW = g.MeasureString(name, fs[1]).Width;
+            using (var b = new SolidBrush(p.Text))
+                g.DrawString(name, fs[1], b, new RectangleF(card.X + S(50), card.Y, nameW + S(16), cardH), SFLeftV);
+
+            // 接口类型徽标
+            string badge = prov.TypeName;
+            int bw = MeasureW(badge, fs[5]) + S(16);
+            var br = new Rectangle(card.X + S(50) + (int)nameW + S(10), card.Y + cardH / 2 - S(9), bw, S(18));
+            using (var path = St.RoundRect(br, S(9)))
+            using (var b = new SolidBrush(p.Pill))
+                g.FillPath(b, path);
+            TextRenderer.DrawText(g, badge, fs[5], br, p.PillText, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+
+            // 打码 Key（与旧表格同规则：前 4 + ****** + 后 4）
+            string key = prov.Key;
+            string masked = key.Length > 8 ? key.Substring(0, 4) + "******" + key.Substring(key.Length - 4) : "****";
+            int keyMax = (card.Right - S(14) - S(30) * 2 - S(6)) - S(12) - (br.Right + S(12));
+            if (keyMax > S(40))
+                using (var b = new SolidBrush(p.Text3))
+                    g.DrawString(Elide(g, masked, fs[6], keyMax), fs[6], b, new RectangleF(br.Right + S(12), card.Y, keyMax, cardH), SFLeftV);
+
+            // 行内操作：编辑（铅笔） / 删除（垃圾桶）
+            bool eHot = _hover == "edit:" + i, dHot = _hover == "del:" + i;
+            var er = new Rectangle(card.Right - S(14) - S(30) * 2 - S(6), card.Y + cardH / 2 - S(15), S(30), S(30));
+            var dr = new Rectangle(card.Right - S(14) - S(30), card.Y + cardH / 2 - S(15), S(30), S(30));
+            if (eHot)
+                using (var path = St.RoundRect(er, S(6)))
+                using (var b = new SolidBrush(p.Hover))
+                    g.FillPath(b, path);
+            PaintPencil(g, eHot ? p.Text : p.Text2, er.X + S(7), er.Y + S(7), _scale);
+            if (dHot)
+                using (var path = St.RoundRect(dr, S(6)))
+                using (var b = new SolidBrush(Color.FromArgb(22, p.Danger)))
+                    g.FillPath(b, path);
+            PaintTrash(g, dHot ? p.Danger : p.Text2, dr.X + S(7), dr.Y + S(7), _scale);
+        }
+
+        private int HoverCardIndex()
+        {
+            if (_hover == null) return -1;
+            int k = _hover.IndexOf(':');
+            if (k < 0) return -1;
+            string head = _hover.Substring(0, k);
+            if (head != "card" && head != "grip" && head != "edit" && head != "del") return -1;
+            int i;
+            return int.TryParse(_hover.Substring(k + 1), out i) ? i : -1;
+        }
+
+        private void PaintGeneral(Graphics g, SettingsPal p, Font[] fs)
+        {
+            PaintGroupBg(g, p, _grp1);
+            PaintGroupBg(g, p, _grp2);
+
+            for (int i = 0; i < _visRows.Count; i++)
+                PaintRow(g, p, fs, _visRows[i], _rowRects[i], i > 0);
+            int baseIdx = _visRows.Count;
+            PaintRow(g, p, fs, R_THEME, _rowRects[baseIdx], true);
+            PaintRow(g, p, fs, R_TOP, _rowRects[baseIdx + 1], true);
+            PaintRow(g, p, fs, R_AUTO, _rowRects[baseIdx + 2], true);
+        }
+
+        private void PaintGroupBg(Graphics g, SettingsPal p, Rectangle grp)
+        {
+            using (var path = St.RoundRect(grp, S(12)))
+            {
+                using (var b = new SolidBrush(p.Win))
+                    g.FillPath(b, path);
+                using (var pen = new Pen(p.Line))
+                    g.DrawPath(pen, path);
+            }
+        }
+
+        // 行标题文案
+        private static string RowTitle(int rowId)
+        {
+            switch (rowId)
+            {
+                case R_MODE: return "显示模式";
+                case R_SCREEN: return "显示屏幕";
+                case R_INT: return "刷新间隔";
+                case R_OP: return "窗口不透明度";
+                case R_THEME: return "主题";
+                case R_TOP: return "窗口置顶";
+                default: return "开机启动";
+            }
+        }
+
+        // 行说明文案（PaintRow 不再画小字，改为悬停行标题后的气泡提示）
+        private static string RowDesc(int rowId)
+        {
+            switch (rowId)
+            {
+                case R_MODE: return "悬浮窗为独立小窗，可拖动、可最小化；置顶栏嵌入屏幕顶部并占用工作区。";
+                case R_SCREEN: return "置顶栏停靠的显示器。";
+                case R_INT: return "自动查询额度的时间间隔。";
+                case R_OP: return "数值越低悬浮窗越透明。";
+                case R_THEME: return "跟随此设置，悬浮窗与置顶栏同步切换明暗。";
+                case R_TOP: return "悬浮窗始终显示在其他窗口之上。";
+                default: return "登录 Windows 后自动运行。";
+            }
+        }
+
+        private void PaintRow(Graphics g, SettingsPal p, Font[] fs, int rowId, Rectangle r, bool withSeparator)
+        {
+            if (withSeparator)
+                using (var pen = new Pen(p.Line2))
+                    g.DrawLine(pen, r.X + S(16), r.Y, r.Right - S(16), r.Y);
+
+            // 单行布局：标题整行垂直居中，说明文字改为悬停气泡（见 UpdateTip / HoverTip）
+            using (var b = new SolidBrush(p.Text))
+                g.DrawString(RowTitle(rowId), fs[1], b, new RectangleF(r.X + S(16), r.Y, r.Width - S(32), r.Height), SFLeftV);
+
+            int cy = r.Y + r.Height / 2;
+            switch (rowId)
+            {
+                case R_MODE:
+                    // 分段顺序：置顶栏在左（默认模式在前）。段位 0=置顶栏 / 1=悬浮窗，
+                    // 与 _pendMode（0=悬浮窗 1=置顶栏）语义相反，读写两端都做换算
+                    PaintSeg(g, p, fs, _rcSegMode, _segModeBtns, new string[] { "置顶栏", "悬浮窗" }, _pendMode == 1 ? 0 : 1, "segmode");
+                    break;
+                case R_SCREEN:
+                    string[] items = ScreenItems();
+                    PaintSelect(g, p, fs, _rcSelScreen, items[Math.Min(_pendScreen, items.Length - 1)], _hover == "sel:screen");
+                    break;
+                case R_INT:
+                    PaintSelect(g, p, fs, _rcSelInt, IntervalText(_pendInterval), _hover == "sel:int");
+                    break;
+                case R_OP:
+                    PaintSlider(g, p, fs, cy);
+                    break;
+                case R_THEME:
+                    PaintSeg(g, p, fs, _rcSegTheme, _segThemeBtns, new string[] { "☀ 浅色", "☾ 深色" }, _pendDark ? 1 : 0, "segtheme");
+                    break;
+                case R_TOP:
+                    PaintToggle(g, p, _rcTglTop, _pendTopMost);
+                    break;
+                default:
+                    PaintToggle(g, p, _rcTglAuto, _pendAutoStart);
+                    break;
+            }
+        }
+
+        private void PaintSeg(Graphics g, SettingsPal p, Font[] fs, Rectangle box, List<Rectangle> btns, string[] labels, int active, string hoverPrefix)
+        {
+            using (var path = St.RoundRect(box, S(8)))
+            using (var b = new SolidBrush(p.Hover))
+                g.FillPath(b, path);
+            int hoverIdx = HoverIdxOf(hoverPrefix);
+            for (int i = 0; i < btns.Count; i++)
+            {
+                var r = btns[i];
+                bool on = i == active;
+                bool hot = !on && i == hoverIdx;
+                if (on)
+                    using (var path = St.RoundRect(r, S(6)))
+                    {
+                        using (var b = new SolidBrush(p.Win))
+                            g.FillPath(b, path);
+                        using (var pen = new Pen(p.Line))
+                            g.DrawPath(pen, path);
+                    }
+                TextRenderer.DrawText(g, labels[i], on ? fs[8] : fs[3], r, on || hot ? p.Text : p.Text2,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+            }
+        }
+
+        private void PaintSelect(Graphics g, SettingsPal p, Font[] fs, Rectangle r, string text, bool hot)
+        {
+            using (var path = St.RoundRect(r, S(8)))
+            {
+                using (var b = new SolidBrush(p.Win))
+                    g.FillPath(b, path);
+                using (var pen = new Pen(hot ? p.CardHover : p.Line))
+                    g.DrawPath(pen, path);
+            }
+            int maxW = r.Width - S(34);
+            string s = text;
+            while (s.Length > 1 && MeasureW(s + "…", fs[3]) > maxW) s = s.Substring(0, s.Length - 1);
+            if (s != text) s += "…";
+            using (var b = new SolidBrush(p.Text))
+                g.DrawString(s, fs[3], b, new RectangleF(r.X + S(12), r.Y, maxW + S(20), r.Height), SFLeftV);
+            using (var pen = new Pen(p.Text2, 1.5f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+            {
+                float cx = r.Right - S(16), cyy = r.Y + r.Height / 2f;
+                g.DrawLine(pen, cx - S(4), cyy - S(2), cx, cyy + S(2));
+                g.DrawLine(pen, cx, cyy + S(2), cx + S(4), cyy - S(2));
+            }
+        }
+
+        private void PaintSlider(Graphics g, SettingsPal p, Font[] fs, int cy)
+        {
+            var tr = _rcSlider;
+            using (var path = St.RoundRect(tr, S(2)))
+            using (var b = new SolidBrush(p.Track))
+                g.FillPath(b, path);
+            int fillW = (int)Math.Round(tr.Width * (_pendOpacity - 50) / 50.0);
+            if (fillW > 0)
+            {
+                var fr = new Rectangle(tr.X, tr.Y, Math.Max(fillW, tr.Height), tr.Height);
+                using (var path = St.RoundRect(fr, S(2)))
+                using (var b = new SolidBrush(p.Text))
+                    g.FillPath(b, path);
+            }
+            var thumb = new Rectangle(tr.X + fillW - S(8), cy - S(8), S(16), S(16));
+            using (var b = new SolidBrush(p.Win))
+                g.FillEllipse(b, thumb);
+            using (var pen = new Pen(p.Text, 1.6f))
+                g.DrawEllipse(pen, thumb);
+
+            using (var b = new SolidBrush(p.Text2))
+                g.DrawString(_pendOpacity + "%", fs[3], b, new RectangleF(tr.Right + S(12), cy - S(14), S(48), S(28)), SFLeftV);
+        }
+
+        private void PaintToggle(Graphics g, SettingsPal p, Rectangle r, bool on)
+        {
+            using (var path = St.RoundRect(r, r.Height / 2))
+            using (var b = new SolidBrush(on ? p.Text : p.ToggleOff))
+                g.FillPath(b, path);
+            int d = r.Height - S(4);
+            var knob = new Rectangle(on ? r.Right - S(2) - d : r.X + S(2), r.Y + S(2), d, d);
+            using (var b = new SolidBrush(p.Win))
+                g.FillEllipse(b, knob);
+        }
+
+        private void PaintAbout(Graphics g, SettingsPal p, Font[] fs)
+        {
+            int y = _vp.Y - (int)_scrollP + S(24);
+
+            int cx = _vp.X + _vp.Width / 2;
+            int iconY = y + S(16);
+            IconFactory.DrawGlyph(g, new Rectangle(cx - S(28), iconY, S(56), S(56)));
+
+            using (var sf = new StringFormat { Alignment = StringAlignment.Center })
+            using (var b = new SolidBrush(p.Text))
+                g.DrawString("AI 额度工具", fs[0], b, new RectangleF(_vp.X, iconY + S(70), _vp.Width, S(26)), sf);
+            using (var sf = new StringFormat { Alignment = StringAlignment.Center })
+            using (var b = new SolidBrush(p.Text2))
+            {
+                g.DrawString("v" + AppInfo.Version, fs[3], b, new RectangleF(_vp.X, iconY + S(100), _vp.Width, S(18)), sf);
+                g.DrawString("在桌面悬浮展示 GLM / Kimi / MiniMax / DeepSeek 的额度与用量。", fs[3], b, new RectangleF(_vp.X, iconY + S(128), _vp.Width, S(18)), sf);
+                g.DrawString("配置明文保存在 exe 同目录 config.json，请勿分享此文件。", fs[3], b, new RectangleF(_vp.X, iconY + S(150), _vp.Width, S(18)), sf);
+            }
+        }
+
+        private void PaintButton(Graphics g, SettingsPal p, Font[] fs, Rectangle r, string text, bool primary, bool hot)
+        {
+            using (var path = St.RoundRect(r, S(8)))
+            {
+                if (primary)
+                {
+                    using (var b = new SolidBrush(hot ? SettingsPal.Mix(p.Primary, p.Win, 0.12) : p.Primary))
+                        g.FillPath(b, path);
+                }
+                else
+                {
+                    using (var b = new SolidBrush(hot ? p.Hover : p.Win))
+                        g.FillPath(b, path);
+                    using (var pen = new Pen(p.Line))
+                        g.DrawPath(pen, path);
+                }
+            }
+            Color c = primary ? p.PrimaryText : (hot ? p.Text : p.Text2);
+            // GDI TextRenderer 垂直居中：GDI+ DrawString 的行盒对中文字体含大量内边距，
+            // 居中后字形明显偏上；与系统按钮控件观感保持一致
+            TextRenderer.DrawText(g, text, fs[1], r, c, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+        }
+
+        private void PaintFooter(Graphics g, SettingsPal p, Font[] fs, int sideW, int footH, int H, int W)
+        {
+            int top = H - footH;
+            using (var pen = new Pen(p.Line2))
+                g.DrawLine(pen, sideW, top, W, top);
+            using (var b = new SolidBrush(p.Text3))
+                g.DrawString("更改在点击「保存」后生效，配置明文保存于 config.json", fs[4], b, new RectangleF(sideW + S(30), top, W - sideW - S(30), footH), SFLeftV);
+            PaintButton(g, p, fs, _rcCancel, "取消", false, _hover == "btn:cancel");
+            PaintButton(g, p, fs, _rcSave, "保存", true, _hover == "btn:save");
+        }
+
+        private void PaintScrollbar(Graphics g, SettingsPal p)
+        {
+            int max = Math.Max(0, _contentH - _vp.Height);
+            if (max <= 0) return;
+            float scroll = _page == 0 ? _scrollP : _scrollG;
+            int thumbH = Math.Max(S(32), (int)((float)_vp.Height * _vp.Height / _contentH));
+            int thumbY = _vp.Y + (int)((_vp.Height - thumbH) * (scroll / max));
+            var r = new Rectangle(_vp.Right + S(8), thumbY, S(4), thumbH);
+            using (var path = St.RoundRect(r, S(2)))
+            using (var b = new SolidBrush(Color.FromArgb(70, p.Text3)))
+                g.FillPath(b, path);
+        }
+
+        private static void PaintPencil(Graphics g, Color c, float x, float y, float s)
+        {
+            // 16 盒内铅笔：沿对角的笔杆 + 左下笔尖
+            var pts = new PointF[] {
+                new PointF(x + 11.3f * s, y + 2.2f * s),
+                new PointF(x + 13.8f * s, y + 4.7f * s),
+                new PointF(x + 5.4f * s,  y + 13f * s),
+                new PointF(x + 2.2f * s,  y + 13.7f * s),
+                new PointF(x + 2.9f * s,  y + 10.5f * s)
+            };
+            using (var pen = new Pen(c, 1.3f) { LineJoin = LineJoin.Round })
+                g.DrawPolygon(pen, pts);
+        }
+
+        private static void PaintTrash(Graphics g, Color c, float x, float y, float s)
+        {
+            using (var pen = new Pen(c, 1.3f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+            {
+                g.DrawLine(pen, x + 2.5f * s, y + 4f * s, x + 13.5f * s, y + 4f * s);      // 顶盖
+                g.DrawLine(pen, x + 6.5f * s, y + 4f * s, x + 6.5f * s, y + 2.2f * s);     // 提手
+                g.DrawLine(pen, x + 9.5f * s, y + 4f * s, x + 9.5f * s, y + 2.2f * s);
+                g.DrawLine(pen, x + 6.5f * s, y + 2.2f * s, x + 9.5f * s, y + 2.2f * s);
+                g.DrawLines(pen, new PointF[] {                                            // 桶身
+                    new PointF(x + 4f * s,    y + 4f * s),
+                    new PointF(x + 4.7f * s,  y + 13.2f * s),
+                    new PointF(x + 11.3f * s, y + 13.2f * s),
+                    new PointF(x + 12f * s,   y + 4f * s)
+                });
+            }
+        }
+
+        private string Elide(Graphics g, string s, Font f, double maxW)
+        {
+            if (g.MeasureString(s, f).Width <= maxW) return s;
+            while (s.Length > 1 && g.MeasureString(s + "…", f).Width > maxW) s = s.Substring(0, s.Length - 1);
+            return s + "…";
+        }
+
+        // ============================= 数据源 =============================
+        private string[] ScreenItems()
+        {
+            var screens = Screen.AllScreens;
+            var items = new string[screens.Length];
+            for (int i = 0; i < screens.Length; i++)
+            {
+                var b = screens[i].Bounds;
+                items[i] = (i + 1) + ". " + (screens[i].Primary ? "主显示器" : "显示器 " + (i + 1)) + string.Format(" ({0}×{1})", b.Width, b.Height);
+            }
+            return items;
+        }
+
+        // 刷新间隔候选（秒）：预设 + 已有自定义值（保证旧配置里的任意值可见可选）
+        private int[] IntervalVals()
+        {
+            var vals = new List<int>(IntervalPresets);
+            if (!vals.Contains(_pendInterval))
+            {
+                vals.Add(_pendInterval);
+                vals.Sort();
+            }
+            return vals.ToArray();
+        }
+
+        private static string IntervalText(int v)
+        {
+            return v >= 60 && v % 60 == 0 ? (v / 60) + " 分钟" : v + " 秒";
+        }
+
+        // ============================= 交互 =============================
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left) return;
+            Focus();
+            HideTip();
+            string id = Hit(e.Location);
+            Point mp = MousePosition;
+
+            if (id == "moon") { _pendDark = !_pendDark; _hover = null; Invalidate(); return; }
+            if (id == "close") { Close(); return; }
+            if (id != null && id.StartsWith("nav:")) { SwitchPage(int.Parse(id.Substring(4))); return; }
+
+            // 标题栏空白区拖动窗口（沿用旧版手动拖动：跨屏时实时重建缩放）
+            if (id == null && e.Y < S(46))
+            {
+                _dragWindow = true;
+                _dragOffset = new Point(mp.X - Left, mp.Y - Top);
+                Capture = true;
+                return;
+            }
+
+            if (_page == 0)
+            {
+                if (id == "add") { AddProvider(); return; }
+                if (id == "test") { TestAll(); return; }
+                if (id != null && id.StartsWith("grip:") && int.Parse(id.Substring(5)) < _cardRects.Count)
+                {
+                    _dragCard = int.Parse(id.Substring(5));
+                    _grabDY = Math.Max(0, Math.Min(S(54), e.Y - _cardRects[_dragCard].Y)); // 抓点在卡片内的相对位置
+                    _dragDrawY = _cardRects[_dragCard].Y;
+                    Capture = true;
+                    return;
+                }
+                if (id != null && id.StartsWith("edit:")) { EditCard(int.Parse(id.Substring(5))); return; }
+                if (id != null && id.StartsWith("del:")) { DeleteCard(int.Parse(id.Substring(4))); return; }
+            }
+            else if (_page == 1)
+            {
+                if (id != null && id.StartsWith("segmode:")) { SetMode(int.Parse(id.Substring(8)) == 0 ? 1 : 0); return; } // 段位 0=置顶栏 → _pendMode=1
+                if (id != null && id.StartsWith("segtheme:")) { _pendDark = int.Parse(id.Substring(9)) == 1; Invalidate(); return; }
+                if (id == "tgl:top") { _pendTopMost = !_pendTopMost; Invalidate(); return; }
+                if (id == "tgl:auto") { _pendAutoStart = !_pendAutoStart; Invalidate(); return; }
+                if (id == "sel:screen") { OpenScreenPopup(); return; }
+                if (id == "sel:int") { OpenIntervalPopup(); return; }
+                if (id == "sld:op") { _dragSlider = true; Capture = true; SliderSet(e.X); return; }
+            }
+
+            if (id == "btn:cancel") { Close(); return; }
+            if (id == "btn:save") { SaveAndClose(); return; }
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            if (_dragWindow)
+            {
+                Location = new Point(MousePosition.X - _dragOffset.X, MousePosition.Y - _dragOffset.Y);
+                return;
+            }
+            if (_dragCard >= 0) { CardDragMove(e.Y); return; }
+            if (_dragSlider) { SliderSet(e.X); return; }
+
+            string h = Hit(e.Location);
+            if (h != _hover)
+            {
+                _hover = h;
+                Cursor = h == null ? Cursors.Default
+                    : (h.StartsWith("grip:") ? Cursors.SizeAll
+                    : (h.StartsWith("tip:") ? Cursors.Default : Cursors.Hand));
+                UpdateTip(h);
+                Invalidate();
+            }
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            _dragWindow = false;
+            _dragSlider = false;
+            _dragCard = -1;
+            Capture = false;
+            Invalidate();
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            if (_dragWindow || _dragCard >= 0 || _dragSlider) return; // 拖拽中的 MouseLeave（含 Capture 边界）不当作真离开
+            if (_hover != null) { _hover = null; Cursor = Cursors.Default; Invalidate(); }
+            HideTip();
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            if (_page == 2 || _dragCard >= 0) return; // 拖拽排序中禁滚动，避免拖拽卡与列表错位
+            HideTip();
+            if (_page == 0) _scrollP -= e.Delta * S(52) / 120f; else _scrollG -= e.Delta * S(52) / 120f;
+            LayoutAll();
+            Invalidate();
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            if (_built) LayoutAll();
+        }
+
+        private void SwitchPage(int idx)
+        {
+            if (_page == idx) return;
+            _page = idx;
+            _hover = null;
+            ClosePopup();
+            HideTip();
+            LayoutAll();
+            Invalidate();
+        }
+
+        private void SetMode(int m)
+        {
+            if (_pendMode == m) return;
+            _pendMode = m;
+            ClosePopup();
+            HideTip();
+            LayoutAll(); // 屏幕行显隐改变内容高度，滚动随之收敛
+            Invalidate();
+        }
+
+        private void SliderSet(int mouseX)
+        {
+            int v = 50 + (int)Math.Round((mouseX - _rcSlider.X) * 50.0 / Math.Max(1, _rcSlider.Width));
+            v = Math.Max(50, Math.Min(100, v));
+            if (v != _pendOpacity) { _pendOpacity = v; Invalidate(); }
+        }
+
+        // 拖拽跟手：被拖卡片以浮层形式跟随鼠标（画在 _dragDrawY），其余卡片让位；
+        // 拖拽卡中心线越过相邻卡中点时实时换位（列表顺序即最终顺序，松手无需再处理）
+        private void CardDragMove(int mouseY)
+        {
+            if (_dragCard < 0 || _dragCard >= _cardRects.Count || _cardRects.Count == 0) return;
+            int cardH = S(54), gap = S(10);
+            int listTop = _cardRects[0].Y;
+            int listBottom = listTop + _editList.Count * (cardH + gap) - gap;
+            _dragDrawY = Math.Max(listTop, Math.Min(listBottom - cardH, mouseY - _grabDY));
+
+            int idx = (int)Math.Floor((_dragDrawY + cardH / 2.0 - listTop) / (cardH + gap));
+            idx = Math.Max(0, Math.Min(_editList.Count - 1, idx));
+            if (idx != _dragCard)
+            {
+                var item = _editList[_dragCard];
+                _editList.RemoveAt(_dragCard);
+                _editList.Insert(idx, item);
+                _dragCard = idx;
+                LayoutAll();
+            }
+            Invalidate();
+        }
+
+        // ---- 下拉弹层 ----
+        private void OpenPopup(Rectangle anchorClient, string[] items, int selected, Action<int> pick)
+        {
+            ClosePopup();
+            Font[] fs = Fonts(_scale);
+            _popup = new SettingsPopupList(RectangleToScreen(anchorClient), items, selected, P, fs[3], fs[8], _scale, pick);
+            _popup.Show(this);
+        }
+
+        private void ClosePopup()
+        {
+            if (_popup != null && !_popup.IsDisposed)
+                _popup.Close();
+            _popup = null;
+        }
+
+        private void OpenScreenPopup()
+        {
+            _pendScreen = Math.Max(0, Math.Min(Screen.AllScreens.Length - 1, _pendScreen));
+            string[] items = ScreenItems();
+            int sel = _pendScreen;
+            OpenPopup(_rcSelScreen, items, sel, delegate(int idx)
+            {
+                _pendScreen = idx;
+                Invalidate();
+            });
+        }
+
+        private void OpenIntervalPopup()
+        {
+            int[] vals = IntervalVals();
+            var items = new string[vals.Length];
+            for (int i = 0; i < vals.Length; i++) items[i] = IntervalText(vals[i]);
+            int sel = 0;
+            for (int i = 0; i < vals.Length; i++) if (vals[i] == _pendInterval) sel = i;
+            OpenPopup(_rcSelInt, items, sel, delegate(int idx)
+            {
+                _pendInterval = vals[idx];
+                Invalidate();
+            });
+        }
+
+        // ============================= 行说明气泡 =============================
+        private void UpdateTip(string hoverId)
+        {
+            int row = -1;
+            if (_page == 1 && hoverId != null && hoverId.StartsWith("tip:"))
+                row = int.Parse(hoverId.Substring(4));
+            if (row == _tipRow) return;
+            HideTip();
+            if (row >= 0 && row <= R_AUTO)
+            {
+                _tipRow = row;
+                _tipText = RowDesc(row);
+                _tipTimer.Stop();
+                _tipTimer.Start(); // 悬停 450ms 后浮现（见 ctor 的 Tick）
+            }
+        }
+
+        private void ShowTip()
+        {
+            if (_tipText == null) return;
+            if (_tip == null || _tip.IsDisposed) _tip = new HoverTip();
+            _tip.ShowAt(Cursor.Position, _tipText, P, _scale);
+        }
+
+        private void HideTip()
+        {
+            _tipTimer.Stop();
+            _tipRow = -1;
+            _tipText = null;
+            if (_tip != null && !_tip.IsDisposed) _tip.Hide();
+        }
+
+        // ---- 供应商增删改 ----
+        private void AddProvider()
+        {
+            using (var dlg = new ProviderEditDialog(null, P, _scale))
+            {
+                if (dlg.ShowDialog(this) == DialogResult.OK && dlg.Result != null)
+                {
+                    _editList.Add(dlg.Result);
+                    LayoutAll();
+                    Invalidate();
+                }
+            }
+        }
+
+        private void EditCard(int idx)
+        {
+            if (idx < 0 || idx >= _editList.Count) return;
+            using (var dlg = new ProviderEditDialog(_editList[idx], P, _scale))
+            {
+                if (dlg.ShowDialog(this) == DialogResult.OK && dlg.Result != null)
+                {
+                    _editList[idx] = dlg.Result;
+                    LayoutAll();
+                    Invalidate();
+                }
+            }
+        }
+
+        private void DeleteCard(int idx)
+        {
+            if (idx < 0 || idx >= _editList.Count) return;
+            _editList.RemoveAt(idx);
+            LayoutAll();
+            Invalidate();
+        }
+
+        // ---- 跨屏 DPI：拖动换屏时按新缩放重建尺寸与布局（状态在字段里，无需备份回填） ----
         protected override void OnLocationChanged(EventArgs e)
         {
             base.OnLocationChanged(e);
             if (!_built || !IsHandleCreated) return;
             try
             {
-                float n = St.DpiOf(Screen.FromControl(this)) / 96f;
+                var screen = Screen.FromControl(this);
+                float n = ClampScale(St.DpiOf(screen) / 96f, screen);
                 if (Math.Abs(n - _scale) > 0.01f)
                 {
                     _scale = n;
-                    // 重建前备份未保存的编辑状态（控件树重建会从配置重读，不备份会静默丢失用户改动）
-                    int interval = _numInterval != null ? (int)_numInterval.Value : Math.Max(15, _ctx.Cfg.RefreshSec);
-                    int opacity = _trkOpacity != null ? _trkOpacity.Value : _ctx.Cfg.OpacityPct;
-                    int modeIdx = _cmbMode != null ? _cmbMode.SelectedIndex : (_ctx.Cfg.DisplayMode == "topbar" ? 1 : 0);
-                    int themeIdx = _cmbTheme != null ? _cmbTheme.SelectedIndex : (_ctx.Cfg.Theme == "dark" ? 1 : 0);
-                    int screenIdx = _cmbScreen != null ? _cmbScreen.SelectedIndex : Math.Max(0, _ctx.Cfg.AppBarScreen);
-                    bool topMost = _chkTopMost != null ? _chkTopMost.Checked : _ctx.Cfg.TopMost;
-                    bool autoStart = _chkAutoStart != null ? _chkAutoStart.Checked : _ctx.Cfg.AutoStart;
-                    int gridRow = _grid != null && _grid.CurrentRow != null ? _grid.CurrentRow.Index : -1;
-
-                    SuspendLayout();
-                    try
-                    {
-                        // 先快照再 Dispose：Dispose 会把控件从 Controls 移除，直接 foreach 枚举会因
-                        // 集合被修改抛 InvalidOperationException（被外层 catch 吞掉后重建中断、按钮
-                        // 区永久丢失）。快照后逐个 Dispose 仍是为避免仅 Clear() 泄漏 HWND/GDI 资源
-                        var snapshot = new Control[Controls.Count];
-                        Controls.CopyTo(snapshot, 0);
-                        foreach (Control c in snapshot) c.Dispose();
-                        Controls.Clear();
-                        BuildLayout();
-                    }
-                    finally { ResumeLayout(true); }
-
-                    // 回填重建前的编辑状态
-                    _numInterval.Value = Math.Max(15, Math.Min(3600, interval));
-                    _trkOpacity.Value = Math.Max(50, Math.Min(100, opacity));
-                    if (modeIdx >= 0 && modeIdx < _cmbMode.Items.Count) _cmbMode.SelectedIndex = modeIdx;
-                    if (themeIdx >= 0 && themeIdx < _cmbTheme.Items.Count) _cmbTheme.SelectedIndex = themeIdx;
-                    if (screenIdx >= 0 && screenIdx < _cmbScreen.Items.Count) _cmbScreen.SelectedIndex = screenIdx;
-                    _chkTopMost.Checked = topMost;
-                    _chkAutoStart.Checked = autoStart;
-                    if (gridRow >= 0 && gridRow < _grid.Rows.Count) _grid.CurrentCell = _grid.Rows[gridRow].Cells[0];
-                    // 拖动中让窗口贴住鼠标抓点；非拖动保持左上角位置
-                    if (_drag) Location = new Point(MousePosition.X - _dragOffset.X, MousePosition.Y - _dragOffset.Y);
+                    ClosePopup();
+                    ApplyScaleToSize();
+                    LayoutAll();
+                    // 拖动中让窗口贴住鼠标抓点（尺寸变了，位置按屏幕坐标偏移重算）
+                    if (_dragWindow) Location = new Point(MousePosition.X - _dragOffset.X, MousePosition.Y - _dragOffset.Y);
                 }
             }
             catch (Exception ex)
             {
-                // 重建失败时保留原布局（缩放不更新），下次移动窗口会重试，不阻塞拖动
                 System.Diagnostics.Debug.WriteLine("SettingsForm 跨屏重建失败: " + ex.Message);
             }
         }
 
-        // 手动拖动标题栏（WM_NCHITTEST 已把标题栏转为客户区，事件在此接收）
-        protected override void OnMouseDown(MouseEventArgs e)
+        protected override void OnHandleCreated(EventArgs e)
         {
-            base.OnMouseDown(e);
-            // 偏移取屏幕坐标系（MousePosition - Location）：标题栏被 WM_NCHITTEST 转为客户区后
-            // 点击标题栏时 e.Location.Y 为负，若用客户区偏移对屏幕坐标运算，首次移动窗口跳变
-            if (e.Button == MouseButtons.Left) { _drag = true; _dragOffset = new Point(MousePosition.X - Left, MousePosition.Y - Top); }
-        }
-        protected override void OnMouseMove(MouseEventArgs e)
-        {
-            base.OnMouseMove(e);
-            if (!_drag) return;
-            // 捕获丢失（窗口失活/ESC 中断等）时复位，避免窗口失控持续跟随鼠标
-            if (!Capture) { _drag = false; return; }
-            Location = new Point(MousePosition.X - _dragOffset.X, MousePosition.Y - _dragOffset.Y);
-        }
-        protected override void OnMouseUp(MouseEventArgs e)
-        {
-            base.OnMouseUp(e);
-            if (e.Button == MouseButtons.Left) _drag = false;
+            base.OnHandleCreated(e);
+            St.RoundCorners(Handle); // 四角交给 DWM 做抗锯齿圆角（与设计稿 10px 圆角观感一致）
+            EnsureBorderlessStyle();
         }
 
-        // 拦截 WM_NCHITTEST：标题栏区域（HT_CAPTION）转为客户区（HT_CLIENT），
-        // 由程序自己拖动，从而支持拖动过程中实时跨屏适配。
-        // WM_DPICHANGED 交给 base 处理：WinForms 更新 DeviceDpi（勾选框等按所在屏 DPI 绘制），
-        // AutoScaleMode=None 时不会自动缩放布局，尺寸由 BuildLayout 手动控制。
-        private const int WM_NCHITTEST = 0x0084;
-        private const int HT_CAPTION = 2;
-        private const int HT_CLIENT = 1;
+        // ---- 无边框样式自愈 ----
+        // WinForms 在最小化恢复 / 句柄重建时可能把 WS_CAPTION 加回窗口（表现为顶部突然出现
+        // 原生标题栏和最小化/关闭按钮）。命中即剥掉并触发一次框架重算；样式正常时是空操作。
+        private const int GWL_STYLE = -16;
+        private const int WS_CAPTION = 0x00C00000;
+        private const uint SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002, SWP_NOZORDER = 0x0004, SWP_FRAMECHANGED = 0x0020;
+
+        [DllImport("user32.dll")]
+        private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+        [DllImport("user32.dll")]
+        private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int value);
+        [DllImport("user32.dll")]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndAfter, int x, int y, int cx, int cy, uint flags);
+
+        private void EnsureBorderlessStyle()
+        {
+            if (!IsHandleCreated) return;
+            int style = GetWindowLong(Handle, GWL_STYLE);
+            if ((style & WS_CAPTION) != 0)
+            {
+                SetWindowLong(Handle, GWL_STYLE, style & ~WS_CAPTION);
+                SetWindowPos(Handle, IntPtr.Zero, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
+            }
+        }
+
+        protected override void OnActivated(EventArgs e)
+        {
+            base.OnActivated(e);
+            EnsureBorderlessStyle();
+        }
+
+        // 无边框窗口保留 DWM 阴影与 Win11 自动圆角：加 WS_THICKFRAME 样式，
+        // 再用 WM_NCCALCSIZE 吞掉非客户区，使客户区 = 整窗（Win7/8 无圆角仅剩细边，可接受）
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                var cp = base.CreateParams;
+                cp.Style |= 0x00040000; // WS_THICKFRAME
+                return cp;
+            }
+        }
+
         protected override void WndProc(ref Message m)
         {
+            const int WM_NCCALCSIZE = 0x0083;
+            const int WM_NCHITTEST = 0x0084;
+            const int WM_NCACTIVATE = 0x0086;
+            if (m.Msg == WM_NCCALCSIZE && m.WParam != IntPtr.Zero)
+            {
+                m.Result = IntPtr.Zero; // 移除标准边框，标题栏由自绘负责
+                return;
+            }
             if (m.Msg == WM_NCHITTEST)
             {
-                base.WndProc(ref m);
-                if (m.Result.ToInt32() == HT_CAPTION) m.Result = new IntPtr(HT_CLIENT);
+                m.Result = (IntPtr)1; // HT_CLIENT：窗口不可 resize，命中全部交给自绘
+                return;
+            }
+            if (m.Msg == WM_NCACTIVATE)
+            {
+                // 失焦时 DefWindowProc 会让 DWM 重绘系统边框（带标题文字的失焦框盖在自绘
+                // 标题栏上）。窗口全自绘、无真实非客户区，直接吞掉：不调用默认过程，返回 TRUE
+                m.Result = (IntPtr)1;
                 return;
             }
             base.WndProc(ref m);
         }
 
-        private void BuildGrid()
-        {
-            _grid = new DataGridView
-            {
-                Dock = DockStyle.Fill,
-                AllowUserToAddRows = false,
-                AllowUserToDeleteRows = false,
-                AllowUserToResizeRows = false,
-                AllowUserToResizeColumns = false,
-                ReadOnly = true,
-                SelectionMode = DataGridViewSelectionMode.FullRowSelect,
-                MultiSelect = false,
-                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
-                BackgroundColor = Color.White,
-                BorderStyle = BorderStyle.FixedSingle,
-                GridColor = Color.FromArgb(226, 232, 240),
-                CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal,
-                ColumnHeadersHeight = St.SiF(34, _scale),
-                RowTemplate = { Height = St.SiF(32, _scale) },
-                ColumnHeadersDefaultCellStyle = { Font = St.FontsForScale(_scale)[0], BackColor = Color.FromArgb(241, 245, 249), ForeColor = Color.FromArgb(51, 65, 85), Alignment = DataGridViewContentAlignment.MiddleLeft, Padding = new Padding(St.SiF(8, _scale), 0, 0, 0) },
-                DefaultCellStyle = { SelectionBackColor = Color.FromArgb(51, 65, 85), SelectionForeColor = Color.White, ForeColor = Color.FromArgb(51, 65, 85), Padding = new Padding(St.SiF(8, _scale), 0, 0, 0) },
-                RowHeadersVisible = false,
-                EnableHeadersVisualStyles = false
-            };
-            _grid.Columns.Add("colName", "显示名称");
-            _grid.Columns.Add("colType", "接口类型");
-            _grid.Columns.Add("colKey", "API Key");
-            ((DataGridViewColumn)_grid.Columns["colKey"]).FillWeight = 180;
-            _grid.CellFormatting += delegate(object s, DataGridViewCellFormattingEventArgs e)
-            {
-                if (e.ColumnIndex == _grid.Columns["colKey"].Index && e.Value != null)
-                {
-                    string k = e.Value.ToString();
-                    e.Value = k.Length > 8 ? k.Substring(0, 4) + "******" + k.Substring(k.Length - 4) : "****";
-                    e.FormattingApplied = true;
-                }
-            };
-            RefreshGrid();
-        }
-
-        private void RefreshGrid()
-        {
-            _grid.Rows.Clear();
-            foreach (var p in _editList)
-                _grid.Rows.Add(p.Name, p.TypeName, p.Key);
-        }
-
-        private void AddProvider()
-        {
-            using (var dlg = new AddProviderDialog(null, this))
-            {
-                if (dlg.ShowDialog(this) == DialogResult.OK && dlg.Result != null)
-                {
-                    _editList.Add(dlg.Result);
-                    RefreshGrid();
-                }
-            }
-        }
-
-        private void EditSelected()
-        {
-            if (_grid.CurrentRow == null || _grid.CurrentRow.Index >= _editList.Count)
-            {
-                MessageBox.Show(this, "请先选择一个供应商", "编辑", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
-            int idx = _grid.CurrentRow.Index;
-            using (var dlg = new AddProviderDialog(_editList[idx], this))
-            {
-                if (dlg.ShowDialog(this) == DialogResult.OK && dlg.Result != null)
-                {
-                    _editList[idx] = dlg.Result;
-                    RefreshGrid();
-                }
-            }
-        }
-
-        private void DeleteSelected()
-        {
-            if (_grid.CurrentRow != null && _grid.CurrentRow.Index < _editList.Count)
-            {
-                _editList.RemoveAt(_grid.CurrentRow.Index);
-                RefreshGrid();
-            }
-        }
-
-        private void MoveSelected(int delta)
-        {
-            if (_grid.CurrentRow == null || _grid.CurrentRow.Index >= _editList.Count)
-            {
-                MessageBox.Show(this, "请先选择一个供应商", "移动", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
-            int idx = _grid.CurrentRow.Index;
-            int newIdx = idx + delta;
-            if (newIdx < 0 || newIdx >= _editList.Count) return;
-            var item = _editList[idx];
-            _editList.RemoveAt(idx);
-            _editList.Insert(newIdx, item);
-            RefreshGrid();
-            _grid.CurrentCell = _grid.Rows[newIdx].Cells[0];
-        }
-
+        // ============================= 保存 / 测试 =============================
         private void SaveAndClose()
         {
             // 先快照旧配置：保存失败时回滚，防止"未保存的新配置"留在内存里被定时刷新
@@ -3246,13 +4948,13 @@ namespace QuotaWidget
             // _editList；若与 Cfg.Providers 共享同一 List，刷新线程池并行遍历会因列表收缩
             // 抛 ArgumentOutOfRangeException 并终止进程（详见 RefreshData 的 providers[i]）
             _ctx.Cfg.Providers = new List<ProviderConfig>(_editList);
-            _ctx.Cfg.RefreshSec = (int)_numInterval.Value;
-            _ctx.Cfg.OpacityPct = _trkOpacity.Value;
-            _ctx.Cfg.TopMost = _chkTopMost.Checked;
-            _ctx.Cfg.AutoStart = _chkAutoStart.Checked;
-            _ctx.Cfg.Theme = _cmbTheme.SelectedIndex == 1 ? "dark" : "light";
-            _ctx.Cfg.DisplayMode = _cmbMode.SelectedIndex == 1 ? "topbar" : "float";
-            _ctx.Cfg.AppBarScreen = _cmbScreen.SelectedIndex;
+            _ctx.Cfg.RefreshSec = _pendInterval;
+            _ctx.Cfg.OpacityPct = _pendOpacity;
+            _ctx.Cfg.TopMost = _pendTopMost;
+            _ctx.Cfg.AutoStart = _pendAutoStart;
+            _ctx.Cfg.Theme = _pendDark ? "dark" : "light";
+            _ctx.Cfg.DisplayMode = _pendMode == 1 ? "topbar" : "float";
+            _ctx.Cfg.AppBarScreen = _pendScreen;
             // 保存失败（磁盘满/文件被杀软锁定等）不静默关闭窗口：
             // 否则用户以为已保存，重启后 API Key 全部丢失且无任何自救提示
             if (!_ctx.Cfg.Save())
@@ -3266,40 +4968,44 @@ namespace QuotaWidget
                 _ctx.Cfg.Theme = oldTheme;
                 _ctx.Cfg.DisplayMode = oldDisplayMode;
                 _ctx.Cfg.AppBarScreen = oldAppBarScreen;
-                MessageBox.Show(this, "配置保存失败（config.json 写入失败，可能磁盘已满或被其他程序占用）。\n窗口保持打开，请先记录本次填写的 API Key，再重试保存。", "保存失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                StyledMsg.Show(this, "保存失败", "配置保存失败（config.json 写入失败，可能磁盘已满或被其他程序占用）。\n窗口保持打开，请先记录本次填写的 API Key，再重试保存。", P, _scale);
                 return;
             }
             _ctx.ApplyConfig();
             Close();
         }
 
-        private void TestConnection(Button btn)
+        private void TestAll()
         {
+            if (_testing) return;
             if (_editList.Count == 0)
             {
-                MessageBox.Show(this, "请先添加供应商", "测试连接", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                StyledMsg.Show(this, "测试连接", "请先添加供应商", P, _scale);
                 return;
             }
-            btn.Enabled = false; btn.Text = "测试中…";
+            _testing = true;
+            _hover = null;
+            Cursor = Cursors.Default;
+            Invalidate();
             var snapshot = new List<ProviderConfig>(_editList);
             ThreadPool.QueueUserWorkItem(delegate
             {
                 var sb = new StringBuilder();
-                foreach (var p in snapshot)
+                foreach (var pr in snapshot)
                 {
-                    if (string.IsNullOrWhiteSpace(p.Key)) continue;
+                    if (string.IsNullOrWhiteSpace(pr.Key)) continue;
                     try
                     {
                         ProviderStatus st;
-                        if (p.Type == "mx") st = QuotaService.FetchMiniMax(p);
-                        else if (p.Type == "kimi") st = QuotaService.FetchKimi(p);
-                        else if (p.Type == "ds") st = QuotaService.FetchDeepSeek(p);
-                        else st = QuotaService.FetchGlm(p);
-                        sb.AppendLine("【" + p.Name + "】连接成功 ✓  " + st.Pools.Count + " 个额度池");
+                        if (pr.Type == "mx") st = QuotaService.FetchMiniMax(pr);
+                        else if (pr.Type == "kimi") st = QuotaService.FetchKimi(pr);
+                        else if (pr.Type == "ds") st = QuotaService.FetchDeepSeek(pr);
+                        else st = QuotaService.FetchGlm(pr);
+                        sb.AppendLine("【" + pr.Name + "】连接成功 ✓  " + st.Pools.Count + " 个额度池");
                         foreach (var q in st.Pools)
                             sb.AppendLine("   · " + q.Label + "：" + (q.IsMoney ? q.Currency + St.FmtMoney(q.Remaining) : "已用 " + q.Percent + "%"));
                     }
-                    catch (Exception ex) { sb.AppendLine("【" + p.Name + "】失败 ✗  " + ex.Message); }
+                    catch (Exception ex) { sb.AppendLine("【" + pr.Name + "】失败 ✗  " + ex.Message); }
                 }
                 string report = sb.ToString();
                 // 测试耗时可达数分钟，期间窗口可能已被用户关闭（句柄销毁）；无 catch 的线程池
@@ -3309,9 +5015,11 @@ namespace QuotaWidget
                 {
                     BeginInvoke((Action)delegate
                     {
-                        btn.Enabled = true; btn.Text = "测试全部";
+                        _testing = false;
                         if (IsDisposed) return;
-                        MessageBox.Show(this, report, "测试连接", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        LayoutAll(); // 按钮文本宽度随文案变化（测试全部 / 测试中…）
+                        Invalidate();
+                        TestResultDialog.Show(this, report, P, _scale);
                     });
                 }
                 catch { /* 窗口已销毁，放弃回调 */ }
