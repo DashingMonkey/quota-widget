@@ -2403,6 +2403,8 @@ namespace QuotaWidget
         private const int WinWidth = 180;
         // 当前所在屏缩放因子（跨屏拖动时更新，保证各屏物理尺寸一致）
         private float _scale = St.Scale;
+        // 缩放所依据的屏（拖拽中按鼠标所在屏切换，附迟滞；见 UpdateScale）
+        private Screen _scaleScreen;
         private int RowHS { get { return St.SiF(RowH, _scale); } }
         private int WinWidthS { get { return St.SiF(WinWidth, _scale); } }
         private int PadYS { get { return St.SiF(PadY, _scale); } }
@@ -2426,7 +2428,27 @@ namespace QuotaWidget
         {
             try
             {
-                var s = Screen.FromControl(this);
+                Screen s;
+                if (_dragging)
+                {
+                    // 拖拽中按“鼠标所在屏”判定：若按窗口面积多数判定（FromControl），窗口跨在
+                    // 分界线上时切换缩放→Rebuild 改变窗口大小→面积占比翻转→判定翻回旧屏→
+                    // 再重建……无限振荡，表现为两种缩放的窗口在交界处反复闪。
+                    // 另加迟滞：鼠标须离开当前屏边界 16px 才切换，贴着分界线微抖不触发重建
+                    var m = Screen.FromPoint(Cursor.Position);
+                    if (_scaleScreen == null || m.DeviceName == _scaleScreen.DeviceName)
+                    {
+                        s = m;
+                    }
+                    else
+                    {
+                        var tol = _scaleScreen.Bounds;
+                        tol.Inflate(16, 16);
+                        s = tol.Contains(Cursor.Position) ? _scaleScreen : m;
+                    }
+                }
+                else s = Screen.FromControl(this);
+                _scaleScreen = s;
                 float n = St.DpiOf(s) / 96f;
                 if (Math.Abs(n - _scale) > 0.01f)
                 {
@@ -2434,6 +2456,9 @@ namespace QuotaWidget
                     _detail.DpiScale = n;
                     if (!_island) Width = WinWidthS;
                     Rebuild(); // 窗口尺寸（岛宽高 / 卡片高）统一由 Rebuild 按当前排列重算
+                    // 拖动中尺寸变了：把窗口贴回鼠标抓点（沿用设置窗口做法），避免重建后跳位
+                    if (_dragging)
+                        Location = new Point(Cursor.Position.X - _dragOffset.X, Cursor.Position.Y - _dragOffset.Y);
                 }
             }
             catch (Exception ex)
@@ -2487,7 +2512,7 @@ namespace QuotaWidget
             _showTimer.Tick += delegate
             {
                 _showTimer.Stop();
-                if (Bounds.Contains(Cursor.Position)) ShowDetail();
+                if (!_dragging && Bounds.Contains(Cursor.Position)) ShowDetail();
             };
 
             _island = _ctx.Cfg.FloatLayout == "island"; // 排列启动即生效（ApplyFromConfig 仅在切换排列时重置位置）
@@ -2542,7 +2567,15 @@ namespace QuotaWidget
                 {
                     Location = new Point(cfg.X, cfg.Y);
                     // 恢复竖向岛（重启前为左右吸附或竖向固定）
+                    bool dockOuter = false;
                     if (cfg.Vertical && (cfg.DockSide == 1 || cfg.DockSide == 2))
+                    {
+                        // 旧版本可能把左右吸附保存在两屏内侧边：该边仍为外缘才恢复吸附，
+                        // 否则退化为下面的竖向固定形态（不吸附、不收缩）
+                        var dscr = Screen.FromPoint(new Point(cfg.X, cfg.Y));
+                        dockOuter = EdgeIsOuterBoundary(dscr, dscr.WorkingArea, cfg.DockSide, new Point(cfg.X, cfg.Y));
+                    }
+                    if (dockOuter)
                     {
                         _vertical = true;
                         _edgeSide = cfg.DockSide;
@@ -2566,9 +2599,12 @@ namespace QuotaWidget
                     }
                     _vertical = false;
                     _edgeSide = 0;
-                    // 位置贴住顶边视为吸附态（与手动拖到顶边等效）；否则为普通悬浮条不自动隐藏
-                    var wa = Screen.FromControl(this).WorkingArea;
-                    _edgeDocked = Top <= wa.Top + St.SiF(EdgeThreshold, _scale);
+                    // 位置贴住顶边视为吸附态（与手动拖到顶边等效）；否则为普通悬浮条不自动隐藏；
+                    // 上下排列双屏中下屏顶边属内侧边，不按吸附恢复
+                    var tscr = Screen.FromControl(this);
+                    var wa = tscr.WorkingArea;
+                    _edgeDocked = Top <= wa.Top + St.SiF(EdgeThreshold, _scale)
+                        && EdgeIsOuterBoundary(tscr, wa, 0, new Point(Left + Width / 2, Top));
                     if (_edgeDocked) _edgeTargetX = Left;
                     _edgeCollapsed = false;
                     _edgeJustUndocked = false;
@@ -2774,6 +2810,9 @@ namespace QuotaWidget
             if (e.Button != MouseButtons.Left || _ctx.Cfg.LockPosition) return;
             // 停掉展开/收缩动画，否则 timer 会把窗口拉回原位
             if (_animTimer != null) _animTimer.Stop();
+            // 拖拽属于移动意图：停掉悬停唤出计时并收起详情面板，拖拽中不再弹出
+            _showTimer.Stop();
+            if (_detail.Visible) _detail.Hide();
             _dragging = true; _dragOffset = e.Location;
         }
         protected override void OnMouseMove(MouseEventArgs e)
@@ -2791,7 +2830,8 @@ namespace QuotaWidget
             }
             Location = new Point(Left + e.X - _dragOffset.X, Top + e.Y - _dragOffset.Y);
             // 贴边检测：以鼠标(屏幕坐标)相对光标所在屏工作区三边的距离为准（跨屏拖动各自独立判定）
-            var wa = Screen.FromPoint(Cursor.Position).WorkingArea;
+            var scr = Screen.FromPoint(Cursor.Position);
+            var wa = scr.WorkingArea;
             int th = St.SiF(EdgeThreshold, _scale);
             bool nearLeft, nearRight, nearTop;
             if (_vertical)
@@ -2808,6 +2848,10 @@ namespace QuotaWidget
                 nearRight = !nearTop && !nearLeft && Cursor.Position.X >= wa.Right - th;
             }
             int side = nearTop ? 0 : nearLeft ? 1 : nearRight ? 2 : -1;
+            // 多联屏：两屏共享的内侧边不吸附——虚影会在两屏边缘间来回闪；
+            // 且收起后窗口大半在邻屏，Screen.FromControl 判到邻屏会把它吸附到
+            // 邻屏外缘"飘走"。只认探测后仍属于本屏的桌面外缘
+            if (side >= 0 && !EdgeIsOuterBoundary(scr, wa, side, Cursor.Position)) side = -1;
             // 从吸附态拖出后，鼠标须先离开所有边缘阈值一次，才能在新位置重新吸附
             if (_edgeJustUndocked)
             {
@@ -2846,6 +2890,8 @@ namespace QuotaWidget
             {
                 _ctx.Cfg.X = Left; _ctx.Cfg.Y = Top; _ctx.Cfg.DockSide = -1; _ctx.Cfg.Vertical = _vertical; _ctx.Cfg.Save();
             }
+            // 松手后鼠标仍悬停时恢复悬停唤出计时（与纯悬停行为一致，1s 后弹出详情）
+            _showTimer.Start();
         }
         protected override void OnMouseDoubleClick(MouseEventArgs e) { base.OnMouseDoubleClick(e); _ctx.RefreshData(); }
         protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); OnEnterAny(this, e); }
@@ -2881,6 +2927,20 @@ namespace QuotaWidget
         }
 
         // ---- 贴边隐藏逻辑 ----
+        // 工作区某条边是否为桌面外缘：向边外 2px 探测一点，若落到其他屏幕上则该边是
+        // 两屏共享的内侧边（在此吸附窗口会盖到邻屏上、收起后还会被邻屏"抢走"）
+        private static bool EdgeIsOuterBoundary(Screen s, Rectangle wa, int side, Point pt)
+        {
+            try
+            {
+                Point probe = side == 0 ? new Point(pt.X, wa.Top - 2)
+                    : side == 1 ? new Point(wa.Left - 2, pt.Y)
+                    : new Point(wa.Right + 2, pt.Y);
+                return Screen.FromPoint(probe).DeviceName == s.DeviceName;
+            }
+            catch { return true; }   // 探测失败按外缘处理，不影响单屏正常吸附
+        }
+
         // 显示贴边虚影预览（松手将吸附到的展开位置）
         private void ShowGhost(Rectangle wa)
         {
@@ -3457,7 +3517,7 @@ namespace QuotaWidget
             _showTimer.Tick += delegate
             {
                 _showTimer.Stop();
-                if (Bounds.Contains(Cursor.Position)) ShowDetail();
+                if (!_dragging && Bounds.Contains(Cursor.Position)) ShowDetail();
             };
         }
 
@@ -3847,7 +3907,11 @@ namespace QuotaWidget
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
-            if (e.Button == MouseButtons.Left) _dragging = true;
+            if (e.Button != MouseButtons.Left) return;
+            // 拖拽属于移动意图：停掉悬停唤出计时并收起详情面板，拖拽中不再弹出
+            _showTimer.Stop();
+            if (_detail.Visible) _detail.Hide();
+            _dragging = true;
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
@@ -3878,6 +3942,8 @@ namespace QuotaWidget
                 _ctx.Cfg.Save();
             }
             _ghostScreen = -1;
+            // 松手后鼠标仍悬停时恢复悬停唤出计时
+            _showTimer.Start();
         }
 
         protected override void OnMouseEnter(EventArgs e)
