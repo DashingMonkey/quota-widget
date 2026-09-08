@@ -22,7 +22,14 @@ namespace QuotaWidget
     // ============================= 应用信息 =============================
     internal static class AppInfo
     {
-        public const string Version = "1.1.7";
+        public const string Version = "1.1.8";
+
+        // 更新检查双源：Gitee 主源（国内可达性最好、海外也能访问），GitHub 备源，两边同 tag 发版。
+        // Gitee API v5 仿 GitHub API 设计，核心字段（tag_name 等）两边一致，解析代码一套通吃
+        public const string GiteeApi = "https://gitee.com/api/v5/repos/dashingmonkey/quota-widget/releases/latest";
+        public const string GiteePage = "https://gitee.com/dashingmonkey/quota-widget/releases/latest";
+        public const string GitHubApi = "https://api.github.com/repos/DashingMonkey/quota-widget/releases/latest";
+        public const string GitHubPage = "https://github.com/DashingMonkey/quota-widget/releases/latest";
     }
 
     // ============================= 崩溃日志 =============================
@@ -59,23 +66,14 @@ namespace QuotaWidget
             catch { }
         }
 
-        // 优先 exe 同目录 error.log（与 config.json 约定一致，用户最容易找到）；
-        // exe 位于不可写目录（如 Program Files）时回退 %LOCALAPPDATA%\QuotaWidget\
+        // 日志与 config.json 同放 %LOCALAPPDATA%\QuotaWidget\（见 Config.DataDir）：
+        // 不再写 exe 同目录，避免随仓库/便携目录被误删或在多个 exe 副本旁各留一份
         private static string ResolvePath()
         {
             try
             {
-                string local = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "error.log");
-                try
-                {
-                    // 用打开方式探测可写性：AppendAllText 到只读目录会抛 UnauthorizedAccessException
-                    using (File.Open(local, FileMode.Append, FileAccess.Write, FileShare.Read)) { }
-                    return local;
-                }
-                catch { }
-                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "QuotaWidget");
-                Directory.CreateDirectory(dir);
-                return Path.Combine(dir, "error.log");
+                Directory.CreateDirectory(Config.DataDir);
+                return Path.Combine(Config.DataDir, "error.log");
             }
             catch { return null; }
         }
@@ -242,13 +240,23 @@ namespace QuotaWidget
             DisplayMode = "float"; AppBarScreen = 0; FloatLayout = "island";
         }
 
+        // 配置与日志统一放 %LOCALAPPDATA%\QuotaWidget\。exe 常随源码仓库或便携目录放置，
+        // 同目录的 config.json 极易被 git clean -fdx、删库重建等连带误删；而 DPAPI 密文
+        // 绑定本机当前用户，丢文件等于丢全部 API Key。AppData 是 Windows 用户数据的标准位置，
+        // 且与 DPAPI 的"本机本用户"语义一致（Local 而非 Roaming，不参与漫游同步）
+        public static string DataDir
+        {
+            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "QuotaWidget"); }
+        }
+
         public static string FilePath
         {
-            get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json"); }
+            get { return Path.Combine(DataDir, "config.json"); }
         }
 
         public static Config Load()
         {
+            MigrateFromExeDir();
             Config cfg = new Config();
             try
             {
@@ -298,6 +306,25 @@ namespace QuotaWidget
             return cfg;
         }
 
+        // 一次性迁移：旧版把 config.json 放 exe 同目录，首启发现旧文件且新位置尚无配置时搬走。
+        // 同机同用户移动 DPAPI 密文原样可解，四个 Key 无感迁移；复制成功后才删旧文件，
+        // 任一步失败保留旧文件下次启动重试，绝不出现两边都没有的情况
+        private static void MigrateFromExeDir()
+        {
+            try
+            {
+                string oldPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
+                if (!File.Exists(oldPath) || File.Exists(FilePath)) return;
+                Directory.CreateDirectory(DataDir);
+                File.Copy(oldPath, FilePath, true);
+                if (!File.Exists(FilePath)) return;
+                File.Delete(oldPath);
+                // 旧版在 exe 同目录留下的损坏备份可能残留明文 key，一并清掉
+                try { if (File.Exists(oldPath + ".bak")) File.Delete(oldPath + ".bak"); } catch { }
+            }
+            catch { }
+        }
+
         private bool HasLegacyKeys()
         {
             return !string.IsNullOrWhiteSpace(GlmKey) || !string.IsNullOrWhiteSpace(MxKey);
@@ -321,6 +348,7 @@ namespace QuotaWidget
                 var ser = new JavaScriptSerializer();
                 // 原子写：先写临时文件再替换，避免写入中途断电/崩溃留下截断的损坏文件，
                 // 否则下次启动静默回退空配置，一次保存就会让全部 API Key 永久丢失
+                Directory.CreateDirectory(DataDir); // 首次保存时 AppData 目录可能尚不存在
                 var tmp = FilePath + ".tmp";
                 File.WriteAllText(tmp, ser.Serialize(this), Encoding.UTF8);
                 if (File.Exists(FilePath)) File.Replace(tmp, FilePath, null);
@@ -1284,6 +1312,112 @@ namespace QuotaWidget
             }
             throw new Exception("凭证文件缺少 " + section + "." + field + "：" + path);
         }
+
+        // ============================= 更新检查 =============================
+        // 检查结果：远端版本号（已去 v 前缀）、是否比本地新、实际应答源的发布页地址
+        internal class UpdateInfo
+        {
+            public string Tag = "";
+            public bool Newer;
+            public string PageUrl = "";
+        }
+
+        // 同时问 Gitee 与 GitHub：各 15s 超时并行跑，谁有结果算谁的；都有结果以 Gitee 为准。
+        // 单边失败静默（另一边成功时不暴露失败细节），两边都失败抛主源的错误。
+        // 内部再排线程池并行两路请求后阻塞汇总，调用方需在后台线程执行（勿占 UI 线程）
+        internal static UpdateInfo CheckUpdate()
+        {
+            // GitHub 强制 TLS1.2+，而 ServicePointManager 默认值在部分机器上不含 1.2（握手直接
+            // 失败）。Program.Main 已全局设置过，这里幂等补设：不依赖调用方初始化顺序
+            try
+            {
+                if ((ServicePointManager.SecurityProtocol & SecurityProtocolType.Tls12) == 0)
+                    ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+            }
+            catch { }
+            var answers = new UpdateInfo[2];
+            var errors = new string[2];
+            int pending = 2;
+            using (var done = new ManualResetEvent(false))
+            {
+                for (int i = 0; i < 2; i++)
+                {
+                    int idx = i;
+                    ThreadPool.QueueUserWorkItem(delegate
+                    {
+                        try
+                        {
+                            answers[idx] = CheckUpdateFrom(
+                                idx == 0 ? AppInfo.GiteeApi : AppInfo.GitHubApi,
+                                idx == 0 ? AppInfo.GiteePage : AppInfo.GitHubPage);
+                        }
+                        catch (Exception ex) { errors[idx] = ex.Message; }
+                        if (Interlocked.Decrement(ref pending) == 0) done.Set();
+                    });
+                }
+                done.WaitOne();
+            }
+            if (answers[0] != null) return answers[0];
+            if (answers[1] != null) return answers[1];
+            throw new Exception(errors[0] != null ? errors[0] : (errors[1] ?? "网络请求失败"));
+        }
+
+        // 单源检查：请求 releases/latest 并解析 tag_name。404 / 网络失败 / 解析失败均以
+        // 异常抛出，由 CheckUpdate 视为该源失败
+        private static UpdateInfo CheckUpdateFrom(string api, string pageUrl)
+        {
+            string body;
+            try { body = HttpGet(api, null); }
+            catch (HttpException he) { throw new Exception(FriendlyUpdateError(he)); }
+
+            Dictionary<string, object> root;
+            try { root = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(body); }
+            catch { root = null; }
+            if (root == null) throw new Exception("接口响应解析失败");
+
+            string tag = J.S(root, "tag_name").Trim();
+            if (tag.Length > 0 && (tag[0] == 'v' || tag[0] == 'V')) tag = tag.Substring(1);
+            int[] remote = ParseVer(tag);
+            if (remote == null) throw new Exception("远端版本号无法解析：" + tag);
+
+            int[] local = ParseVer(AppInfo.Version);
+            return new UpdateInfo { Tag = tag, Newer = local != null && CompareVer(remote, local) > 0, PageUrl = pageUrl };
+        }
+
+        // 更新检查场景的专属错误翻译：限流（401/403 + rate limit，两平台匿名配额均为 60 次/时）
+        // 走 DescribeHttpError 会得到「登录凭证失效」的误导文案；404 在此场景是「没发过版本」
+        private static string FriendlyUpdateError(HttpException he)
+        {
+            if ((he.StatusCode == 401 || he.StatusCode == 403) && he.Message.ToLowerInvariant().Contains("rate limit"))
+                return "请求过于频繁，请稍后再试";
+            if (he.StatusCode == 404) return "仓库尚未发布任何版本";
+            return he.Message;
+        }
+
+        // "1.2.10" → {1,2,10}；任何段非数字、为空或超 4 段返回 null（解析失败）
+        private static int[] ParseVer(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return null;
+            string[] parts = s.Trim().Split('.');
+            if (parts.Length > 4) return null;
+            var v = new int[parts.Length];
+            for (int i = 0; i < parts.Length; i++)
+                if (!int.TryParse(parts[i], out v[i])) return null;
+            return v;
+        }
+
+        // 逐段数值比较（长度不齐补 0）。版本号必须数值比较：字符串序会把 "1.1.10" 判成小于 "1.1.9"
+        private static int CompareVer(int[] a, int[] b)
+        {
+            int n = Math.Max(a.Length, b.Length);
+            for (int i = 0; i < n; i++)
+            {
+                int x = i < a.Length ? a[i] : 0;
+                int y = i < b.Length ? b[i] : 0;
+                if (x != y) return x > y ? 1 : -1;
+            }
+            return 0;
+        }
     }
 
     // ============================= 样式 =============================
@@ -1314,7 +1448,7 @@ namespace QuotaWidget
             if (!_fontCache.TryGetValue(dpi, out f))
             {
                 f = new Font[4];
-                f[0] = new Font("Microsoft YaHei UI", 9.5f * dpi / 72f, FontStyle.Bold, GraphicsUnit.Pixel);
+                f[0] = new Font("Microsoft YaHei UI", 9f * dpi / 72f, FontStyle.Bold, GraphicsUnit.Pixel);
                 f[1] = new Font("Microsoft YaHei UI", 9f * dpi / 72f, FontStyle.Regular, GraphicsUnit.Pixel);
                 f[2] = new Font("Microsoft YaHei UI", 8f * dpi / 72f, FontStyle.Regular, GraphicsUnit.Pixel);
                 f[3] = new Font("Microsoft YaHei UI", 11f * dpi / 72f, FontStyle.Bold, GraphicsUnit.Pixel);
@@ -1432,8 +1566,9 @@ namespace QuotaWidget
             BrandIcons.Draw(g, type, dark, (int)Math.Round(cx - isz / 2f), (int)Math.Round(cy - isz / 2f), isz);
         }
 
-        // 绘制单个徽标（centerY 为垂直中心线，textY 为文本行顶），返回徽标内容宽度；调用方自行叠加徽标间 gap
-        public static float DrawBadge(Graphics g, BadgeInfo bi, float x, float centerY, float textY, float s, Font f, int ringD, float penW, bool dark)
+        // 绘制单个徽标（centerY 为垂直中心线，textY 为文本行顶），返回徽标内容宽度；调用方自行叠加徽标间 gap。
+        // fName 名称粗体 / fVal 数值常规，与卡片行同款层级
+        public static float DrawBadge(Graphics g, BadgeInfo bi, float x, float centerY, float textY, float s, Font fName, Font fVal, int ringD, float penW, bool dark)
         {
             if (bi.IconType != null)
             {
@@ -1443,13 +1578,13 @@ namespace QuotaWidget
                     int isz = SiF(18, s);
                     BrandIcons.Draw(g, bi.IconType, dark, (int)Math.Round(x), (int)Math.Round(centerY - isz / 2f), isz);
                     using (var b = new SolidBrush(bi.DotColor))
-                        g.DrawString(bi.Value, f, b, x + isz + SiF(8, s), textY);
+                        g.DrawString(bi.Value, fVal, b, x + isz + SiF(8, s), textY);
                     return BadgeWidth(bi, s, ringD);
                 }
                 float outer = SiF(ringD, s);
                 DrawRingIcon(g, bi.IconType, bi.RingPct, bi.DotColor, x + outer / 2, centerY, s, ringD, penW, dark);
                 using (var b = new SolidBrush(bi.DotColor))
-                    g.DrawString(bi.Value, f, b, x + outer + SiF(8, s), textY);
+                    g.DrawString(bi.Value, fVal, b, x + outer + SiF(8, s), textY);
                 return BadgeWidth(bi, s, ringD);
             }
             float dot = 8f * s;
@@ -1457,10 +1592,10 @@ namespace QuotaWidget
                 g.FillEllipse(b, x, centerY - dot / 2, dot, dot);
             float tx = x + 8f * s + 6f * s;
             using (var b = new SolidBrush(Text))
-                g.DrawString(bi.Name, f, b, tx, textY);
+                g.DrawString(bi.Name, fName, b, tx, textY);
             tx += bi.NameW + 10f * s;
             using (var b = new SolidBrush(bi.DotColor))
-                g.DrawString(bi.Value, f, b, tx, textY);
+                g.DrawString(bi.Value, fVal, b, tx, textY);
             return BadgeWidth(bi, s, ringD);
         }
 
@@ -1490,7 +1625,7 @@ namespace QuotaWidget
                     bi.IconType = st.Type;
                     bi.RingPct = err ? 0 : remain;
                 }
-                bi.NameW = g.MeasureString(bi.Name, fs[1]).Width;
+                bi.NameW = g.MeasureString(bi.Name, fs[0]).Width;   // 名称粗体，与绘制同源
                 bi.ValW = g.MeasureString(bi.Value, fs[1]).Width;
                 badges.Add(bi);
                 totalW += BadgeWidth(bi, s, ringD) + gap;
@@ -1604,12 +1739,12 @@ namespace QuotaWidget
             }
             else if (pool != null)
             {
-                // 金额模式（DeepSeek 余额）显示金额，否则显示剩余百分比
+                // 金额模式（DeepSeek 余额）显示金额，否则显示剩余百分比；与名称同字号常规体，基线天然对齐
                 string rightTxt = pool.IsMoney ? pool.Currency + FmtMoney(pool.Remaining) : (remain + "%");
                 using (var b = new SolidBrush(dotColor))
                 {
-                    var psz = g.MeasureString(rightTxt, fs[0]);
-                    g.DrawString(rightTxt, fs[0], b, width - psz.Width - SiF(12, s), y + SiF(3, s));
+                    var psz = g.MeasureString(rightTxt, fs[1]);
+                    g.DrawString(rightTxt, fs[1], b, width - psz.Width - SiF(12, s), y + SiF(3, s));
                 }
             }
         }
@@ -2397,16 +2532,14 @@ namespace QuotaWidget
         private System.Windows.Forms.Timer _animTimer;
         private Point _animTarget;
 
-        // 行高与窗口宽度（DIP 基准值，运行时按所在屏 DPI 缩放）；卡片行为紧凑单行样式
+        // 行高（DIP 基准值，运行时按所在屏 DPI 缩放）；卡片行为紧凑单行样式，宽度按内容自适应（见 CardWidth）
         private const int RowH = 26;
         private const int PadY = 6;
-        private const int WinWidth = 180;
         // 当前所在屏缩放因子（跨屏拖动时更新，保证各屏物理尺寸一致）
         private float _scale = St.Scale;
         // 缩放所依据的屏（拖拽中按鼠标所在屏切换，附迟滞；见 UpdateScale）
         private Screen _scaleScreen;
         private int RowHS { get { return St.SiF(RowH, _scale); } }
-        private int WinWidthS { get { return St.SiF(WinWidth, _scale); } }
         private int PadYS { get { return St.SiF(PadY, _scale); } }
 
         // ---- 条形灵动岛排列 ----
@@ -2454,8 +2587,8 @@ namespace QuotaWidget
                 {
                     _scale = n;
                     _detail.DpiScale = n;
-                    if (!_island) Width = WinWidthS;
-                    Rebuild(); // 窗口尺寸（岛宽高 / 卡片高）统一由 Rebuild 按当前排列重算
+                    if (!_island) Width = CardWidth();
+                    Rebuild(); // 窗口尺寸（岛宽高 / 卡片宽高）统一由 Rebuild 按当前排列重算
                     // 拖动中尺寸变了：把窗口贴回鼠标抓点（沿用设置窗口做法），避免重建后跳位
                     if (_dragging)
                         Location = new Point(Cursor.Position.X - _dragOffset.X, Cursor.Position.Y - _dragOffset.Y);
@@ -2474,7 +2607,7 @@ namespace QuotaWidget
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.Manual;
-            Width = WinWidthS;
+            Width = CardWidth();
 
             _detail = new DetailForm(ctx);
             _detail.DpiScale = St.Scale;
@@ -2527,7 +2660,7 @@ namespace QuotaWidget
             _island = cfg.FloatLayout == "island";
             bool layoutChanged = _island != wasIsland;
             UpdateScale();
-            Width = _island ? IslandWidth() : WinWidthS;
+            Width = _island ? IslandWidth() : CardWidth();
             TopMost = cfg.TopMost;
             _detail.TopMost = cfg.TopMost;
 
@@ -2697,10 +2830,45 @@ namespace QuotaWidget
             }
             else
             {
+                Width = CardWidth();   // 数据刷新后数字变化 → 重算卡片宽（左缘不动，右侧伸缩）
                 Height = PadYS * 2 + _ctx.Providers.Count * RowHS;
             }
             UpdateLayered();
             if (_detail.Visible) ShowDetail();
+        }
+
+        // 卡片宽度 = 各行最大值：左列（图标或名称）+ 最小间隙 16 + 右列（失败/金额/百分比）+ 右边距 12，
+        // 与 DrawRow 同源测量；向上取整到 8 DIP 台阶，百分比/金额数字变化不引起宽度抖动
+        private int CardWidth()
+        {
+            float s = _scale;
+            var fs = St.FontsForScale(s);
+            bool dark = St.Theme == 1;
+            float maxRow = 0;
+            using (var g = CreateGraphics())
+            {
+                foreach (var st in _ctx.Providers)
+                {
+                    bool err = st.Error != null;
+                    var pool = st.Primary5h;
+                    float lw = (!st.ShowName && BrandIcons.Get(st.Type, dark) != null)
+                        ? St.SiF(12 + 16, s)
+                        : g.MeasureString(st.Name, fs[0]).Width + St.SiF(12, s);
+                    float rw = 0;
+                    if (err) rw = g.MeasureString("失败", fs[2]).Width;
+                    else if (pool != null)
+                    {
+                        string t = pool.IsMoney ? pool.Currency + St.FmtMoney(pool.Remaining)
+                            : ((100 - Math.Max(0, Math.Min(100, pool.Percent))) + "%");
+                        rw = g.MeasureString(t, fs[1]).Width;
+                    }
+                    float row = lw + St.SiF(16, s) + rw + St.SiF(12, s);
+                    if (row > maxRow) maxRow = row;
+                }
+            }
+            int step = Math.Max(1, St.SiF(8, s));
+            int w = ((int)Math.Ceiling(maxRow) + step - 1) / step * step;
+            return Math.Max(w, St.SiF(80, s));   // 下限：空数据/极短内容时保持可点可拖
         }
 
         // 灵动岛宽度 = 徽标内容宽 + 左右内边距（与绘制同源测量，见 St.BuildBadges）
@@ -2749,7 +2917,7 @@ namespace QuotaWidget
                 float textY = (Height - textH) / 2;
                 for (int i = 0; i < badges.Count; i++)
                 {
-                    x += St.DrawBadge(g, badges[i], x, Height / 2f, textY, s, fs[1], 38, 4f, dark) + gap;
+                    x += St.DrawBadge(g, badges[i], x, Height / 2f, textY, s, fs[0], fs[1], 38, 4f, dark) + gap;
                 }
                 return;
             }
@@ -3893,7 +4061,7 @@ namespace QuotaWidget
 
             for (int i = 0; i < badges.Count; i++)
             {
-                x += St.DrawBadge(g, badges[i], x, Height / 2f, textY, s, fs[1], 0, 0, St.Theme == 1) + gap;
+                x += St.DrawBadge(g, badges[i], x, Height / 2f, textY, s, fs[0], fs[1], 0, 0, St.Theme == 1) + gap;
             }
         }
 
@@ -4063,6 +4231,235 @@ namespace QuotaWidget
                 g.DrawArc(pen, r.X + 5f * k, r.Y + 5f * k, 22f * k, 22f * k, -90, 270);
             using (var brush = new SolidBrush(St.MxAccent))
                 g.FillEllipse(brush, r.X + 13f * k, r.Y + 13f * k, 6f * k, 6f * k);
+        }
+
+        // ===== SVG 矢量图标：codicon（VS Code，MIT）/ lucide（ISC）官方 path 数据内嵌 =====
+        // 网页参考页（icons-reference.html）里选中的图标即这套几何，运行时解析 SVG path
+        // 为 GraphicsPath 后按官方原路径填充/描边，渲染结果与网页逐点一致，不再手绘近似。
+
+        private const string DServer =
+            "M12 11.5C12 11.5989 11.9707 11.6956 11.9157 11.7778C11.8608 11.86 11.7827 11.9241 11.6913 11.9619C11.6 11.9998 11.4994 12.0097 11.4025 11.9904C11.3055 11.9711 11.2164 11.9235 11.1464 11.8536C11.0765 11.7836 11.0289 11.6945 11.0096 11.5975C10.9903 11.5006 11.0002 11.4 11.0381 11.3087C11.0759 11.2173 11.14 11.1392 11.2222 11.0843C11.3044 11.0293 11.4011 11 11.5 11C11.6326 11 11.7598 11.0527 11.8536 11.1464C11.9473 11.2402 12 11.3674 12 11.5ZM11.5 8C11.5989 8 11.6956 7.97068 11.7778 7.91573C11.86 7.86079 11.9241 7.7827 11.9619 7.69134C11.9998 7.59998 12.0097 7.49945 11.9904 7.40245C11.9711 7.30546 11.9235 7.21637 11.8536 7.14645C11.7836 7.07652 11.6945 7.0289 11.5975 7.00961C11.5006 6.99031 11.4 7.00022 11.3087 7.03806C11.2173 7.0759 11.1392 7.13999 11.0843 7.22221C11.0293 7.30444 11 7.40111 11 7.5C11 7.63261 11.0527 7.75979 11.1464 7.85355C11.2402 7.94732 11.3674 8 11.5 8ZM14 4.5C13.999 4.87026 13.86 5.22685 13.61 5.5C13.86 5.77315 13.999 6.12974 14 6.5V8.5C13.999 8.87026 13.86 9.22685 13.61 9.5C13.86 9.77315 13.999 10.1297 14 10.5V12.5C14 12.8978 13.842 13.2794 13.5607 13.5607C13.2794 13.842 12.8978 14 12.5 14H3.5C3.10218 14 2.72064 13.842 2.43934 13.5607C2.15804 13.2794 2 12.8978 2 12.5V10.5C2.00097 10.1297 2.14003 9.77315 2.39 9.5C2.14003 9.22685 2.00097 8.87026 2 8.5V6.5C2.00097 6.12974 2.14003 5.77315 2.39 5.5C2.14003 5.22685 2.00097 4.87026 2 4.5V2.5C2 2.10218 2.15804 1.72064 2.43934 1.43934C2.72064 1.15804 3.10218 1 3.5 1H12.5C12.8978 1 13.2794 1.15804 13.5607 1.43934C13.842 1.72064 14 2.10218 14 2.5V4.5ZM3 4.5C3 4.63261 3.05268 4.75979 3.14645 4.85355C3.24021 4.94732 3.36739 5 3.5 5H12.5C12.6326 5 12.7598 4.94732 12.8536 4.85355C12.9473 4.75979 13 4.63261 13 4.5V2.5C13 2.36739 12.9473 2.24021 12.8536 2.14645C12.7598 2.05268 12.6326 2 12.5 2H3.5C3.36739 2 3.24021 2.05268 3.14645 2.14645C3.05268 2.24021 3 2.36739 3 2.5V4.5ZM12.5 6H3.5C3.36739 6 3.24021 6.05268 3.14645 6.14645C3.05268 6.24021 3 6.36739 3 6.5V8.5C3 8.63261 3.05268 8.75979 3.14645 8.85355C3.24021 8.94732 3.36739 9 3.5 9H12.5C12.6326 9 12.7598 8.94732 12.8536 8.85355C12.9473 8.75979 13 8.63261 13 8.5V6.5C13 6.36739 12.9473 6.24021 12.8536 6.14645C12.7598 6.05268 12.6326 6 12.5 6ZM13 10.5C13 10.3674 12.9473 10.2402 12.8536 10.1464C12.7598 10.0527 12.6326 10 12.5 10H3.5C3.36739 10 3.24021 10.0527 3.14645 10.1464C3.05268 10.2402 3 10.3674 3 10.5V12.5C3 12.6326 3.05268 12.7598 3.14645 12.8536C3.24021 12.9473 3.36739 13 3.5 13H12.5C12.6326 13 12.7598 12.9473 12.8536 12.8536C12.9473 12.7598 13 12.6326 13 12.5V10.5ZM11.5 4C11.5989 4 11.6956 3.97068 11.7778 3.91573C11.86 3.86079 11.9241 3.7827 11.9619 3.69134C11.9998 3.59998 12.0097 3.49945 11.9904 3.40245C11.9711 3.30546 11.9235 3.21637 11.8536 3.14645C11.7836 3.07652 11.6945 3.0289 11.5975 3.00961C11.5006 2.99031 11.4 3.00022 11.3087 3.03806C11.2173 3.0759 11.1392 3.13999 11.0843 3.22221C11.0293 3.30444 11 3.40111 11 3.5C11 3.63261 11.0527 3.75979 11.1464 3.85355C11.2402 3.94732 11.3674 4 11.5 4Z";
+        private const string DGear =
+            "M12 9C10.3425 9 9.00002 10.3425 9.00002 12C9.00002 13.6575 10.3425 15 12 15C13.6575 15 15 13.6575 15 12C15 10.3425 13.6575 9 12 9ZM12 13.5C11.172 13.5 10.5 12.828 10.5 12C10.5 11.172 11.172 10.5 12 10.5C12.828 10.5 13.5 11.172 13.5 12C13.5 12.828 12.828 13.5 12 13.5ZM21.8475 14.5725L19.9185 12.942C19.8675 12.8985 19.8195 12.8505 19.776 12.7995C19.332 12.279 19.3965 11.5005 19.9185 11.058L21.8475 9.4275C22.0395 9.2655 22.113 9.0045 22.0365 8.766C21.579 7.3545 20.823 6.06 19.8285 4.962C19.7085 4.83 19.5405 4.758 19.368 4.758C19.2975 4.758 19.227 4.77 19.1595 4.794L16.779 5.6415C16.716 5.664 16.65 5.682 16.584 5.694C16.509 5.7075 16.434 5.715 16.3605 5.715C15.7725 5.715 15.2505 5.298 15.141 4.701L14.6865 2.223C14.6415 1.977 14.451 1.782 14.205 1.7295C13.485 1.5765 12.7485 1.5 12.0015 1.5C11.2545 1.5 10.5165 1.578 9.79652 1.7295C9.55052 1.782 9.36002 1.977 9.31502 2.223L8.86202 4.701C8.85002 4.767 8.83202 4.8315 8.80952 4.8945C8.62802 5.4 8.15102 5.715 7.64102 5.715C7.50302 5.715 7.36202 5.691 7.22402 5.643L4.84352 4.7955C4.77602 4.7715 4.70402 4.7595 4.63502 4.7595C4.46252 4.7595 4.29452 4.8315 4.17452 4.9635C3.17852 6.0615 2.42402 7.356 1.96502 8.7675C1.88702 9.006 1.96202 9.267 2.15402 9.429L4.08302 11.0595C4.13402 11.103 4.18202 11.151 4.22552 11.202C4.66952 11.7225 4.60502 12.501 4.08302 12.9435L2.15402 14.574C1.96202 14.736 1.88852 14.997 1.96502 15.2355C2.42252 16.647 3.17852 17.9415 4.17452 19.0395C4.29452 19.1715 4.46252 19.2435 4.63502 19.2435C4.70552 19.2435 4.77602 19.2315 4.84352 19.2075L7.22402 18.36C7.28702 18.3375 7.35302 18.3195 7.41902 18.307C7.49402 18.294 7.56902 18.288 7.64252 18.288C8.23052 18.288 8.75252 18.705 8.86202 19.302L9.31502 21.78C9.36002 22.026 9.55052 22.221 9.79652 22.2735C10.5165 22.4265 11.2545 22.503 12.0015 22.503C12.7485 22.503 13.4865 22.425 14.205 22.2735C14.451 22.221 14.6415 22.026 14.6865 21.78L15.141 19.302C15.153 19.236 15.171 19.1715 15.1935 19.1085C15.375 18.603 15.852 18.288 16.362 18.288C16.5 18.288 16.641 18.312 16.779 18.36L19.158 19.2075C19.227 19.2315 19.2975 19.2435 19.3665 19.2435C19.539 19.2435 19.707 19.1715 19.827 19.0395C20.823 17.9415 21.5775 16.647 22.035 15.2355C22.113 14.997 22.038 14.736 21.846 14.574L21.8475 14.5725ZM19.092 17.589L17.2815 16.944C16.9845 16.839 16.6755 16.785 16.362 16.785C15.2085 16.785 14.1705 17.514 13.782 18.5985C13.731 18.738 13.6935 18.882 13.6665 19.029L13.3215 20.9055C12.8865 20.9685 12.444 21 12.0015 21C11.559 21 11.1165 20.9685 10.68 20.904L10.3365 19.0275C10.098 17.727 8.96552 16.7835 7.64252 16.7835C7.48052 16.7835 7.31552 16.7985 7.14902 16.8285C7.00352 16.8555 6.86102 16.893 6.72002 16.9425L4.90952 17.5875C4.35752 16.896 3.91652 16.1385 3.59102 15.321L5.05202 14.0865C5.61152 13.614 5.95202 12.951 6.01202 12.222C6.07202 11.493 5.84252 10.785 5.36702 10.227C5.27102 10.1145 5.16452 10.008 5.05202 9.912L3.59102 8.6775C3.91652 7.86 4.35752 7.101 4.90952 6.411L6.72002 7.056C7.01702 7.161 7.32602 7.215 7.64102 7.215C8.79452 7.215 9.83252 6.486 10.221 5.4015C10.272 5.2605 10.3095 5.1165 10.3365 4.971L10.68 3.0945C11.1165 3.0315 11.559 2.9985 12.0015 2.9985C12.444 2.9985 12.8865 3.03 13.3215 3.093L13.665 4.9695C13.9035 6.27 15.036 7.2135 16.359 7.2135C16.521 7.2135 16.686 7.1985 16.851 7.1685C16.9965 7.1415 17.1405 7.104 17.2815 7.0545L19.092 6.4095C19.644 7.0995 20.085 7.8585 20.4105 8.676L18.951 9.9105C18.3915 10.383 18.0495 11.046 17.991 11.775C17.931 12.504 18.1605 13.2135 18.636 13.77C18.7335 13.884 18.8385 13.989 18.9525 14.085L20.4135 15.3195C20.088 16.137 19.647 16.896 19.095 17.586L19.092 17.589Z";
+        private const string DInfo =
+            "M8.49902 7.49998C8.49902 7.22384 8.27517 6.99998 7.99902 6.99998C7.72288 6.99998 7.49902 7.22384 7.49902 7.49998V10.5C7.49902 10.7761 7.72288 11 7.99902 11C8.27517 11 8.49902 10.7761 8.49902 10.5V7.49998ZM8.74807 5.50001C8.74807 5.91369 8.41271 6.24905 7.99903 6.24905C7.58535 6.24905 7.25 5.91369 7.25 5.50001C7.25 5.08633 7.58535 4.75098 7.99903 4.75098C8.41271 4.75098 8.74807 5.08633 8.74807 5.50001ZM8 1C4.13401 1 1 4.13401 1 8C1 11.866 4.13401 15 8 15C11.866 15 15 11.866 15 8C15 4.13401 11.866 1 8 1ZM2 8C2 4.68629 4.68629 2 8 2C11.3137 2 14 4.68629 14 8C14 11.3137 11.3137 14 8 14C4.68629 14 2 11.3137 2 8Z";
+        private const string DColorMode =
+            "M8 1.00195C6.61553 1.00195 5.26216 1.4125 4.11101 2.18167C2.95987 2.95084 2.06266 4.04409 1.53285 5.32317C1.00303 6.60225 0.86441 8.00972 1.13451 9.36759C1.4046 10.7255 2.07129 11.9727 3.05026 12.9517C4.02922 13.9307 5.27651 14.5974 6.63437 14.8675C7.99224 15.1375 9.3997 14.9989 10.6788 14.4691C11.9579 13.9393 13.0511 13.0421 13.8203 11.8909C14.5895 10.7398 15 9.38642 15 8.00195C15 6.14544 14.2625 4.36496 12.9498 3.05221C11.637 1.73945 9.85652 1.00195 8 1.00195ZM8 14.002V2.00195C9.5913 2.00195 11.1174 2.63409 12.2426 3.75931C13.3679 4.88453 14 6.41065 14 8.00195C14 9.59325 13.3679 11.1194 12.2426 12.2446C11.1174 13.3698 9.5913 14.002 8 14.002Z";
+        private const string DSun =
+            "M8 12a4 4 0 1 0 8 0a4 4 0 1 0 -8 0ZM12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41";
+        private const string DMoon =
+            "M20.985 12.486a9 9 0 1 1-9.473-9.472c.405-.022.617.46.402.803a6 6 0 0 0 8.268 8.268c.344-.215.825-.004.803.401";
+
+        private static GraphicsPath _pServer, _pGear, _pInfo, _pColor, _pSun, _pMoon;
+        private static GraphicsPath P(ref GraphicsPath cache, string d)
+        {
+            if (cache == null) cache = ParseSvgPath(d);
+            return cache;
+        }
+
+        // SVG path → GraphicsPath（M/L/H/V/C/A/Z 及相对命令；圆弧按 ≤90° 分段转三阶贝塞尔）
+        private static GraphicsPath ParseSvgPath(string d)
+        {
+            var path = new GraphicsPath();
+            float x = 0, y = 0, sx = 0, sy = 0;
+            int i = 0;
+            char cmd = ' ';
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            while (i < d.Length)
+            {
+                if (!char.IsLetter(d[i])) { i++; continue; }
+                cmd = d[i]; i++;
+                var n = new List<float>();
+                while (i < d.Length)
+                {
+                    while (i < d.Length && (char.IsWhiteSpace(d[i]) || d[i] == ',')) i++;
+                    if (i >= d.Length || (char.IsLetter(d[i]))) break;
+                    int start = i;
+                    if (d[i] == '-' || d[i] == '+') i++;
+                    bool dot = false;
+                    while (i < d.Length)
+                    {
+                        char c = d[i];
+                        if (char.IsDigit(c)) i++;
+                        else if (c == '.' && !dot) { dot = true; i++; }
+                        else break;
+                    }
+                    n.Add(float.Parse(d.Substring(start, i - start), inv));
+                }
+                bool rel = char.IsLower(cmd);
+                char C = char.ToUpper(cmd);
+                int j = 0;
+                while (j < n.Count)
+                {
+                    int take = (C == 'C' || C == 'A') ? 6 + (C == 'A' ? 1 : 0) : (C == 'M' || C == 'L') ? 2 : (C == 'H' || C == 'V') ? 1 : 0;
+                    if (j + take > n.Count) break;
+                    switch (C)
+                    {
+                        case 'M':
+                            {
+                                float nx = n[j] + (rel ? x : 0), ny = n[j + 1] + (rel ? y : 0); j += 2;
+                                path.StartFigure();
+                                x = sx = nx; y = sy = ny;
+                                C = 'L';   // M 后隐式重复的坐标按 L 处理
+                                break;
+                            }
+                        case 'L':
+                            {
+                                float nx = n[j] + (rel ? x : 0), ny = n[j + 1] + (rel ? y : 0); j += 2;
+                                path.AddLine(x, y, nx, ny); x = nx; y = ny;
+                                break;
+                            }
+                        case 'H':
+                            {
+                                float nx = n[j] + (rel ? x : 0); j += 1;
+                                path.AddLine(x, y, nx, y); x = nx;
+                                break;
+                            }
+                        case 'V':
+                            {
+                                float ny = n[j] + (rel ? y : 0); j += 1;
+                                path.AddLine(x, y, x, ny); y = ny;
+                                break;
+                            }
+                        case 'C':
+                            {
+                                float c1x = n[j] + (rel ? x : 0), c1y = n[j + 1] + (rel ? y : 0);
+                                float c2x = n[j + 2] + (rel ? x : 0), c2y = n[j + 3] + (rel ? y : 0);
+                                float ex = n[j + 4] + (rel ? x : 0), ey = n[j + 5] + (rel ? y : 0); j += 6;
+                                path.AddBezier(x, y, c1x, c1y, c2x, c2y, ex, ey); x = ex; y = ey;
+                                break;
+                            }
+                        case 'A':
+                            {
+                                float rx = n[j], ry = n[j + 1], rot = n[j + 2];
+                                bool large = n[j + 3] != 0, sweep = n[j + 4] != 0;
+                                float ex = n[j + 5] + (rel ? x : 0), ey = n[j + 6] + (rel ? y : 0); j += 7;
+                                SvgArcToBeziers(path, x, y, rx, ry, rot, large, sweep, ex, ey, out x, out y);
+                                break;
+                            }
+                        case 'Z':
+                            path.CloseFigure(); x = sx; y = sy;
+                            break;
+                    }
+                }
+            }
+            return path;
+        }
+
+        // W3C 端点参数化圆弧 → 贝塞尔分段（标准换算）
+        private static void SvgArcToBeziers(GraphicsPath path, float x0, float y0, float rx, float ry, float rotDeg,
+            bool large, bool sweep, float x1, float y1, out float ox, out float oy)
+        {
+            ox = x1; oy = y1;
+            if (rx == 0 || ry == 0 || (x0 == x1 && y0 == y1)) { path.AddLine(x0, y0, x1, y1); return; }
+            rx = Math.Abs(rx); ry = Math.Abs(ry);
+            double phi = rotDeg * Math.PI / 180.0;
+            double cosP = Math.Cos(phi), sinP = Math.Sin(phi);
+            double dx2 = (x0 - x1) / 2.0, dy2 = (y0 - y1) / 2.0;
+            double x1p = cosP * dx2 + sinP * dy2;
+            double y1p = -sinP * dx2 + cosP * dy2;
+            double lam = x1p * x1p / (rx * rx) + y1p * y1p / (ry * ry);
+            if (lam > 1) { double s = Math.Sqrt(lam); rx = (float)(rx * s); ry = (float)(ry * s); }
+            double sign = (large != sweep) ? 1 : -1;
+            double num = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p;
+            double den = rx * rx * y1p * y1p + ry * ry * x1p * x1p;
+            double co = sign * Math.Sqrt(Math.Max(0, num) / den);
+            double cxp = co * rx * y1p / ry;
+            double cyp = -co * ry * x1p / rx;
+            double cx = cosP * cxp - sinP * cyp + (x0 + x1) / 2.0;
+            double cy = sinP * cxp + cosP * cyp + (y0 + y1) / 2.0;
+            double th1 = Math.Atan2((y1p - cyp) / ry, (x1p - cxp) / rx);
+            double dth = Math.Atan2((-y1p - cyp) / ry, (-x1p - cxp) / rx) - th1;
+            if (!sweep && dth > 0) dth -= 2 * Math.PI;
+            else if (sweep && dth < 0) dth += 2 * Math.PI;
+            int segs = (int)Math.Ceiling(Math.Abs(dth) / (Math.PI / 2));
+            if (segs < 1) segs = 1;
+            double delta = dth / segs;
+            double t = 4.0 / 3 * Math.Tan(delta / 4);
+            double th = th1, px = x0, py = y0;
+            for (int s = 0; s < segs; s++)
+            {
+                double th2 = th + delta;
+                double c1 = Math.Cos(th), s1 = Math.Sin(th), c2 = Math.Cos(th2), s2 = Math.Sin(th2);
+                double ex = cx + rx * cosP * c2 - ry * sinP * s2;
+                double ey = cy + rx * sinP * c2 + ry * cosP * s2;
+                double d1x = t * (-rx * cosP * s1 - ry * sinP * c1);
+                double d1y = t * (-rx * sinP * s1 + ry * cosP * c1);
+                double d2x = t * (rx * cosP * s2 + ry * sinP * c2);
+                double d2y = t * (rx * sinP * s2 - ry * cosP * c2);
+                path.AddBezier((float)px, (float)py, (float)(px + d1x), (float)(py + d1y),
+                    (float)(ex + d2x), (float)(ey + d2y), (float)ex, (float)ey);
+                px = ex; py = ey; th = th2;
+            }
+        }
+
+        // 按官方路径填充（codicon 系，viewBox 见各常量注释）到目标矩形
+        private static void FillIcon(Graphics g, string d, ref GraphicsPath cache, float vb, float x, float y, float size, Color c)
+        {
+            using (var m = new Matrix())
+            {
+                m.Translate(x, y);
+                m.Scale(size / vb, size / vb);
+                using (var gp = (GraphicsPath)P(ref cache, d).Clone())
+                {
+                    gp.Transform(m);
+                    using (var b = new SolidBrush(c))
+                        g.FillPath(b, gp);
+                }
+            }
+        }
+
+        // 按官方路径描边（lucide 系，1.5 线宽圆头，与参考页一致）
+        private static void StrokeIcon(Graphics g, string d, ref GraphicsPath cache, float vb, float x, float y, float size, Color c)
+        {
+            using (var m = new Matrix())
+            {
+                m.Translate(x, y);
+                m.Scale(size / vb, size / vb);
+                using (var gp = (GraphicsPath)P(ref cache, d).Clone())
+                {
+                    gp.Transform(m);
+                    using (var pen = new Pen(c, 1.5f * size / vb) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+                        g.DrawPath(pen, gp);
+                }
+            }
+        }
+
+        public static void DrawServer(Graphics g, float x, float y, float size, Color c)
+        {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            FillIcon(g, DServer, ref _pServer, 16, x, y, size, c);
+        }
+
+        public static void DrawGear(Graphics g, float x, float y, float size, Color c)
+        {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            FillIcon(g, DGear, ref _pGear, 24, x, y, size, c);
+        }
+
+        public static void DrawInfo(Graphics g, float x, float y, float size, Color c)
+        {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            FillIcon(g, DInfo, ref _pInfo, 16, x, y, size, c);
+        }
+
+        // codicon color-mode 官方几何为左半填充(偶奇规则),签名保持中心定位
+        public static void DrawColorMode(Graphics g, float cx, float cy, float size, Color c)
+        {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            FillIcon(g, DColorMode, ref _pColor, 16, cx - size / 2, cy - size / 2, size, c);
+        }
+
+        public static void DrawSun(Graphics g, float cx, float cy, float size, Color c)
+        {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            StrokeIcon(g, DSun, ref _pSun, 24, cx - size / 2, cy - size / 2, size, c);
+        }
+
+        public static void DrawMoon(Graphics g, float cx, float cy, float size, Color c)
+        {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            StrokeIcon(g, DMoon, ref _pMoon, 24, cx - size / 2, cy - size / 2, size, c);
         }
     }
 
@@ -4255,13 +4652,13 @@ namespace QuotaWidget
         public ProviderConfig Result { get; private set; }
 
         public ProviderEditDialog(ProviderConfig existing, SettingsPal pal, float scale)
-            : base(existing != null ? "编辑供应商" : "添加供应商", pal, scale, new Size(St.SiF(400, scale), St.SiF(310, scale)))
+            : base(existing != null ? "编辑供应商" : "添加供应商", pal, scale, new Size(St.SiF(400, scale), St.SiF(334, scale)))
         {
             int x = S(20), w = ClientSize.Width - S(40);
 
             // 前两组「标签 + 输入区」固定；显示方式分段控件与名称组（可选）在 ApplyLayout 里排布
             _rcSelect = new Rectangle(x, S(46) + S(38), w, S(34));
-            _rcKeyBox = new Rectangle(x, S(46) + S(100), w, S(34));
+            _rcKeyBox = new Rectangle(x, S(46) + S(112), w, S(34));
 
             _txtKey = new TextBox { BorderStyle = BorderStyle.None, BackColor = pal.Win, ForeColor = pal.Text, Font = Fs[1], PasswordChar = '●' };
             _txtName = new TextBox { BorderStyle = BorderStyle.None, BackColor = pal.Win, ForeColor = pal.Text, Font = Fs[1] };
@@ -4294,15 +4691,19 @@ namespace QuotaWidget
             ApplyLayout();
         }
 
-        // 显示方式/图标样式切换后重排：图标模式在分段控件下追加黑白/彩色次级选择（加高 S(40)），
-        // 名称模式追加名称输入组（加高 S(62)）
+        // 字段纵向节奏：组间距 12（上组输入框→下组 Label），组内 Label→输入框 8，控件→按钮区 16。
+        // 名称模式追加名称输入组（加高 S(74)）
         private void ApplyLayout()
         {
             int x = S(20), w = S(400) - S(40);
-            ClientSize = new Size(S(400), S(310) + (_showName ? S(62) : 0));
-            _rcSeg = new Rectangle(x, S(46) + S(162), w, S(34));
-            _rcNameBox = _showName ? new Rectangle(x, S(46) + S(224), w, S(34)) : Rectangle.Empty;
-            _rcOk = new Rectangle(S(400) - S(20) - S(88), ClientSize.Height - S(18) - S(34), S(88), S(34));
+            int h = S(334) + (_showName ? S(74) : 0);
+            // 本窗口吞掉了 WM_NCCALCSIZE,客户区即整个外框;句柄已创建后再设 ClientSize,
+            // WinForms 会按 WS_THICKFRAME 用 AdjustWindowRectEx 补算边框,把窗口撑宽一圈,
+            // 故运行期切换显示方式时直接设置外框尺寸(构造期仍走 ClientSize,创建句柄时正好抵消)
+            if (IsHandleCreated) Size = new Size(S(400), h); else ClientSize = new Size(S(400), h);
+            _rcSeg = new Rectangle(x, S(46) + S(186), w, S(34));
+            _rcNameBox = _showName ? new Rectangle(x, S(46) + S(260), w, S(34)) : Rectangle.Empty;
+            _rcOk = new Rectangle(S(400) - S(20) - S(88), h - S(18) - S(34), S(88), S(34));
             _rcCancel = new Rectangle(_rcOk.X - S(10) - S(88), _rcOk.Y, S(88), S(34));
             _txtName.Visible = _showName;
             _txtName.Bounds = new Rectangle(_rcNameBox.X + S(10), _rcNameBox.Y + (S(34) - _txtName.PreferredHeight) / 2, _rcNameBox.Width - S(20), _txtName.PreferredHeight);
@@ -4364,13 +4765,13 @@ namespace QuotaWidget
 
             DrawFieldLabel(g, "接口", S(46) + S(10));
             PaintSelectBox(g, _rcSelect, TypeItems[_typeIndex], _hotSelect, TypeIconTypes[_typeIndex]);
-            DrawFieldLabel(g, "API Key", S(46) + S(72));
+            DrawFieldLabel(g, "API Key", S(46) + S(84));
             DrawFieldBox(g, _rcKeyBox, _txtKey.Focused);
-            DrawFieldLabel(g, "显示方式", S(46) + S(134));
+            DrawFieldLabel(g, "显示方式", S(46) + S(158));
             PaintSegmented(g, _rcSeg);
             if (_showName)
             {
-                DrawFieldLabel(g, "显示名称", S(46) + S(196));
+                DrawFieldLabel(g, "显示名称", S(46) + S(232));
                 DrawFieldBox(g, _rcNameBox, _txtName.Focused);
             }
 
@@ -5067,6 +5468,10 @@ namespace QuotaWidget
         private float _scrollP, _scrollG;     // 供应商页 / 通用页滚动偏移
         private string _hover;                // 悬停命中区 id
         private bool _testing;                // 「测试全部」进行中
+        // ---- 关于页·检查更新状态（按钮文案与宽度随状态变，布局需重算） ----
+        private bool _updateChecking;         // 检查请求进行中（按钮显示「检查中…」并忽略点击）
+        private QuotaService.UpdateInfo _updateInfo; // 非 null 且 Newer=发现新版本（按钮变主色「下载新版本」）
+        private string _updateMsg;            // 按钮下方状态行：已是最新 / 错误信息（发现新版时为引导文案）
         private SettingsPopupList _popup;
         private bool _built;
 
@@ -5092,7 +5497,7 @@ namespace QuotaWidget
         private readonly List<Hot> _hots = new List<Hot>();
         private Rectangle _vp;                // 当前页内容视口
         private int _contentH;                // 当前页内容总高（与滚动无关，>视口高时出现滚动）
-        private Rectangle _rcMoon, _rcClose, _rcAdd, _rcTest, _rcCancel, _rcSave;
+        private Rectangle _rcMoon, _rcClose, _rcAdd, _rcTest, _rcCancel, _rcSave, _rcOpenDir, _rcUpdate;
         private readonly List<Rectangle> _cardRects = new List<Rectangle>();
         private Rectangle _grp1, _grp2;
         private readonly List<int> _visRows = new List<int>();        // 通用页可见行（置顶栏模式才含“显示屏幕”）
@@ -5221,7 +5626,7 @@ namespace QuotaWidget
             {
                 if (_page == 0) LayoutProviders();
                 else if (_page == 1) LayoutGeneral();
-                else { _contentH = S(420); break; }
+                else { LayoutAbout(); break; }
                 float c = ClampScroll(_page == 0 ? _scrollP : _scrollG);
                 bool changed = (_page == 0 ? _scrollP : _scrollG) != c;
                 if (_page == 0) _scrollP = c; else _scrollG = c;
@@ -5327,9 +5732,33 @@ namespace QuotaWidget
             _contentH = listY + _editList.Count * (cardH + gap) + S(8) - _vp.Y;
         }
 
+        // 关于页固定布局（页内不滚动）：坐标与 PaintAbout 一致，命中与绘制共用 _rcOpenDir/_rcUpdate
+        private void LayoutAbout()
+        {
+            _contentH = S(420);
+            Font[] fs = Fonts(_scale);
+            // 双按钮并排整体居中：更新按钮文案随检查状态变（检查中… / 下载新版本 vX），宽度须每次现测
+            int w1 = MeasureW("打开配置目录", fs[1]) + S(36);
+            int w2 = MeasureW(UpdateButtonText(), fs[1]) + S(36);
+            int x = _vp.X + _vp.Width / 2 - (w1 + S(10) + w2) / 2;
+            int iconY = _vp.Y + S(24) + S(16);
+            _rcOpenDir = new Rectangle(x, iconY + S(170), w1, S(34));
+            _rcUpdate = new Rectangle(x + w1 + S(10), iconY + S(170), w2, S(34));
+            AddHot(_rcOpenDir, "opendir");
+            AddHot(_rcUpdate, "update");
+        }
+
+        // 更新按钮文案随状态：检查中禁用 / 发现新版引导下载 / 默认
+        private string UpdateButtonText()
+        {
+            if (_updateChecking) return "检查中…";
+            if (_updateInfo != null && _updateInfo.Newer) return "下载新版本 v" + _updateInfo.Tag;
+            return "检查更新";
+        }
+
         private void LayoutGeneral()
         {
-            int y = _vp.Y - (int)_scrollP;
+            int y = _vp.Y - (int)_scrollG;
 
             int pad = S(16), rowH = S(52);
             _visRows.Add(R_MODE);
@@ -5385,7 +5814,9 @@ namespace QuotaWidget
                 switch (rows2[i])
                 {
                     case R_THEME:
-                        _rcSegTheme = SegRect(rr, new string[] { "☀ 浅色", "☾ 深色" });
+                        _rcSegTheme = SegRect(rr, new string[] { "浅色", "深色" });
+                        // 钮内为「图标 + 文字」，比纯文字宽：每钮补图标位 S(20)
+                        _rcSegTheme = new Rectangle(_rcSegTheme.X - S(40), _rcSegTheme.Y, _rcSegTheme.Width + S(40), _rcSegTheme.Height);
                         SegBtns(_rcSegTheme, _segThemeBtns);
                         AddHot(_segThemeBtns[0], "segtheme:0");
                         AddHot(_segThemeBtns[1], "segtheme:1");
@@ -5460,14 +5891,12 @@ namespace QuotaWidget
             using (var b = new SolidBrush(p.Text))
                 TextRenderer.DrawText(g, "设置", fs[1], new Rectangle(ic.Right + S(9), 0, S(80), tbH), p.Text, TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
 
-            // 主题预览按钮：浅色显示月亮、深色显示太阳
+            // 主题预览按钮：VS Code 同款半圆对比图标（codicon color-mode），点击切换明暗预览
             if (_hover == "moon")
                 using (var path = St.RoundRect(_rcMoon, S(8)))
                 using (var b = new SolidBrush(p.Hover))
                     g.FillPath(b, path);
-            float mcx = _rcMoon.X + _rcMoon.Width / 2f, mcy = _rcMoon.Y + _rcMoon.Height / 2f;
-            if (_pendDark) PaintSun(g, p.Text, mcx, mcy, _scale);
-            else PaintMoon(g, p, mcx, mcy, _scale);
+            IconFactory.DrawColorMode(g, _rcMoon.X + _rcMoon.Width / 2f, _rcMoon.Y + _rcMoon.Height / 2f, S(16), p.Text);
 
             // 关闭按钮
             if (_hover == "close")
@@ -5483,33 +5912,6 @@ namespace QuotaWidget
 
             using (var pen = new Pen(p.Line2))
                 g.DrawLine(pen, 0, tbH - 1, W, tbH - 1);
-        }
-
-        private static void PaintMoon(Graphics g, SettingsPal p, float cx, float cy, float s)
-        {
-            float d = 15f * s;
-            using (var b = new SolidBrush(p.Text))
-            {
-                g.FillEllipse(b, cx - d / 2, cy - d / 2, d, d);
-                using (var b2 = new SolidBrush(p.Win)) // 偏移圆抠出月牙
-                    g.FillEllipse(b2, cx - d / 2 + d * 0.34f, cy - d / 2 - d * 0.16f, d * 0.86f, d * 0.86f);
-            }
-        }
-
-        private static void PaintSun(Graphics g, Color c, float cx, float cy, float s)
-        {
-            float r = 3.6f * s;
-            using (var b = new SolidBrush(c))
-                g.FillEllipse(b, cx - r, cy - r, r * 2, r * 2);
-            using (var pen = new Pen(c, 1.4f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
-            {
-                float r1 = 6f * s, r2 = 8.4f * s;
-                for (int i = 0; i < 8; i++)
-                {
-                    double a = Math.PI * i / 4.0;
-                    g.DrawLine(pen, cx + (float)Math.Cos(a) * r1, cy + (float)Math.Sin(a) * r1, cx + (float)Math.Cos(a) * r2, cy + (float)Math.Sin(a) * r2);
-                }
-            }
         }
 
         private void PaintSidebar(Graphics g, SettingsPal p, Font[] fs, int tbH, int sideW, int H)
@@ -5530,7 +5932,7 @@ namespace QuotaWidget
                     using (var b = new SolidBrush(active ? p.Sel : p.Hover))
                         g.FillPath(b, path);
                 Color c = (active || hot) ? p.Text : p.Text2;
-                PaintNavIcon(g, i, r.X + S(10), r.Y + (r.Height - S(15)) / 2, c, p.Side);
+                PaintNavIcon(g, i, r.X + S(10), r.Y + (r.Height - S(16)) / 2, c);
                 using (var b = new SolidBrush(c))
                     g.DrawString(names[i], active ? fs[1] : fs[2], b, new RectangleF(r.X + S(35), r.Y, navW - S(35), navH), SFLeftV);
             }
@@ -5543,48 +5945,13 @@ namespace QuotaWidget
             }
         }
 
-        private void PaintNavIcon(Graphics g, int idx, float x, float y, Color c, Color bgFill)
+        // 导航图标统一用 codicon 风格（几何见 IconFactory）：server / settings-gear / info
+        private void PaintNavIcon(Graphics g, int idx, float x, float y, Color c)
         {
-            float sc = _scale;
-            using (var pen = new Pen(c, 1.3f))
-            {
-                if (idx == 0)
-                { // 供应商：上下两栏
-                    using (var p1 = St.RoundRect(new Rectangle((int)x, (int)y, S(15), S(6)), S(2)))
-                    using (var p2 = St.RoundRect(new Rectangle((int)x, (int)y + S(9), S(15), S(6)), S(2)))
-                    {
-                        g.DrawPath(pen, p1);
-                        g.DrawPath(pen, p2);
-                    }
-                    using (var b = new SolidBrush(c))
-                    {
-                        g.FillEllipse(b, x + 2.8f * sc, y + 2.2f * sc, 1.6f * sc, 1.6f * sc);
-                        g.FillEllipse(b, x + 2.8f * sc, y + 11.2f * sc, 1.6f * sc, 1.6f * sc);
-                    }
-                }
-                else if (idx == 1)
-                { // 通用：两条调节杆 + 旋钮
-                    g.DrawLine(pen, x + 1 * sc, y + 4.5f * sc, x + 14 * sc, y + 4.5f * sc);
-                    g.DrawLine(pen, x + 1 * sc, y + 11.5f * sc, x + 14 * sc, y + 11.5f * sc);
-                    float kr = 2.2f * sc;
-                    using (var b = new SolidBrush(bgFill))
-                    {
-                        g.FillEllipse(b, x + 10.5f * sc - kr, y + 4.5f * sc - kr, kr * 2, kr * 2);
-                        g.FillEllipse(b, x + 4.7f * sc - kr, y + 11.5f * sc - kr, kr * 2, kr * 2);
-                    }
-                    g.DrawEllipse(pen, x + 10.5f * sc - kr, y + 4.5f * sc - kr, kr * 2, kr * 2);
-                    g.DrawEllipse(pen, x + 4.7f * sc - kr, y + 11.5f * sc - kr, kr * 2, kr * 2);
-                }
-                else
-                { // 关于：圆 + i
-                    g.DrawEllipse(pen, x + 1.5f * sc, y + 1.5f * sc, 12 * sc, 12 * sc);
-                    using (var b = new SolidBrush(c))
-                    {
-                        g.FillEllipse(b, x + 7.1f * sc, y + 4.2f * sc, 1.8f * sc, 1.8f * sc);
-                        g.FillEllipse(b, x + 7.1f * sc, y + 7.2f * sc, 1.8f * sc, 4.4f * sc);
-                    }
-                }
-            }
+            float size = S(16);
+            if (idx == 0) IconFactory.DrawServer(g, x, y, size, c);
+            else if (idx == 1) IconFactory.DrawGear(g, x, y, size, c);
+            else IconFactory.DrawInfo(g, x, y, size, c);
         }
 
         private void PaintProviders(Graphics g, SettingsPal p, Font[] fs)
@@ -5788,7 +6155,7 @@ namespace QuotaWidget
                     PaintSlider(g, p, fs, cy);
                     break;
                 case R_THEME:
-                    PaintSeg(g, p, fs, _rcSegTheme, _segThemeBtns, new string[] { "☀ 浅色", "☾ 深色" }, _pendDark ? 1 : 0, "segtheme");
+                    PaintThemeSeg(g, p, fs);
                     break;
                 case R_TOP:
                     PaintToggle(g, p, _rcTglTop, _pendTopMost);
@@ -5796,6 +6163,41 @@ namespace QuotaWidget
                 default:
                     PaintToggle(g, p, _rcTglAuto, _pendAutoStart);
                     break;
+            }
+        }
+
+        // 主题分段：钮内绘制「lucide sun/moon 图标 + 文字」，替换原 unicode 字符（☀/☾ 随字体渲染效果差）
+        private void PaintThemeSeg(Graphics g, SettingsPal p, Font[] fs)
+        {
+            int active = _pendDark ? 1 : 0;
+            int hoverIdx = HoverIdxOf("segtheme");
+            using (var path = St.RoundRect(_rcSegTheme, S(8)))
+            using (var b = new SolidBrush(p.Hover))
+                g.FillPath(b, path);
+            string[] labels = new string[] { "浅色", "深色" };
+            for (int i = 0; i < _segThemeBtns.Count; i++)
+            {
+                var r = _segThemeBtns[i];
+                bool on = i == active;
+                bool hot = !on && i == hoverIdx;
+                if (on)
+                    using (var path = St.RoundRect(r, S(6)))
+                    {
+                        using (var b = new SolidBrush(p.Win))
+                            g.FillPath(b, path);
+                        using (var pen = new Pen(p.Line))
+                            g.DrawPath(pen, path);
+                    }
+                Color c = on || hot ? p.Text : p.Text2;
+                var f = on ? fs[8] : fs[3];
+                float tw = g.MeasureString(labels[i], f).Width;
+                float isz = S(14);
+                float x = r.X + (r.Width - (isz + S(6) + tw)) / 2f;
+                float cy = r.Y + r.Height / 2f;
+                if (i == 0) IconFactory.DrawSun(g, x + isz / 2f, cy, isz, c);
+                else IconFactory.DrawMoon(g, x + isz / 2f, cy, isz, c);
+                using (var b = new SolidBrush(c))
+                    g.DrawString(labels[i], f, b, new RectangleF(x + isz + S(6), r.Y, tw + S(4), r.Height), SFLeftV);
             }
         }
 
@@ -5883,7 +6285,9 @@ namespace QuotaWidget
 
         private void PaintAbout(Graphics g, SettingsPal p, Font[] fs)
         {
-            int y = _vp.Y - (int)_scrollP + S(24);
+            // 本页不滚动（OnMouseWheel 对 _page==2 直接返回），坐标与 LayoutAbout 一致；
+            // 不再减 _scrollP——旧代码减了但页面切换不重置它，从已滚动的供应商页切过来会整体上移
+            int y = _vp.Y + S(24);
 
             int cx = _vp.X + _vp.Width / 2;
             int iconY = y + S(16);
@@ -5897,6 +6301,16 @@ namespace QuotaWidget
             {
                 g.DrawString("v" + AppInfo.Version, fs[3], b, new RectangleF(_vp.X, iconY + S(100), _vp.Width, S(18)), sf);
                 g.DrawString("在桌面悬浮展示 GLM / Kimi / MiniMax / DeepSeek / Claude / Codex 的额度与用量。", fs[3], b, new RectangleF(_vp.X, iconY + S(128), _vp.Width, S(18)), sf);
+            }
+            // 配置挪到 AppData 后用户不易找到，提供一键定位（资源管理器选中 config.json）
+            PaintButton(g, p, fs, _rcOpenDir, "打开配置目录", false, _hover == "opendir");
+            // 发现新版时换主色引导下载；「检查中…」悬停态照常、点击在 OnMouseDown 被忽略
+            PaintButton(g, p, fs, _rcUpdate, UpdateButtonText(), _updateInfo != null && _updateInfo.Newer, _hover == "update");
+            if (!string.IsNullOrEmpty(_updateMsg))
+            {
+                using (var sf = new StringFormat { Alignment = StringAlignment.Center })
+                using (var b = new SolidBrush(p.Text2))
+                    g.DrawString(_updateMsg, fs[3], b, new RectangleF(_vp.X, _rcOpenDir.Bottom + S(12), _vp.Width, S(18)), sf);
             }
         }
 
@@ -5936,6 +6350,7 @@ namespace QuotaWidget
 
         private void PaintScrollbar(Graphics g, SettingsPal p)
         {
+            if (_page == 2) return; // 关于页固定布局不滚动，_scrollG 在本页也不过钳制，画出来只是装饰
             int max = Math.Max(0, _contentH - _vp.Height);
             if (max <= 0) return;
             float scroll = _page == 0 ? _scrollP : _scrollG;
@@ -6064,6 +6479,11 @@ namespace QuotaWidget
                 if (id == "sel:int") { OpenIntervalPopup(); return; }
                 if (id == "sld:op") { _dragSlider = true; Capture = true; SliderSet(e.X); return; }
             }
+            else if (_page == 2)
+            {
+                if (id == "opendir") { OpenConfigDir(); return; }
+                if (id == "update") { OnUpdateClick(); return; }
+            }
 
             if (id == "btn:cancel") { Close(); return; }
             if (id == "btn:save") { SaveAndClose(); return; }
@@ -6084,9 +6504,7 @@ namespace QuotaWidget
             if (h != _hover)
             {
                 _hover = h;
-                Cursor = h == null ? Cursors.Default
-                    : (h.StartsWith("grip:") ? Cursors.SizeAll
-                    : (h.StartsWith("tip:") ? Cursors.Default : Cursors.Hand));
+                // 光标样式由 WndProc 的 WM_SETCURSOR 统一设置，这里只更新悬停态
                 UpdateTip(h);
                 Invalidate();
             }
@@ -6106,7 +6524,7 @@ namespace QuotaWidget
         {
             base.OnMouseLeave(e);
             if (_dragWindow || _dragCard >= 0 || _dragSlider) return; // 拖拽中的 MouseLeave（含 Capture 边界）不当作真离开
-            if (_hover != null) { _hover = null; Cursor = Cursors.Default; Invalidate(); }
+            if (_hover != null) { _hover = null; Invalidate(); }
             HideTip();
         }
 
@@ -6362,11 +6780,32 @@ namespace QuotaWidget
             }
         }
 
+        [DllImport("user32.dll")] private static extern IntPtr SetCursor(IntPtr h);
+        [DllImport("user32.dll")] private static extern IntPtr LoadCursor(IntPtr hInstance, IntPtr name);
+
+        // 悬停光标统一用现场加载的系统共享句柄:WinForms 缓存的 Cursors.Hand 实测是 32×32 单色句柄,
+        // 混合 DPI 下不随所在屏正确缩放(1080P 上显小显糙);系统句柄由 Windows 按当前屏 DPI 渲染
+        private void UpdateHoverCursor()
+        {
+            IntPtr want = _hover == null || _hover.StartsWith("tip:")
+                ? LoadCursor(IntPtr.Zero, (IntPtr)32512)                          // IDC_ARROW
+                : (_hover.StartsWith("grip:") ? LoadCursor(IntPtr.Zero, (IntPtr)32646) // IDC_SIZEALL
+                : LoadCursor(IntPtr.Zero, (IntPtr)32649));                        // IDC_HAND
+            SetCursor(want);
+        }
+
         protected override void WndProc(ref Message m)
         {
             const int WM_NCCALCSIZE = 0x0083;
             const int WM_NCHITTEST = 0x0084;
             const int WM_NCACTIVATE = 0x0086;
+            const int WM_SETCURSOR = 0x0020;
+            if (m.Msg == WM_SETCURSOR && ((long)m.LParam & 0xFFFF) == 1) // 本窗口恒 HTCLIENT
+            {
+                UpdateHoverCursor();
+                m.Result = (IntPtr)1;
+                return;
+            }
             if (m.Msg == WM_NCCALCSIZE && m.WParam != IntPtr.Zero)
             {
                 m.Result = IntPtr.Zero; // 移除标准边框，标题栏由自绘负责
@@ -6435,6 +6874,68 @@ namespace QuotaWidget
             Close();
         }
 
+        // 资源管理器打开 %LOCALAPPDATA%\QuotaWidget 并选中 config.json：
+        // 配置不再放 exe 同目录，用户反馈/备份时需要入口找到它（error.log 也在该目录）
+        private void OpenConfigDir()
+        {
+            try
+            {
+                Directory.CreateDirectory(Config.DataDir);
+                System.Diagnostics.Process.Start("explorer.exe", "/select,\"" + Config.FilePath + "\"");
+            }
+            catch { }
+        }
+
+        // 检查更新按钮：检查中忽略点击；已发现新版则跳实际应答源的发布页；否则发起检查
+        private void OnUpdateClick()
+        {
+            if (_updateChecking) return;
+            if (_updateInfo != null && _updateInfo.Newer)
+            {
+                try { System.Diagnostics.Process.Start(_updateInfo.PageUrl); }
+                catch { }
+                return;
+            }
+            StartUpdateCheck();
+        }
+
+        // 后台双源检查（Gitee 主、GitHub 备，单边失败静默，见 QuotaService.CheckUpdate）。
+        // 与 TestAll 相同的线程池套路：BeginInvoke 外包 try-catch、回调内判 IsDisposed，
+        // 用户在请求期间关掉设置窗不会把线程池异常升级成进程崩溃
+        private void StartUpdateCheck()
+        {
+            _updateChecking = true;
+            _updateMsg = null;
+            _hover = null;
+            UpdateHoverCursor();
+            Invalidate();
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                QuotaService.UpdateInfo info = null;
+                string err = null;
+                try { info = QuotaService.CheckUpdate(); }
+                catch (Exception ex) { err = ex.Message; }
+                try
+                {
+                    BeginInvoke((Action)delegate
+                    {
+                        _updateChecking = false;
+                        if (IsDisposed) return;
+                        _updateInfo = info;
+                        if (info != null && info.Newer)
+                            _updateMsg = "发现新版本 v" + info.Tag + "，点击右侧按钮前往下载";
+                        else if (info != null)
+                            _updateMsg = "已是最新版本 ✓（v" + AppInfo.Version + "）";
+                        else
+                            _updateMsg = "检查失败：" + err;
+                        LayoutAll(); // 按钮文案随状态变（检查中… / 下载新版本 vX），宽度需重测
+                        Invalidate();
+                    });
+                }
+                catch { /* 窗口已销毁，放弃回调 */ }
+            });
+        }
+
         private void TestAll()
         {
             if (_testing) return;
@@ -6445,7 +6946,7 @@ namespace QuotaWidget
             }
             _testing = true;
             _hover = null;
-            Cursor = Cursors.Default;
+            UpdateHoverCursor();
             Invalidate();
             var snapshot = new List<ProviderConfig>(_editList);
             ThreadPool.QueueUserWorkItem(delegate
