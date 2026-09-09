@@ -2309,10 +2309,12 @@ namespace QuotaWidget
                 Visible = true,
                 Text = "AI 额度工具 v" + AppInfo.Version
             };
+            // 托盘点击只可能在消息循环启动后送达，而窗口在构造末尾已按 DisplayMode 显示完毕，
+            // 因此不需要"首次显示完成"标志来挡掉早期点击（原 _firstShow 恒为 false，是死条件）
             Tray.MouseClick += delegate(object s, MouseEventArgs e)
             {
                 if (e.Button == MouseButtons.Right) { ShowMenu(); return; }
-                if (e.Button == MouseButtons.Left && !_firstShow)
+                if (e.Button == MouseButtons.Left)
                 {
                     if (Cfg.DisplayMode == "topbar")
                     {
@@ -2324,7 +2326,10 @@ namespace QuotaWidget
                         else
                         {
                             TopBar.ApplyFromConfig();
-                            MainForm = Floating;
+                            // MainForm 必须指向本模式的窗口：ApplicationContext 的 RunMessageLoop
+                            // 会在消息循环启动时自动 Show(MainForm)，指向悬浮窗会让它在置顶栏
+                            // 模式下也被弹出来（两个窗口同时出现）
+                            MainForm = TopBar;
                             TopBar.Show();
                         }
                     }
@@ -2336,12 +2341,31 @@ namespace QuotaWidget
             // 不在此处设置 MainForm：设置后 Application.Run 会立即显示空白窗口；
             // 仅创建窗口句柄，使后台线程能通过 BeginInvoke 回到 UI 线程
             var h = Floating.Handle;
-            // 首屏即刻显示：此前首次 Show 押在全部供应商查询完成之后（_firstShow 分支），
-            // 任一端点超时（15s，GLM/MiniMax 双端点回退最坏 30s）窗口就迟迟不出现。
-            // 先塞一条占位状态（各布局渲染为"正在获取 --"）显示窗口，数据到达后由
-            // RefreshData 的回调原地替换并 Rebuild
-            Providers.Add(new ProviderStatus { Name = "正在获取", Type = "glm" });
-            _firstShow = false;
+            // 首屏即刻显示：此前首次 Show 押在全部供应商查询完成之后（数据到达回调里才
+            // ShowActiveForm），任一端点超时（15s，GLM/MiniMax 双端点回退最坏 30s）窗口就迟迟
+            // 不出现。占位行必须按配置里的供应商数量逐条生成：窗口尺寸由 Providers.Count 决定
+            // （卡片行数 / 竖向岛高度 / 岛宽与徽标数），只塞一条的话首屏会先以"一行/单徽标"
+            // 的形态出现，等数据回来 Rebuild 才变成上次关闭前的形态，视觉上就是"加载完才归位"。
+            // 跳过条件与 RefreshData 完全一致（未配置 key 且无本地凭证的供应商最终不会进列表），
+            // 否则首屏会多出一行、数据到达后又消失，行数变化照样引起尺寸跳变
+            if (Cfg.Providers != null)
+            {
+                foreach (var p in Cfg.Providers)
+                {
+                    if (!p.HasKey && !p.CanUseLocalCreds) continue;
+                    // Name 与 QuotaService 各 Fetch* 的赋值保持一致，不在这里做 TypeDisplay 回退：
+                    // 回退只出现在占位行会让首屏宽度先宽后窄（CardWidth 按名称测量）
+                    Providers.Add(new ProviderStatus
+                    {
+                        Name = p.Name ?? "",
+                        Type = p.Type,
+                        Region = p.Region,
+                        ShowName = p.ShowName
+                    });
+                }
+            }
+            if (Providers.Count == 0)
+                Providers.Add(new ProviderStatus { Name = "正在获取", Type = "glm" });
             ShowActiveForm();
             RefreshData();
             // 任何退出路径（含未处理异常对话框选"退出"）都兜底恢复工作区；RestoreWorkArea 以
@@ -2396,9 +2420,13 @@ namespace QuotaWidget
             if (Cfg.DisplayMode == "topbar")
             {
                 Floating.SuspendTimers();
-                if (Floating.Visible) Floating.Hide();
+                // 无条件 Hide：启动时悬浮窗从未 Show 过，Visible 为 false，若只按可见性判断
+                // 就不会收起它，而 MainForm 指向的窗口会在消息循环启动时被自动显示
+                Floating.Hide();
                 TopBar.ApplyFromConfig();
-                if (!TopBar.Visible) { MainForm = Floating; TopBar.Show(); }
+                // MainForm 必须指向本模式的窗口（原因见托盘左键分支）
+                MainForm = TopBar;
+                if (!TopBar.Visible) TopBar.Show();
             }
             else
             {
@@ -2408,12 +2436,13 @@ namespace QuotaWidget
                     _topBar.SuspendTimers();
                 }
                 Floating.ApplyFromConfig();
-                if (!Floating.Visible) { MainForm = Floating; Floating.Show(); }
+                // MainForm 指回悬浮窗（从置顶栏切回时它在消息循环启动后也需要被自动显示）
+                MainForm = Floating;
+                if (!Floating.Visible) { Floating.Show(); }
             }
         }
 
         private int _fetching;
-        private bool _firstShow = true;
         private string _lastTrayTip = "";   // 缓存上次托盘文本，只在变化时更新（避免每秒调用 Shell_NotifyIcon）
 
         public void RefreshData()
@@ -2427,7 +2456,7 @@ namespace QuotaWidget
                 System.Threading.Tasks.Parallel.For(0, providers.Count, i =>
                 {
                     var p = providers[i];
-                    if (!p.HasKey && !p.CanUseLocalCreds) return;   // 未配置 key 且无本地凭证可用：跳过（行内显示 "--"）
+                    if (!p.HasKey && !p.CanUseLocalCreds) return;   // 未配置 key 且无本地凭证可用：跳过（该供应商整行不出现，首屏占位循环用同一规则）
                     try
                     {
                         ProviderStatus st;
@@ -2459,7 +2488,6 @@ namespace QuotaWidget
                             Floating.Rebuild();
                             if (_topBar != null && _topBar.Visible) _topBar.Rebuild();
                             UpdateTrayTip();
-                            if (_firstShow) { _firstShow = false; ShowActiveForm(); }
                         }
                         finally { Interlocked.Exchange(ref _fetching, 0); }
                     });
@@ -2514,6 +2542,16 @@ namespace QuotaWidget
         private System.Windows.Forms.Timer _refreshTimer;
         private System.Windows.Forms.Timer _hideTimer;
         private System.Windows.Forms.Timer _showTimer;
+        // 详情面板"看守"定时器：只兜底，不参与唤出/收起的事件配对。
+        // 面板的显隐原本全靠 MouseEnter/MouseLeave 配对驱动，鼠标从悬浮窗直接移开、
+        // 既没掠过面板、离开后那一发 _hideTimer 判定又恰好落在面板矩形内时，
+        // _hideTimer 判定不通过便自行 Stop()，此后没有任何入口再关面板 → 面板永久驻留。
+        private System.Windows.Forms.Timer _watchdogTimer;
+        private int? _detailOffSince;   // 鼠标既不在悬浮窗也不在面板内的起始时刻；null = 尚未离开过
+        // 看守节奏：250ms 轮询一次，光标离开悬浮窗与面板后须持续 700ms 才收面板。
+        // 两处硬编码收敛成常量，TopBarForm 的同名成员必须保持一致
+        private const int WatchdogIntervalMs = 250;
+        private const int DetailOffGraceMs = 700;
         private bool _dragging;
         private Point _dragOffset;
 
@@ -2633,12 +2671,15 @@ namespace QuotaWidget
             _refreshTimer = new System.Windows.Forms.Timer();
             _refreshTimer.Tick += delegate { _ctx.RefreshData(); };
 
-            _hideTimer = new System.Windows.Forms.Timer { Interval = 350 };
+            // 500ms：原 350ms 对"卡片→面板"路径偏短——鼠标还在两者间隙里时这一发判定必然落空。
+            // 根因是显隐依赖事件配对（间隙里没人调 CancelHide），500ms 只是把命中率降低，
+            // 真正的兜底是下面的看门狗；鼠标只要进了面板就会被 DetailForm.OnMouseEnter 取消
+            _hideTimer = new System.Windows.Forms.Timer { Interval = 500 };
             _hideTimer.Tick += delegate
             {
                 _hideTimer.Stop();
                 if (!Bounds.Contains(Cursor.Position) && !_detail.Bounds.Contains(Cursor.Position))
-                    _detail.Hide();
+                    HideDetail();
             };
 
             _showTimer = new System.Windows.Forms.Timer { Interval = 1000 };
@@ -2647,6 +2688,10 @@ namespace QuotaWidget
                 _showTimer.Stop();
                 if (!_dragging && Bounds.Contains(Cursor.Position)) ShowDetail();
             };
+
+            _watchdogTimer = new System.Windows.Forms.Timer { Interval = WatchdogIntervalMs };
+            _watchdogTimer.Tick += delegate { WatchdogTick(); };
+            _watchdogTimer.Start();
 
             _island = _ctx.Cfg.FloatLayout == "island"; // 排列启动即生效（ApplyFromConfig 仅在切换排列时重置位置）
             ApplyFromConfig();
@@ -2676,8 +2721,10 @@ namespace QuotaWidget
             _refreshTimer.Interval = Math.Max(15, cfg.RefreshSec) * 1000;
             _refreshTimer.Start();
             // 从置顶栏模式切回时 _uiTimer 处于停止态（SuspendTimers 所停），必须在此重启；
-            // 构造函数里的 Start() 只执行一次，缺了这行倒计时/托盘 tip 将永久冻结
+            // 构造函数里的 Start() 只执行一次，缺了这行倒计时/托盘 tip 将永久冻结。
+            // 看门狗同理必须在 SuspendTimers/此处成对停启，且位置要在下面的分支 return 之前
             _uiTimer.Start();
+            _watchdogTimer.Start();
 
             if (_island)
             {
@@ -2771,6 +2818,10 @@ namespace QuotaWidget
                     Location = new Point(wa.Right - Width - 24, wa.Top + 24);
                 }
             }
+            // 矩形卡片：上面只定了位置（宽度已在前面按排列算过），高度仍是窗体默认值，
+            // 必须按当前供应商数量算一次尺寸。岛形与竖向分支内部已各自调用 Rebuild，
+            // 这里补上后三种排列首屏形态都直接正确
+            Rebuild();
         }
 
         // 切到置顶栏模式后本窗口隐藏，停止刷新/重绘定时器，避免两个模式的定时器
@@ -2779,6 +2830,9 @@ namespace QuotaWidget
         {
             _uiTimer.Stop();
             _refreshTimer.Stop();
+            _watchdogTimer.Stop();   // 与 ApplyFromConfig 成对，切回本模式时必须重启
+            // 切模式时窗口整体隐藏，详情面板是独立窗口会留在屏幕上，必须一起收掉
+            if (_detail.Visible) HideDetail();
         }
 
         // Alt+F4 / WM_CLOSE 走正规退出流程（清理托盘图标与工作区），否则消息循环直接结束、
@@ -2980,7 +3034,7 @@ namespace QuotaWidget
             if (_animTimer != null) _animTimer.Stop();
             // 拖拽属于移动意图：停掉悬停唤出计时并收起详情面板，拖拽中不再弹出
             _showTimer.Stop();
-            if (_detail.Visible) _detail.Hide();
+            if (_detail.Visible) HideDetail();
             _dragging = true; _dragOffset = e.Location;
         }
         protected override void OnMouseMove(MouseEventArgs e)
@@ -3297,6 +3351,51 @@ namespace QuotaWidget
         public void ArmHide() { _hideTimer.Stop(); _hideTimer.Start(); }
         public void CancelHide() { _hideTimer.Stop(); }
 
+        // ---- 详情面板看守（兜底）----
+        // 只负责"鼠标已经离开悬浮窗和面板、但面板还挂着"这一种漏网情况，不改变原有
+        // 唤出/收起语义：鼠标停在悬浮窗或面板上时计数永远清零，面板一直显示。
+        private void WatchdogTick()
+        {
+            if (!_detail.Visible) { _detailOffSince = null; return; }
+            if (ShouldHideStuckDetail()) HideDetail();
+        }
+
+        // 是否满足"鼠标已离开悬浮窗和面板、且持续超过缓冲时长"→ 可以收面板
+        private bool ShouldHideStuckDetail()
+        {
+            // 吸附态收起中：光标若落在岛体"展开后"应占的范围内（Peek 条上方那条空带，
+            // 再往下一点就会触发 EdgeExpand），不能按"已离开"处理，否则展开动画期间面板会被误关。
+            // 注意这里只 return false、不复位 _detailOffSince，等价于"暂停倒计时"：
+            // 光标离开该带区后会立刻（≤250ms）收面板，而不是再等一个完整宽限期
+            if (_edgeDocked && _edgeCollapsed && EdgeExpandBounds().Contains(Cursor.Position)) return false;
+            // Visible：宿主整体隐藏后（托盘切换 / 切到置顶栏模式 / 置顶栏 Alt+F4），光标可能仍停在
+            // 本窗口矩形内，只按 Bounds 判断会让面板永远收不掉——被 owner 隐藏的窗口托管 Visible
+            // 依旧是 true，而 _detail 在置顶栏下是 Show(this) 的从属窗口
+            bool over = _dragging || (Visible && Bounds.Contains(Cursor.Position)) || _detail.Bounds.Contains(Cursor.Position);
+            if (over) { _detailOffSince = null; return false; }
+            // 哨兵必须是 null 而不是 0：Environment.TickCount 本身是约 22 亿的正数，
+            // 用 0 作"尚未离开"的标记时 TickCount-0 已远大于阈值，首帧就会误判为超时
+            if (!_detailOffSince.HasValue) { _detailOffSince = Environment.TickCount; return false; }
+            return unchecked(Environment.TickCount - _detailOffSince.Value) >= DetailOffGraceMs;
+        }
+
+        // 吸附收起态下，岛体"展开后"应占的矩形：用于判断光标是否仍压在 Peek 条上
+        private Rectangle EdgeExpandBounds()
+        {
+            var wa = Screen.FromControl(this).WorkingArea;
+            if (VerticalDocked)
+                return new Rectangle(_edgeSide == 1 ? wa.Left : wa.Right - Width, _edgeTargetY, Width, Height);
+            return new Rectangle(_edgeTargetX, wa.Top, Width, Height);
+        }
+
+        // 关面板统一入口：顺带复位看守计数，避免旧时间戳残留导致下次弹出被立刻收掉
+        private void HideDetail()
+        {
+            _hideTimer.Stop();
+            _detailOffSince = null;
+            _detail.Hide();
+        }
+
         protected override void Dispose(bool disposing)
         {
             if (disposing)
@@ -3305,6 +3404,7 @@ namespace QuotaWidget
                 if (_refreshTimer != null) _refreshTimer.Dispose();
                 if (_hideTimer != null) _hideTimer.Dispose();
                 if (_showTimer != null) _showTimer.Dispose();
+                if (_watchdogTimer != null) _watchdogTimer.Dispose();
                 if (_animTimer != null) _animTimer.Dispose();
                 if (_detail != null) _detail.Dispose();
                 if (_ghost != null) _ghost.Dispose();
@@ -3572,6 +3672,13 @@ namespace QuotaWidget
         private System.Windows.Forms.Timer _hideTimer;
         private System.Windows.Forms.Timer _showTimer;
 
+        // 详情面板"看守"定时器：只兜底，不参与唤出/收起的事件配对（详见 FloatingForm 同名成员）
+        private System.Windows.Forms.Timer _watchdogTimer;
+        private int? _detailOffSince;   // 鼠标既不在置顶栏也不在面板内的起始时刻；null = 尚未离开过
+        // 与 FloatingForm 的 WatchdogIntervalMs / DetailOffGraceMs 必须保持一致
+        private const int WatchdogIntervalMs = 250;
+        private const int DetailOffGraceMs = 700;
+
         // ---- 工作区预留 P/Invoke ----
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
         private static extern bool SystemParametersInfo(int uAction, int uParam, ref RECT pvParam, int fuWinIni);
@@ -3673,12 +3780,13 @@ namespace QuotaWidget
             _refreshTimer = new System.Windows.Forms.Timer();
             _refreshTimer.Tick += delegate { _ctx.RefreshData(); };
 
-            _hideTimer = new System.Windows.Forms.Timer { Interval = 350 };
+            // 500ms：与悬浮窗保持一致，避免两条关闭路径延迟差近一倍（详见 FloatingForm 构造函数）
+            _hideTimer = new System.Windows.Forms.Timer { Interval = 500 };
             _hideTimer.Tick += delegate
             {
                 _hideTimer.Stop();
                 if (!Bounds.Contains(Cursor.Position) && !_detail.Bounds.Contains(Cursor.Position))
-                    _detail.Hide();
+                    HideDetail();
             };
 
             _showTimer = new System.Windows.Forms.Timer { Interval = 800 };
@@ -3687,6 +3795,10 @@ namespace QuotaWidget
                 _showTimer.Stop();
                 if (!_dragging && Bounds.Contains(Cursor.Position)) ShowDetail();
             };
+
+            _watchdogTimer = new System.Windows.Forms.Timer { Interval = WatchdogIntervalMs };
+            _watchdogTimer.Tick += delegate { WatchdogTick(); };
+            _watchdogTimer.Start();
         }
 
         // ---- 辅助 ----
@@ -4013,6 +4125,7 @@ namespace QuotaWidget
             ApplyToScreen(targetScreen);
 
             _uiTimer.Start();
+            _watchdogTimer.Start();   // 与 SuspendTimers 成对：切回置顶栏模式时必须重启看守
             UpdateLayered();
         }
 
@@ -4022,6 +4135,9 @@ namespace QuotaWidget
         {
             _uiTimer.Stop();
             _refreshTimer.Stop();
+            _watchdogTimer.Stop();   // 与 ApplyFromConfig 成对，切回本模式时必须重启
+            // 切模式时窗口整体隐藏，详情面板是独立窗口会留在屏幕上，必须一起收掉
+            if (_detail.Visible) HideDetail();
         }
 
         public void Rebuild()
@@ -4078,7 +4194,7 @@ namespace QuotaWidget
             if (e.Button != MouseButtons.Left) return;
             // 拖拽属于移动意图：停掉悬停唤出计时并收起详情面板，拖拽中不再弹出
             _showTimer.Stop();
-            if (_detail.Visible) _detail.Hide();
+            if (_detail.Visible) HideDetail();
             _dragging = true;
         }
 
@@ -4172,6 +4288,33 @@ namespace QuotaWidget
         public void ArmHide() { _hideTimer.Stop(); _hideTimer.Start(); }
         public void CancelHide() { _hideTimer.Stop(); }
 
+        // ---- 详情面板看守（兜底，逻辑与 FloatingForm 一致）----
+        private void WatchdogTick()
+        {
+            if (!_detail.Visible) { _detailOffSince = null; return; }
+            if (ShouldHideStuckDetail()) HideDetail();
+        }
+
+        // 是否满足"鼠标已离开置顶栏和面板、且持续超过缓冲时长"→ 可以收面板
+        private bool ShouldHideStuckDetail()
+        {
+            // Visible：置顶栏被隐藏后（托盘切换 / Alt+F4 走 Hide()），光标可能仍停在原矩形内，
+            // 只按 Bounds 判断会让面板永远收不掉（详见 FloatingForm 同名方法）
+            bool over = _dragging || (Visible && Bounds.Contains(Cursor.Position)) || _detail.Bounds.Contains(Cursor.Position);
+            if (over) { _detailOffSince = null; return false; }
+            // 哨兵必须是 null 而不是 0（原因见 FloatingForm.ShouldHideStuckDetail）
+            if (!_detailOffSince.HasValue) { _detailOffSince = Environment.TickCount; return false; }
+            return unchecked(Environment.TickCount - _detailOffSince.Value) >= DetailOffGraceMs;
+        }
+
+        // 关面板统一入口：顺带复位看守计数，避免旧时间戳残留导致下次弹出被立刻收掉
+        private void HideDetail()
+        {
+            _hideTimer.Stop();
+            _detailOffSince = null;
+            _detail.Hide();
+        }
+
         // Alt+F4 / WM_CLOSE：恢复工作区并转为隐藏（与托盘左键切换行为一致），
         // 避免绕过 UnregisterAppBar 导致系统工作区顶部永久残留一条 bar 高度
         protected override void OnFormClosing(FormClosingEventArgs e)
@@ -4193,6 +4336,7 @@ namespace QuotaWidget
                 if (_refreshTimer != null) _refreshTimer.Dispose();
                 if (_hideTimer != null) _hideTimer.Dispose();
                 if (_showTimer != null) _showTimer.Dispose();
+                if (_watchdogTimer != null) _watchdogTimer.Dispose();
                 if (_detail != null) _detail.Dispose();
                 if (_ghost != null) _ghost.Dispose();
             }
