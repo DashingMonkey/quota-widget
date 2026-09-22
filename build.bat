@@ -25,6 +25,19 @@ if not exist "QuotaWidget.cs" (
   exit /b 1
 )
 
+REM If QuotaWidget.exe is running, kill it first (csc cannot overwrite a locked exe).
+REM WAS_RUNNING remembers the pre-build state; on success only a previously running
+REM instance is restarted. Remove the "if defined WAS_RUNNING" check to always start.
+set "WAS_RUNNING="
+tasklist /FI "IMAGENAME eq QuotaWidget.exe" 2>NUL | findstr /I "QuotaWidget.exe" >NUL
+if not errorlevel 1 (
+  set "WAS_RUNNING=1"
+  echo 检测到 QuotaWidget.exe 正在运行，先关闭 ...
+  taskkill /F /IM QuotaWidget.exe >NUL 2>&1
+  REM wait 1s for handle release (ping delay: timeout.exe fails with redirected stdin)
+  ping -n 2 127.0.0.1 >NUL
+)
+
 echo 编译器: %CSC%
 echo 正在编译 QuotaWidget.exe ...
 echo.
@@ -46,6 +59,11 @@ if errorlevel 1 (
 ) else (
   echo.
   echo [成功] 已生成 QuotaWidget.exe
+  REM restart only if it was running before the build
+  if defined WAS_RUNNING (
+    echo 正在启动 QuotaWidget.exe ...
+    start "" "%~dp0QuotaWidget.exe"
+  )
 )
 
 pause

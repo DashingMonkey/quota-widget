@@ -22,7 +22,7 @@ namespace QuotaWidget
     // ============================= 应用信息 =============================
     internal static class AppInfo
     {
-        public const string Version = "1.1.8";
+        public const string Version = "1.1.9";
 
         // 更新检查双源：Gitee 主源（国内可达性最好、海外也能访问），GitHub 备源，两边同 tag 发版。
         // Gitee API v5 仿 GitHub API 设计，核心字段（tag_name 等）两边一致，解析代码一套通吃
@@ -184,8 +184,7 @@ namespace QuotaWidget
         public double Used;
         public double Remaining;
         public int Percent;            // 已用百分比 0-100
-        public DateTime? ResetLocal;   // 本地时间
-        public bool ResetEstimated;    // 重置时间是否为估算
+        public DateTime? ResetLocal;   // 本地时间（接口未提供则不显示，不做本地估算）
         public bool PercentOnly;       // 仅按百分比展示（接口计数字段不可靠）
         public string Note;            // 附加说明（未启用/已耗尽/周加成等）
         public bool IsMoney;           // 金额展示模式（DeepSeek 余额）：显示金额而非百分比，不画进度条
@@ -202,6 +201,8 @@ namespace QuotaWidget
         public string Error = null;
         public List<QuotaPool> Pools = new List<QuotaPool>();
         public DateTime UpdatedAt = DateTime.Now;
+        // 紧凑位（悬浮窗/灵动岛/托盘）主显池：平时为 5 小时窗口；
+        // 周额度耗尽时由 PromoteExhaustedWeekly 切换为周额度（见该方法注释）
         public QuotaPool Primary5h;
 
         // 悬浮窗/托盘等文本场景的展示名：图标模式显示接口类型名（如"GLM 国内版"）
@@ -252,6 +253,22 @@ namespace QuotaWidget
         public static string FilePath
         {
             get { return Path.Combine(DataDir, "config.json"); }
+        }
+
+        /// 是否已有可用配置：首个"填了 key（明文或密文任一）或可回退本机 CLI 凭证"的供应商即算已配置。
+        /// 判据与 RefreshData 的跳过条件（!HasKey && !CanUseLocalCreds）严格一致 —— 两者不一致时，
+        /// 会出现"启动判定未配置、实际却有供应商在正常查询"的误判，把设置页强塞给已配置好的用户。
+        /// Claude/Codex 无 Key 也能查（自动读本机 Claude Code / Codex CLI 登录凭证），故不能只按 HasKey 判
+        [ScriptIgnore]
+        public bool IsConfigured
+        {
+            get
+            {
+                if (Providers == null) return false;
+                foreach (var p in Providers)
+                    if (p != null && (p.HasKey || p.CanUseLocalCreds)) return true;
+                return false;
+            }
         }
 
         public static Config Load()
@@ -528,13 +545,6 @@ namespace QuotaWidget
             return DateTimeOffset.FromUnixTimeMilliseconds(ms).LocalDateTime;
         }
 
-        public static DateTime NextFiveHourBoundary(DateTime now)
-        {
-            int nextH = (now.Hour / 5 + 1) * 5;
-            if (nextH >= 24) return now.Date.AddDays(1);
-            return now.Date.AddHours(nextH);
-        }
-
         private static DateTime? ParseTimeFlexible(object v)
         {
             if (v == null) return null;
@@ -575,6 +585,26 @@ namespace QuotaWidget
             string k = p.GetKey();
             if (k == null) throw new Exception("密钥无法解密（可能已更换电脑或 Windows 账户），请在设置中重新填写");
             return k;
+        }
+
+        // 周额度耗尽时把主显切到周额度。紧凑位（悬浮窗/灵动岛/竖向岛/托盘）平时固定展示
+        // 5 小时窗口，不按剩余比例中途换池——两个窗口消耗速率不同，切换会让数字看起来
+        // 忽快忽慢；只有周窗口真正用完（此时拦住使用的是周额度，5 小时余量已无意义）
+        // 才切换为周额度的红色 0%，数字变化只表达"被硬顶挡住"这一种含义。
+        // 与 CodexBar 的菜单栏策略一致：固定主窗口，仅耗尽时切换。
+        static void PromoteExhaustedWeekly(ProviderStatus st)
+        {
+            if (st.Primary5h != null && st.Primary5h.Percent >= 100) return;   // 5h 自身已耗尽：同为红 0%，保持稳定
+            foreach (var pool in st.Pools)
+            {
+                if (pool.IsMoney || pool.Note == "未启用") continue;           // 余额无窗口概念；未启用≠耗尽
+                if (!pool.Label.StartsWith("周额度")) continue;
+                // 耗尽要有正向证据：百分比到顶，或计数确实用完（Used>=Total 且 Remaining 不为正）。
+                // 字段缺失时 J.D 返回 0，单凭 Remaining<=0 会把"接口没给 remaining"误判成耗尽
+                bool exhausted = pool.Percent >= 100
+                    || (pool.Total > 0 && pool.Remaining <= 0 && pool.Used >= pool.Total);
+                if (exhausted) { st.Primary5h = pool; return; }
+            }
         }
 
         public static ProviderStatus FetchGlm(ProviderConfig p)
@@ -679,18 +709,11 @@ namespace QuotaWidget
                         var t = ParseTimeFlexible(lim["nextResetTime"]);
                         if (t.HasValue) pool.ResetLocal = t.Value;
                     }
-                    if (is5h)
-                    {
-                        if (!pool.ResetLocal.HasValue)
-                        {
-                            pool.ResetLocal = NextFiveHourBoundary(DateTime.Now);
-                            pool.ResetEstimated = true;
-                        }
-                        if (st.Primary5h == null) st.Primary5h = pool;
-                    }
+                    if (is5h && st.Primary5h == null) st.Primary5h = pool;
                     st.Pools.Add(pool);
                 }
             }
+            PromoteExhaustedWeekly(st);
             st.UpdatedAt = DateTime.Now;
             return st;
         }
@@ -871,11 +894,7 @@ namespace QuotaWidget
                 if (pool.Note == "未启用") continue;
                 if (st.Primary5h == null || pool.Percent > st.Primary5h.Percent) st.Primary5h = pool;
             }
-            if (st.Primary5h != null && !st.Primary5h.ResetLocal.HasValue)
-            {
-                st.Primary5h.ResetLocal = NextFiveHourBoundary(DateTime.Now);
-                st.Primary5h.ResetEstimated = true;
-            }
+            PromoteExhaustedWeekly(st);
             st.UpdatedAt = DateTime.Now;
             return st;
         }
@@ -1010,11 +1029,7 @@ namespace QuotaWidget
                 foreach (var pool in st.Pools)
                     if (pool.Label == "周额度") { st.Primary5h = pool; break; }
             }
-            if (st.Primary5h != null && !st.Primary5h.ResetLocal.HasValue)
-            {
-                st.Primary5h.ResetLocal = NextFiveHourBoundary(DateTime.Now);
-                st.Primary5h.ResetEstimated = true;
-            }
+            PromoteExhaustedWeekly(st);
             st.UpdatedAt = DateTime.Now;
             return st;
         }
@@ -1166,6 +1181,7 @@ namespace QuotaWidget
             AddUtilWindow(st, root, "seven_day", "周额度", false);
             if (st.Primary5h == null && st.Pools.Count > 0) st.Primary5h = st.Pools[0];
             if (st.Pools.Count == 0) throw new Exception("Claude: 响应缺少用量窗口字段（接口可能已变更）");
+            PromoteExhaustedWeekly(st);
             st.UpdatedAt = DateTime.Now;
             return st;
         }
@@ -1238,6 +1254,7 @@ namespace QuotaWidget
             AddCodexWindow(st, rl, "secondary_window", false);
             if (st.Primary5h == null && st.Pools.Count > 0) st.Primary5h = st.Pools[0];
             if (st.Pools.Count == 0) throw new Exception("Codex: 响应中无用量窗口（接口可能已变更）");
+            PromoteExhaustedWeekly(st);
             st.UpdatedAt = DateTime.Now;
             return st;
         }
@@ -1645,7 +1662,7 @@ namespace QuotaWidget
             return n.ToString("#,0.00", CultureInfo.InvariantCulture);
         }
 
-        public static string FmtCountdown(DateTime? reset, bool estimated)
+        public static string FmtCountdown(DateTime? reset)
         {
             if (!reset.HasValue) return "--:--:--";
             var diff = reset.Value - DateTime.Now;
@@ -1655,7 +1672,7 @@ namespace QuotaWidget
                 core = string.Format("{0}天 {1:D2}:{2:D2}:{3:D2}", (int)diff.TotalDays, diff.Hours, diff.Minutes, diff.Seconds);
             else
                 core = string.Format("{0:D2}:{1:D2}:{2:D2}", (int)diff.TotalHours, diff.Minutes, diff.Seconds);
-            return (estimated ? "≈" : "") + core;
+            return core;
         }
 
         // 校验坐标是否落在某个屏幕的可视工作区内（防止跨屏越界导致窗口消失）
@@ -1852,15 +1869,16 @@ namespace QuotaWidget
     }
 
     // ============================= 品牌图标 =============================
-    // 内嵌 64px 透明底 PNG（LobeHub Icons 官方 SVG 经 Edge 无头渲染转换）。
-    // 样式随主题自动切换：浅色用品牌彩色源（Codex 无彩源用黑色单色原样），
+    // 内嵌 64px 透明底 PNG（LobeHub Icons 官方 SVG 经 Edge 无头渲染转换；
+    // GLM 换用官方 zai.svg 的 Z.ai 标志，currentColor 单色造型，24 网格矢量转 64px）。
+    // 样式随主题自动切换：浅色用品牌彩色源（Codex、GLM/Z.ai 等无彩单色源随主题染色），
     // 深色统一白色——有深色彩变体的用变体（Kimi 白 K+蓝点），其余单色源染白。
     internal static class BrandIcons
     {
         class Def { public string Mono, Color, ColorDark; }   // ColorDark：彩色版深色变体（可选，如 Kimi 白 K）
         static readonly Dictionary<string, Def> _defs = new Dictionary<string, Def>
         {
-            { "glm",    new Def { Mono = IC_GLM,      Color = IC_GLM_COLOR } },
+            { "glm",    new Def { Mono = IC_ZAI } },
             { "mx",     new Def { Mono = IC_MINIMAX,  Color = IC_MINIMAX_COLOR } },
             { "kimi",   new Def { Mono = IC_KIMI,     Color = IC_KIMI_COLOR, ColorDark = IC_KIMI_COLOR_DARK } },
             { "ds",     new Def { Mono = IC_DEEPSEEK, Color = IC_DEEPSEEK_COLOR } },
@@ -1907,32 +1925,19 @@ namespace QuotaWidget
             }
         }
 
-        const string IC_GLM =
-            "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAGeElEQVR4nOybd4wVVRTGP8VEwU6wYZAIokjQoK6oYFDBgg1L" +
-            "lERFxYhGEo0lsZclFlCxRFEJ1j9s6CpRgyYKGmzYkKBGiqyIsWAjNuwaPN/eebuzs+e2ebNvSN7+kpN9c+/c92bO3Dnt3u2G" +
-            "crlVZJjIPJTEeiiX/iL/iaxESZStgNJZH3VOlwJQ5xShgN4ir4g0ixyMOPYTGYQ4jhD5VORFkV6okiIUcLLIQTAW/arAMVuK" +
-            "vCwyX+Tj5O8WgWOvFukncmjy21VRhAI+S33+KGxIi6JGpo45Ey4JHLsix+9ZKcoN7i3yt8gHgefPFjky0zYH5qmGcABM7PA5" +
-            "qmQDFMN7iINTPquAdxHOqyiIbigHKozGc4/k+E2RiTCzqKaUHQn2SWQ+SqIrFEbncRjMu/o7zPt9dsTYRpGlImthvMz9Ipui" +
-            "E7DNAPrZFcjPDOg3TOt/tGfs8zDBTpZlIkNE/kQ+dkR7l92CNgMGJReRlzNhf9pHiYy3D8U46DdPdoEJgvLyrMjO2cbOsAHL" +
-            "tB9KQYM33NI3S+Q4x9jlnu+OJsYGbCxyj8hqmHfzcuWczeG/wJ0cff3gZoCl/Ry02YznYK41iBgFXAnjq3smx5PRMZj5B35W" +
-            "OfqWwk2z0ra/yHSYV4TQxtyMQGIUoBmvAzPHtPhvwM1sR9/TcPOU0jZGaRuJQGIU8LXStlppmwD9SVV4wdHXBLuCODuuVdq/" +
-            "Qth1qcQo4IbMMV3KQ8p5NIIMcR+Dzl9ww5k2SeST5HgljFsdKvKHcv4D6JgUaYpSifUCfWGmHKc6n9S3AWNo1Y+HcXHkIpHb" +
-            "USw9kutifjFX5MPQgbUMhWmYLhb5CSadDb7IzqSWCqCLpAfonhzzfV8iskZkAUyGuAY1ptbJED3EcEf/WTBxf82otiAyAqYe" +
-            "SGbCGEAXO3j674MJdi71nLeXSAPMrFoMt2t1kncGMOhgJbh3pv1G6BEioTGchTDoCWw3xWh0YqZtkcgJMNXiKPIqgO9rg6Xv" +
-            "CpEpSvtCtFWAfNhi/sss301oT2JL7B3iAGr2CZjw0gazvQZHPxXQPdPGqR9682QA9Lh/imPMrmhztRqsPDM2OSPdmFbAYJjp" +
-            "NVbkSccXDYObTUQGZtryZHC7ZY739A/Bvo6+R0ROEnkQqQeYNoLphYkf7d/TEgT5yM4AX/SnsRHicRn1dEXp18qH9Aygi+Ir" +
-            "8LjI6bDjK2BSQdkgpxnxLMkcLwwY40rEjoWJPehqW71VXiPIG+pv6eMKz1SlnfXBEQjjC+gukyn59ZYxXGIbjEjyFkVHoy1Z" +
-            "SXM39JsndyAc2zIZE7IZSjtn3BjkoNpI8DSYKg63ubwk8o7n/O/hX9FldjfBcw4t+iEwD5Au81HkpNahMFeAbF6EhpdVpltQ" +
-            "Q4paGwwlbTdokFjkYErNdYPY9cVCqKUCLhTZBiYjZDq8HOsAsYujjP3Hi4yCibtD0leOofG6Jjm+AGZzRAgMbFjsCClxnZuc" +
-            "TwX/jEBibAALjekLp6tiRPWdci4rRyyAjFX6toW7krQ1TLSWrjgzieINrrJ8H11sOtqkgZyLAGLc4PTMMVd1NWvNaf4W9Jsn" +
-            "vqiQq1LZcjtLarzJrZTzT0HHUNuXTrcSo4A+Spu2r4fv+nawM9nRdyfsiRaTo0aEXZdvgaWVGAVoVV4tv3ctbRGG29PQPl/g" +
-            "tOe+4fM8Y09U2mYqbc8gkBgbwOUmGrNTRb6B8ddaWXwtwmDBg+86w1emsaEZI68jm5CNSq6Hq8cPwwRoQXRGIOTKEyrQPjSl" +
-            "jmnpGf42esYxWOqJAtFeARYuFiM/0zz9LI03Zdr4RCchU6xQmIr8MF/YJ9uoxQHMld8W+RL5YD7AqThQ6bsJ7lWbRck4Laub" +
-            "B2Mj/kU+3odJsdttxNIUwBXevDdfgWU1BiM0bvQI9N90mSEZIdcOuXjSC23ehC6Yr03emydcQ+ywC63uN0mVtU+wAkNX1hB/" +
-            "QEmUtV2e9TmWrxgx8r18TWQzlEBZM+A6mAptBeYOv4m8jhpT1AxgrW9cxPna+uBQhMN6YQ8UQBEK4D9JMFFhBHZv4BitwrsA" +
-            "YTBg4oYIWvXoImiWIhQwJPW5b+AYrvCkd3Vw6t8WOPaY5C8TsdGokiLc4PYwiRL/MtGZEziOIe3uML45ZrM0N1veBZNzHA7/" +
-            "zjInXZulUed0KQB1TtmhMA3hhsi/Bb5qyjaCrCj9InI+SuJ/AAAA//+vKs5WAAAABklEQVQDAOpQHGzBb5SsAAAAAElFTkSu" +
-            "QmCC";
+        const string IC_ZAI =
+            "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMA" +
+            "AA7DAcdvqGQAAAMASURBVHhe7Zs5zE1RFIUXibEhEUNlTFAIGnNpjCjQiAQ1ekOhQiISiaGgMUWFgoixM1WGRkJnqIgCEQoKQpac" +
+            "l5ys7Pca+2w7cb9k5S/+s9/a/333nnPv+s8FOjo6Ojr6sgPAeQBnGuhs+TlOTSsOAzhn1HroAoB9alizGsCvxjoCYKgaF/Yb4721" +
+            "Tk17TATwzijw1B01rVhhjPfWLjWtuWUUeOo9gElqWpgA4K1R46kbalqzxyjw1ho1rWBzOt5TPLjj1bTHMgA/jSJPHVLTCp6WOt5b" +
+            "vLxMxgJ4YxR46uGASW8JgB9Gjac4sZqMAHDbKPDUJwDT1LgwBsBLo8ZTd9W0ZjSAtQCWN9QsNa24aDTsqQ8AJqtpFrYbDXtrvZpm" +
+            "YS6A70bDnjqqplkYBeC50bCnHgMYpsZZOG007KmvAGaqaRa2GA17ix4p4bfyxWjYUzy7UsLrkdelNuypF2VZTwlnZG3YU98AzFPT" +
+            "LHAt1oa9xQAnJbwL492YNuypS2qahSEA7hkNe+pVeZ5ISetoi0+QS9U0CxHR1m41zUJEtHVTTTMREW3xIKeEp6U27K2VapoFTkit" +
+            "o60DapqFiGiLSyqX1pS0jrY+Zo62eBuqDXtrg5pmgQ8graOtY2qahYho68n/Hm0NitT/KRHR1lY1zUJEtMWNDCnpoi2jYU9xRZmv" +
+            "plmIiLZ2qmkWIqKty2qahYho63XZp5CS1tEWd6Zwh0pKIqKtvWqahYhoi7vS0tI62uJ+RO5LTElEtLVKTbMQEW0dVNMsRERb9wdE" +
+            "W9MBLAawoIEWlc/ut13vD62jLW6Zm6KmBT768vda4yneyvc7+CHR1kY1LQwH8NQY76lHxcckIto6rqYVJ4zxnvoMYIaa9oiItvjt" +
+            "9jv6PCt0vLc2qWlNRLQ1W00LUwOu+1NqWhMRbW1T0wJn4wfGeE89AzBSjXssNAq8xfd+LPjHnzTGe4pz2hw1ruGLQ/w385UGulZe" +
+            "uuoXbXEpvA7gqlH7t+Jn0n+zmmai71rc0dHREcFvfnykuaHXaTsAAAAASUVORK5CYII=";
 
         const string IC_MINIMAX =
             "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAE6UlEQVR4nOxbWYgdRRQ9Mwb3Ne4BEcRkjBqi4o7LfLjjEhcQ" +
@@ -2072,41 +2077,6 @@ namespace QuotaWidget
             "+BWoMoIpEPXtrOC7r6h5j//aDBdLHw+d37vG/eQUMJ/kJi6UklQdofSHlLUwqKYFwQg6v1uHEEVOhBOmcsSJU1fMffrGBgh/" +
             "17pxojy+8U19HsPzSaWvVx/YFF2bGBhEvvcZq/5ARkddcp36RBsV6AfEFKTCZ6gdiBMOUfi/pb43Dza1BMQguSK3eI5Cr35U" +
             "Zh0ZJL0JOruXasB4KBngQXiMgcOG8I9TbHy5Rhj3AwAA//9U1hhvAAAABklEQVQDAFqzHWP+HZgfAAAAAElFTkSuQmCC";
-        const string IC_GLM_COLOR =
-            "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAJGklEQVR4nOxbD5CVVRX/3fe9ZXdZHI0pJRrQMMFp1OHP/gPK" +
-            "yLIcdUms/fMWMEtspGzCZiRUHBknMAUto3AoJWdAd5dNspBqSiomWXi7bNNQogKV1ZhpGSmwiPu+d/zdx+7n99735933Z99z" +
-            "ZvnNvHnvu98999x77rnnnnPufRGUEY0xub+xTVahjIiijBhMYkOFgo0yQmGUI4JRjtMCwChHwUZwRptMHKOwRQkmI4mb9m5V" +
-            "T5vS1sdktkrg9Xi3OmBK09AuV0Kwnp/DCYWF/R3qvygABWvAGKCdlvTjNKfnw8JKE5qL2+U9DTHZSeY9Kopn+btn+jVylgkt" +
-            "hXwn+U1RCp+qELSjQBS+BBT+5vwW/MmEpEawkoO47J0mMLuyCstNaFn3rw67pBm/MBQsgHiHesJOoj6ZxPS9neqrJjQimOYp" +
-            "VKiFAchjIYUwL6JwXnyr+i0KRFEcob4u1ZdLfdGqD1zlLuNzryn9ng61C0VCWXaBV6vwALVgk1Mg2G0dx70oA8rqCda1ySR+" +
-            "TerrVD0oE0a9KzxiwVB9u3yavsHt/NTx8c9U+YfjXeoHJrSMEO8ShRhnZxqXx4ss2mkN4JbdP1NHUWT42oDadpmCAtDQJhsj" +
-            "gl9yAJdSx6r5qVMRbOTAtmeljckO1l+VGrwGrT0/NyRq0Hfe9VKFPFHfLB/0K/cIoKFZPhwV7EC+jNrkBjopX/J9qXA1hXB9" +
-            "EC0Hv4gDv9KfFNMmvIk7kSciUfy0vlWm+rRbXHD2X6AApgZWEPRwL5/r94rC2cYeLQgmxSH6HcFt5wFjG3DJYqkZO4i1/NnK" +
-            "To5nZ25nZ+5x15nVLGeGDl5D4UNBr0S7uAgjxQV+5dS6m8h32dCy2T4QRWz/ZnUcBjD2A6oHcQd7sFQPfqgza8g4zZnBmxjM" +
-            "1g6N4cshr59HKDEOZxZx2XyEXuFDjs0AmqoTuA+GMBYAGTT5lM1zP/dvVwOcxWdC21F4KugdhfNECCm4M/zYp3i+h4crzsgG" +
-            "YwFwYP+Cl9NrmUV2Akv8Zsp5L/h50LveLtVN2iABPR9J4G5PaRIvwdvZ12AIYwEw2FmdxkNSUeCPMuvt61YvvGFjBjvxuF87" +
-            "kQhOIgQ0kE2kXcX2D55ihBcp/I10lev3dKsTmfWPJvEIv/6e0be7YYicdoE57XJuUjCfnwGtyjSCr2SjoZ1YwLrXktEi/Uza" +
-            "r/d2qm+jiJjVJGOjYzGfPCZKBE+zX/tNaUvmCtNY3Udmt3I2/8/Hj+XSyZFEyQSgt8gKizuA9gw1BN00as9RIMeUjX1HBX0H" +
-            "utUxlBglDYbo6DxDjnNDqty4t0M9jBKioGCorkUutSLMBxIJG53aAIbV52xPziLxHza2ygV7u9Q3wioxMTqLhq6WFvxMGucD" +
-            "3D2eQp7ISwNqm2Va1MJvSD3RXc4Bfotr+zY/Gm0M6bBsgwE4qKagQVGLNqQcsnS+f0wk8bn+LvUX5Ii8MkKWhS2Zg9egNFfQ" +
-            "2N0WwMg4kGHk+IBfOdtekTn4Ib7TecaYNdL05eV+oPotZU/nUaLrOZO+Hp2O9jiTwetUUkbtbPeeTQM4uSKavldnAw3k1Pjj" +
-            "6lBa/2JU/DAaYDH7vcXvXeoMAtBJ21+zjuO/OBpQ2yoX8WkDf7bwszWICRuZgzAojBu0cKG7qCJbgOTXjI2L3c+cnJlZiQSN" +
-            "ge2BhzdIJVk2cRKdDLQjABoz98HEkZCGBpAFrFPtfk5m8f78kFTIPfmhgo06M1NnOG3bcDJLjgC0ytNLW0o16qCifR7BHQtN" +
-            "YJJ24LiNNCfHjgbHBoF8gOfcz9wZ/mBAFhiI2cA12vfgzxvdu1VeuwAt8eHUUZgP2PHlvR1qbWY5DdiuVIrMABTiP+OdarKH" +
-            "b0zu4Nc3fWmAZzmJFyFH5LULcH1e4QQr7k4Ivu83+BRNEg/CFOJ/TEYnabUOjLzVsd9W3rDYBAV5gsz8XhdJYgo7QP74FSO5" +
-            "eFh9asF/WO+9oY0KHmE7S8KqDFn0y7muI6x/iMvjMeSJUrvCu8kxaBc5Qg1aQ9VfhxKipJekuLef70hcB0OnUmCv0Pj25nq+" +
-            "WCyUTADce2/h4M/hoHVEqMPhQ3gXICcB6NsglQqf5SDGJSw82r9FvWxIswKnvDA98ytNB9/QKo3k9T/GBQez1WXO/2Z6qJFB" +
-            "G0/2d6t/wBDGNoCG5zJuGTuHn/VWZZ1Ebc9P1KuZdYcyRzoz25L5jgOaEJZJmrNAzrYrsYlZpKtcRNsGo7jZT+B1zTIhYmFX" +
-            "WjrexuWmV3XMs8KCh9KeFSYlKuGx1rT05zDxuQc+g9c4eSLcK+Tgd6QNPsUM10Zt7JrRLO/LrM8Tn4WeswgLoeF0Gr1pRarK" +
-            "JE+ZgudeDzVDr/X3B7VTVYU1Qe/o6HxXBdwU0YciYyzc5fPK0y99wAJD5OIIebO8SW98z44GHm0NVVjK7XD97GZx4gWt9vre" +
-            "MIbtRBCpQrNPHzq9LPAkDGFsA/TRGE9cVnMpLOZ29m8WrXOHlcPIFrI6YP6fbvMmdkC7r4uUYcQ4eAw1+gDGXVbXJp+gAVyn" +
-            "8wLkvpm+xHUwRNEdobA4YRjM+LSkDkGGoNPaFTV0f5WvirtxhO7weBQRniVQ2yYzOAjji4uZEH2JMfz9re7Ba+gZpfu7ilrx" +
-            "hVBaYC3yBDVzP8fVkFnuEcBbFTjITn4ReSLepR6UgDXIrfHeMFeXQniUtJ2+LwW/49HYd5AnuMSWWAPwTOyIxQLcDpdpe0EO" +
-            "M7X3R0bLqL5bs9Fp45i08BWdvdG0qUJuwRTOlzECOP1/AZQR2tWdFZMLUUaURQPmzpcz7LH4xfApEW3O7+m9XR1/TL2BEqMs" +
-            "GmBXY6X7iIwG6qPMGBndMy42iiIAfUSmb3gZE/icD1IL6mEIfc6gfQcUAQULoLFFPmnpaAzY3NAmRhchKQC/DO8+mPCLyXJ9" +
-            "yBIdh5dSZxkFomABSATTXY/nmtDw4ETfLnNOirQNOFHhfxzmZYjP6C8K/CxL4QoUiIIzQhEbHckomrjnf4C9Msrn6bie+/1M" +
-            "sXAJ8/Vv5XJZms7UPfT7v0dBSCLkwpUpTvsBGOU4LQCMcpRVADSE443/LjdCKOu/x7kL3F9pQbu/X0OZ8DYAAAD//6puvfcA" +
-            "AAAGSURBVAMAhtIN1bNKO8EAAAAASUVORK5CYII=";
         const string IC_MINIMAX_COLOR =
             "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAKt0lEQVR4nOxaDZBWZRU+573fLrDAAstP2w4byYDE34haNCB/" +
             "jkhjtEEoZqBIhmaWIJCNjg1jpQ3TDxk4TcOkAqaJMJAwRA5sAWYUECYOIpo5QvwvP7urBLvffU/nvb/v/fnu9613P5ZmPczy" +
@@ -2295,6 +2265,25 @@ namespace QuotaWidget
             }
         }
 
+        // ---- 首启自动打开设置 ----
+        // 一个可用供应商都没有时（config.json 不存在、被清空、供应商被删光，或文件损坏后回退默认），
+        // 悬浮窗只会显示"正在获取"再变成一行错误提示，用户不知道下一步该做什么，只能自己摸到右键菜单；
+        // 此处直接把设置页推到最前。配置成功保存后 SettingsForm 会调 ApplyConfig → RefreshData，
+        // 一切照旧；若用户没配置就关掉设置页，悬浮窗仍以它原有的未配置样式留在屏幕上（托盘也可再唤出）。
+        private bool _autoOpenedSettings;
+        internal bool IsConfigured { get { return Cfg.IsConfigured; } }
+
+        // 延后到消息循环真正跑起来之后再显示：构造期 Show() 出来的窗口虽然能正常绘制/命中，
+        // 但排在它前面的 Floating/HoverTip 等窗口在 Run 启动时还会被 MainForm 逻辑再显示一次，
+        // 有盖住设置页的风险。BeginInvoke 排队到消息队列，天然在所有启动期显示动作之后执行
+        private void AutoOpenSettingsOnce()
+        {
+            if (_autoOpenedSettings || _exiting) return;   // 回调出队前用户可能已从托盘退出
+            _autoOpenedSettings = true;
+            if (IsConfigured) return;   // 出队前已通过其它入口配置好（保险，避免设置页重复弹出）
+            ShowSettings();
+        }
+
         public AppContext()
         {
             Cfg = Config.Load();
@@ -2367,7 +2356,17 @@ namespace QuotaWidget
             if (Providers.Count == 0)
                 Providers.Add(new ProviderStatus { Name = "正在获取", Type = "glm" });
             ShowActiveForm();
-            RefreshData();
+            // 未配置时没有任何请求可发：跳过首轮刷新。RefreshData 会把构造期铺好的占位行换成
+            // Name="未配置" + Error="右键 → 设置，添加供应商" 的报错态，托盘提示也随之变成
+            // "未配置连接失败"；保留占位行并改写托盘提示，指向真正该做的下一步
+            if (IsConfigured) RefreshData();
+            else
+            {
+                Tray.Text = "AI 额度工具 v" + AppInfo.Version + " · 未配置，右键打开设置";
+                // 延后到消息循环跑起来之后再显示，避开启动期各窗口的显示顺序（见 AutoOpenSettingsOnce）
+                try { Floating.BeginInvoke((Action)AutoOpenSettingsOnce); }
+                catch { AutoOpenSettingsOnce(); }   // 句柄异常时直接打开，别把唯一入口整个吃掉
+            }
             // 任何退出路径（含未处理异常对话框选"退出"）都兜底恢复工作区；RestoreWorkArea 以
             // _originalLoaded 哨兵保证幂等，正常退出链路已恢复过时此处为空操作
             Application.ApplicationExit += delegate
@@ -2378,7 +2377,12 @@ namespace QuotaWidget
 
         public void ShowSettings()
         {
-            if (_settings == null || _settings.IsDisposed) _settings = new SettingsForm(this);
+            // 关闭即解除引用：否则 ApplyConfig 等处读已释放实例的 Visible 会抛 ObjectDisposedException
+            if (_settings == null || _settings.IsDisposed)
+            {
+                _settings = new SettingsForm(this);
+                _settings.FormClosed += delegate { _settings = null; };
+            }
             _settings.Show();
             _settings.Activate();
         }
@@ -2411,6 +2415,14 @@ namespace QuotaWidget
             Config.SetAutoStart(Cfg.AutoStart);
             ShowActiveForm();
             RefreshData();
+            // 保存后变得无可查询供应商（把最后一个供应商删掉并保存）：别让窗口停在"正在获取"，
+            // 把设置页重新推到前面（此时设置窗正在 Close，_settings 会被置为新实例），
+            // 用户才有下一步可走。首次打开时用户尚未点过保存，不会命中这里
+            if (!IsConfigured && (_settings == null || _settings.IsDisposed || !_settings.Visible))
+            {
+                UpdateTrayTip();
+                ShowSettings();
+            }
         }
 
         // 根据当前 DisplayMode 显示对应窗口，隐藏另一个；
@@ -3646,7 +3658,7 @@ namespace QuotaWidget
                             g.DrawString(nums, fs[2], b, Si(36), y);
                         if (pool.ResetLocal.HasValue)
                         {
-                            string cd = "重置 " + St.FmtCountdown(pool.ResetLocal, pool.ResetEstimated);
+                            string cd = "重置 " + St.FmtCountdown(pool.ResetLocal);
                             var csz = g.MeasureString(cd, fs[2]);
                             using (var b = new SolidBrush(St.Dim))
                                 g.DrawString(cd, fs[2], b, Width - csz.Width - Si(18), y);
@@ -4810,8 +4822,10 @@ namespace QuotaWidget
             Controls.Add(_txtName);
             // 单行 TextBox 高度跟随字体，垂直居中在输入框内；边框由 OnPaint 画
             _txtKey.Bounds = new Rectangle(_rcKeyBox.X + S(10), _rcKeyBox.Y + (S(34) - _txtKey.PreferredHeight) / 2, _rcKeyBox.Width - S(20), _txtKey.PreferredHeight);
-            _txtKey.GotFocus += delegate { Invalidate(); };
-            _txtKey.LostFocus += delegate { Invalidate(); };
+            // 空 Key 框在未聚焦时是隐藏的（见 UpdateKeyBox），打开对话框自动聚焦会跳过它，占位提示得以显示
+            _txtKey.GotFocus += delegate { UpdateKeyBox(); Invalidate(); };
+            _txtKey.LostFocus += delegate { UpdateKeyBox(); Invalidate(); };
+            _txtKey.TextChanged += delegate { UpdateKeyBox(); };
             _txtName.GotFocus += delegate { Invalidate(); };
             _txtName.LostFocus += delegate { Invalidate(); };
 
@@ -4833,6 +4847,22 @@ namespace QuotaWidget
                 _txtName.Text = existing.Name;
             }
             ApplyLayout();
+            UpdateKeyBox();
+        }
+
+        // Key 框占位提示的显隐：空且未聚焦时隐藏输入框，露出 OnPaint 画的占位文字。
+        // .NET Framework 的 TextBox 无 PlaceholderText，且密码掩码下系统 cue banner 不显示，只能自绘
+        private void UpdateKeyBox()
+        {
+            _txtKey.Visible = _txtKey.Text.Length > 0 || _txtKey.Focused;
+        }
+
+        private string KeyHint()
+        {
+            string t = TypeIconTypes[_typeIndex];
+            if (t == "codex") return "留空自动读取本机 Codex 登录凭证";
+            if (t == "claude") return "留空自动读取本机 Claude 登录凭证";
+            return "请输入 API Key";
         }
 
         // 字段纵向节奏：组间距 12（上组输入框→下组 Label），组内 Label→输入框 8，控件→按钮区 16。
@@ -4911,6 +4941,11 @@ namespace QuotaWidget
             PaintSelectBox(g, _rcSelect, TypeItems[_typeIndex], _hotSelect, TypeIconTypes[_typeIndex]);
             DrawFieldLabel(g, "API Key", S(46) + S(84));
             DrawFieldBox(g, _rcKeyBox, _txtKey.Focused);
+            // 占位提示：输入框隐藏（空且未聚焦）时才可见，聚焦后由真实输入框覆盖
+            if (_txtKey.Text.Length == 0)
+                TextRenderer.DrawText(g, KeyHint(), Fs[1],
+                    new Rectangle(_rcKeyBox.X + S(10), _rcKeyBox.Y, _rcKeyBox.Width - S(20), _rcKeyBox.Height),
+                    Pal.Text3, TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
             DrawFieldLabel(g, "显示方式", S(46) + S(158));
             PaintSegmented(g, _rcSeg);
             if (_showName)
@@ -4999,6 +5034,8 @@ namespace QuotaWidget
             }
             if (_rcOk.Contains(e.Location)) { OnOk(); return; }
             if (_rcCancel.Contains(e.Location)) { Close(); return; }
+            // Key 框空且未聚焦时输入框是隐藏的（露占位提示），点击需代为聚焦
+            if (_rcKeyBox.Contains(e.Location)) { _txtKey.Visible = true; _txtKey.Focus(); return; }
             // 点击输入框以外区域让文本框失焦，边框恢复常态
             if (!_rcKeyBox.Contains(e.Location) && !_rcNameBox.Contains(e.Location))
                 ActiveControl = null;
