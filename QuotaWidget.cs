@@ -1,4 +1,4 @@
-// QuotaWidget - AI 额度工具 (GLM Coding Plan / MiniMax Token Plan / Kimi Code Plan / DeepSeek 余额)
+﻿// QuotaWidget - AI 额度工具 (GLM Coding Plan / MiniMax Token Plan / Kimi Code Plan / DeepSeek 余额)
 // 编译: csc.exe /nologo /utf8output /target:winexe /optimize+ /win32icon:QuotaWidget.ico /out:QuotaWidget.exe QuotaWidget.cs /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll
 using System;
 using System.Collections;
@@ -91,16 +91,30 @@ namespace QuotaWidget
         // config.json 被其他软件扫描/拷走到别的电脑均无法还原
         public string KeyEnc { get; set; }
         public string Name { get; set; }     // 显示名称
-        // 悬浮窗/置顶栏展示方式：false(默认)=图标模式（品牌图标+外圈环形进度+百分比）；
+        // 悬浮窗展示方式：false(默认)=图标模式（品牌图标+外圈环形进度+百分比）；
         // true=名称模式（显示自定义名称）。旧配置无此字段，加载时按是否自定义过名称推断
         public bool ShowName { get; set; }
+        public bool Enabled { get; set; } // 关闭后保留配置，跳过查询与展示；旧配置默认启用。
+        public int RefreshSec { get; set; } // 0=跟随通用设置；其他值为供应商独立间隔。
+        public CustomApiConfig Custom { get; set; }
+        internal Guid RuntimeId = Guid.NewGuid(); // 编辑、排序后仍能找到同一接口的查询状态，不写入配置。
+        internal DateTime NextRefreshUtc;
+        internal DateTime CooldownUntilUtc;
+        internal DateTime LastFetchUtc;
+        internal List<ProviderStatus> LastResults;
+
+        public int EffectiveRefreshSec(int globalSeconds) { return Math.Max(15, Math.Min(86400, RefreshSec > 0 ? RefreshSec : globalSeconds)); }
+        public bool IsRefreshDue(DateTime now) { return now >= NextRefreshUtc; }
+        [ScriptIgnore]
+        public string IconType { get { return Type == "custom" ? (Custom == null || string.IsNullOrEmpty(Custom.IconType) ? "custom" : Custom.IconType) : Type; } }
 
         // 各接口默认显示名（与设置对话框 TypeItems 顺序一致）；编辑对话框与旧配置迁移共用
-        internal static readonly string[] TypeDefaultNames = { "GLM", "GLM", "MiniMax", "MiniMax", "Kimi", "DeepSeek", "Claude", "Codex" };
+        internal static readonly string[] TypeDefaultNames = { "GLM", "GLM", "MiniMax", "MiniMax", "Kimi", "DeepSeek", "Claude", "Codex", "自定义接口" };
 
         /// type+region → 接口下拉项索引（编辑对话框预填/保存与旧配置迁移共用）
         internal static int TypeIndex(string type, string region)
         {
+            if (type == "custom") return 8;
             if (type == "codex") return 7;
             if (type == "claude") return 6;
             if (type == "ds") return 5;
@@ -117,12 +131,13 @@ namespace QuotaWidget
             if (type == "ds") return "DeepSeek";
             if (type == "claude") return "Claude Pro/Max";
             if (type == "codex") return "Codex (ChatGPT 套餐)";
+            if (type == "custom") return "自定义接口";
             return type;
         }
 
         /// 悬浮窗/托盘等处的展示文本：图标模式用接口类型名（自定义名仅在名称模式下展示）
         [ScriptIgnore]
-        public string DisplayName { get { return ShowName ? Name : TypeDisplay(Type, Region); } }
+        public string DisplayName { get { return ShowName || Type == "custom" ? Name : TypeDisplay(Type, Region); } }
 
         // 可选熵：恒定值（改动会让历史密文全部失效），提高离线盲解门槛
         private static readonly byte[] Entropy = Encoding.UTF8.GetBytes("QuotaWidget.ApiKey.v1");
@@ -130,7 +145,7 @@ namespace QuotaWidget
         private string _plainCache;
         private bool _plainLoaded;
 
-        public ProviderConfig() { Type = "glm"; Region = "cn"; Key = ""; KeyEnc = ""; Name = "GLM"; }
+        public ProviderConfig() { Type = "glm"; Region = "cn"; Key = ""; KeyEnc = ""; Name = "GLM"; Enabled = true; }
 
         /// 是否配置了 key（旧明文字段或密文任一存在）
         [ScriptIgnore]
@@ -162,7 +177,22 @@ namespace QuotaWidget
             Key = "";
         }
 
-        public ProviderConfig Clone() { return new ProviderConfig { Type = Type, Region = Region, Key = Key, KeyEnc = KeyEnc, Name = Name, ShowName = ShowName }; }
+        public ProviderConfig Clone() { return new ProviderConfig { RuntimeId = RuntimeId, Type = Type, Region = Region, Key = Key, KeyEnc = KeyEnc, Name = Name, ShowName = ShowName, Enabled = Enabled, RefreshSec = RefreshSec, Custom = Custom == null ? null : Custom.Clone() }; }
+
+        internal bool HasSameQuery(ProviderConfig other)
+        {
+            if (other == null || Type != other.Type || Region != other.Region) return false;
+            if ((KeyEnc != other.KeyEnc || Key != other.Key) && GetKey() != other.GetKey()) return false;
+            if (Type != "custom") return true;
+            if (Custom == null || other.Custom == null) return Custom == other.Custom;
+            if (Custom.HttpMethod != other.Custom.HttpMethod || (Custom.HttpMethod == "POST" && Custom.GetBody() != other.Custom.GetBody())) return false;
+            // 名称和图标只影响展示；请求与取值规则变化后不能继续套用旧额度。
+            var a = Custom.Clone(); var b = other.Custom.Clone();
+            a.IconType = b.IconType = a.DisplayName = b.DisplayName = a.BodyEnc = b.BodyEnc = "";
+            a.Method = b.Method = Custom.HttpMethod;
+            var ser = new JavaScriptSerializer();
+            return ser.Serialize(a) == ser.Serialize(b);
+        }
 
         [ScriptIgnore]
         public string TypeName
@@ -175,8 +205,478 @@ namespace QuotaWidget
         // 未配置 key 不等于不可查询，刷新循环不应跳过
         [ScriptIgnore]
         public bool CanUseLocalCreds { get { return (Type == "claude" || Type == "codex") && !HasKey; } }
+
+        // 首屏、自动刷新和连接测试统一使用此条件，禁用时不读取本机登录凭证。
+        [ScriptIgnore]
+        public bool CanQuery { get { return Enabled && (Type == "custom" ? Custom != null && !string.IsNullOrWhiteSpace(Custom.Url) : HasKey || CanUseLocalCreds); } }
     }
 
+    internal class CustomQuotaRule
+    {
+        public string Name { get; set; }
+        public string ValuePath { get; set; }
+        public string TotalPath { get; set; }
+        public string ResetPath { get; set; }
+        public string Mode { get; set; }
+        public bool IsRemaining { get; set; }
+        public bool Fraction { get; set; }
+        public double Multiplier { get; set; }
+        public string Currency { get; set; }
+        public CustomQuotaRule()
+        { Name = ValuePath = TotalPath = ResetPath = ""; Mode = "percent"; IsRemaining = true; Multiplier = 1; Currency = "$"; }
+        public CustomQuotaRule Clone() { return (CustomQuotaRule)MemberwiseClone(); }
+        public void Validate()
+        {
+            if (string.IsNullOrWhiteSpace(Name)) throw new Exception("请先填写额度名称");
+            if (Mode != "percent" && Mode != "balance" && Mode != "usedTotal") throw new Exception("请选择额度类型");
+            if (string.IsNullOrWhiteSpace(ValuePath)) throw new Exception("请拖入或填写数值路径");
+            if (Mode == "usedTotal" && string.IsNullOrWhiteSpace(TotalPath)) throw new Exception("请拖入或填写总量路径");
+            if (Mode == "balance" && (double.IsNaN(Multiplier) || double.IsInfinity(Multiplier) || Multiplier <= 0)) throw new Exception("倍率必须大于 0");
+            JsonFieldPath.Tokens(ValuePath); JsonFieldPath.Tokens(ResetPath);
+            if (Mode == "usedTotal") JsonFieldPath.Tokens(TotalPath);
+        }
+    }
+
+    // 自定义接口采用字段路径映射，不执行用户代码。请求头整体沿用 ProviderConfig.KeyEnc 加密保存。
+    internal class CustomApiConfig
+    {
+        public string Url { get; set; }
+        public string Method { get; set; }
+        public string BodyEnc { get; set; }
+        [ScriptIgnore]
+        public string HttpMethod { get { return string.IsNullOrWhiteSpace(Method) ? "GET" : Method.Trim().ToUpperInvariant(); } }
+        public string GetBody() { return new ProviderConfig { KeyEnc = BodyEnc }.GetKey(); }
+        public void SetBody(string body)
+        {
+            var encrypted = new ProviderConfig(); encrypted.SetKey(body); BodyEnc = encrypted.KeyEnc;
+        }
+        public string IconType { get; set; }
+        public string DisplayName { get; set; } // 留空时跟随接口名称；填写后独立保存。
+        public List<CustomQuotaRule> Rules { get; set; } // 每套规则使用相对响应根的固定路径。
+
+        public CustomApiConfig()
+        {
+            Url = ""; Method = "GET"; BodyEnc = ""; IconType = "custom";
+            Rules = new List<CustomQuotaRule>();
+        }
+        public CustomApiConfig Clone()
+        {
+            var copy = (CustomApiConfig)MemberwiseClone();
+            if (Rules != null) copy.Rules = Rules.ConvertAll(rule => rule == null ? null : rule.Clone());
+            return copy;
+        }
+        public void ValidateRequest()
+        {
+            if (HttpMethod != "GET" && HttpMethod != "POST") throw new Exception("请求方式请选择 GET 或 POST");
+            Uri uri;
+            if (!Uri.TryCreate(Url, UriKind.Absolute, out uri) || (uri.Scheme != "http" && uri.Scheme != "https") || !string.IsNullOrEmpty(uri.UserInfo) || !string.IsNullOrEmpty(uri.Fragment))
+                throw new Exception("请输入完整的 HTTP / HTTPS 数据接口地址");
+        }
+        public void Validate()
+        {
+            ValidateRequest();
+            if (Rules != null)
+            {
+                if (Rules.Count == 0 || Rules.Count > 100) throw new Exception("请保留 1 到 100 套额度规则");
+                for (int i = 0; i < Rules.Count; i++)
+                {
+                    if (Rules[i] == null) throw new Exception("额度规则不能为空");
+                    try { Rules[i].Validate(); }
+                    catch (Exception ex) { throw new Exception("第 " + (i + 1) + " 套规则：" + ex.Message); }
+                }
+                return;
+            }
+            throw new Exception("请添加额度规则");
+        }
+    }
+
+    internal static class JsonFieldPath
+    {
+        public static string Append(string parent, string key)
+        {
+            if (System.Text.RegularExpressions.Regex.IsMatch(key, @"^[\p{L}_$][\p{L}\p{N}_$]*$")) return parent + "." + key;
+            return parent + "[" + new JavaScriptSerializer().Serialize(key) + "]";
+        }
+        private static string DecodeKey(string key)
+        {
+            var result = new StringBuilder();
+            for (int i = 0; i < key.Length; i++)
+            {
+                char c = key[i];
+                if (c != '\\') { result.Append(c); continue; }
+                if (++i >= key.Length) throw new Exception("字段名称的转义不完整");
+                c = key[i];
+                if (c == '\\' || c == '\'' || c == '"' || c == '/') result.Append(c);
+                else if (c == 'n') result.Append('\n');
+                else if (c == 'r') result.Append('\r');
+                else if (c == 't') result.Append('\t');
+                else if (c == 'b') result.Append('\b');
+                else if (c == 'f') result.Append('\f');
+                else if (c == 'u')
+                {
+                    ushort code;
+                    if (i + 4 >= key.Length || !ushort.TryParse(key.Substring(i + 1, 4), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out code))
+                        throw new Exception("字段名称的 Unicode 转义不完整");
+                    result.Append((char)code); i += 4;
+                }
+                else throw new Exception("字段名称包含无效转义");
+            }
+            return result.ToString();
+        }
+        // 兼容 result.data.value、data.items[0].value、result["a-b"]；不求值 JS 表达式。
+        public static List<object> Tokens(string path)
+        {
+            string s = (path ?? "").Trim();
+            if (s == "result" || s == "$") s = "";
+            else if (s.StartsWith("result.") || s.StartsWith("result[")) s = s.Substring(6);
+            else if (s.StartsWith("$.") || s.StartsWith("$[")) s = s.Substring(1);
+            if (s.StartsWith(".")) s = s.Substring(1);
+            var tokens = new List<object>();
+            int pos = 0;
+            while (pos < s.Length)
+            {
+                var match = System.Text.RegularExpressions.Regex.Match(s.Substring(pos),
+                    pos == 0 ? @"^(?:([\p{L}_$][\p{L}\p{N}_$]*)|\[(\d+)\]|\['((?:[^'\\\r\n]|\\.)*)'\]|\[""((?:[^""\\\r\n]|\\.)*)""\])"
+                             : @"^(?:\.([\p{L}_$][\p{L}\p{N}_$]*)|\[(\d+)\]|\['((?:[^'\\\r\n]|\\.)*)'\]|\[""((?:[^""\\\r\n]|\\.)*)""\])");
+                if (!match.Success) throw new Exception("字段路径格式不正确：" + path + "（例如 result.data.value 或 items[0].value）");
+                int index;
+                if (match.Groups[2].Success)
+                {
+                    if (!int.TryParse(match.Groups[2].Value, out index)) throw new Exception("数组下标过大");
+                    tokens.Add(index);
+                }
+                else tokens.Add(match.Groups[1].Success ? match.Groups[1].Value : DecodeKey(match.Groups[3].Success ? match.Groups[3].Value : match.Groups[4].Value));
+                pos += match.Length;
+            }
+            return tokens;
+        }
+        public static object Get(object root, string path)
+        {
+            object value;
+            return TryGet(root, path, out value) ? value : null;
+        }
+        public static bool TryGet(object root, string path, out object value)
+        {
+            value = root;
+            foreach (object token in Tokens(path))
+            {
+                if (token is int)
+                {
+                    var list = value as IList;
+                    int n = (int)token;
+                    if (list == null || n >= list.Count) { value = null; return false; }
+                    value = list[n];
+                }
+                else
+                {
+                    var dict = value as Dictionary<string, object>;
+                    if (dict == null || !dict.TryGetValue((string)token, out value)) { value = null; return false; }
+                }
+            }
+            return true;
+        }
+        public static object Optional(object root, string path) { return string.IsNullOrWhiteSpace(path) ? null : Get(root, path); }
+        public static string Text(object root, string path)
+        {
+            object value = Optional(root, path);
+            return value is string ? (string)value : value == null || value is IDictionary || value is IList ? "" : Convert.ToString(value, CultureInfo.InvariantCulture);
+        }
+        public static double Number(object value, string path)
+        {
+            double number;
+            if (value == null || value is bool || !double.TryParse(Convert.ToString(value, CultureInfo.InvariantCulture), NumberStyles.Float, CultureInfo.InvariantCulture, out number)
+                || double.IsNaN(number) || double.IsInfinity(number)) throw new Exception("字段 " + path + " 缺失或不是有效数字");
+            return number;
+        }
+    }
+
+    internal class CustomFetchResult
+    {
+        public List<ProviderStatus> Statuses;
+        public string PreviewJson;
+        public bool Cached;
+        public int WaitSeconds;
+        internal DateTime FetchedUtc;
+        internal string Json; // 原响应只保留在进程内，供本地规则预览使用。
+        internal object PreviewRoot; // 树与字段旁的值只显示脱敏后的数据。
+    }
+
+    internal static class CustomApiService
+    {
+        private sealed class Entry { public string Json, CooldownError; public DateTime FetchedUtc, NextUtc; }
+        private static readonly Dictionary<string, Entry> Cache = new Dictionary<string, Entry>();
+        private const int MaxBody = 2 * 1024 * 1024;
+
+        public static Dictionary<string, string> ParseHeaders(string text)
+        {
+            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if ((text ?? "").Length > 16384) throw new Exception("请求头过长");
+            foreach (string line in (text ?? "").Replace("\r\n", "\n").Split('\n'))
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                int colon = line.IndexOf(':');
+                if (colon <= 0) throw new Exception("请求头请每行填写 名称: 值");
+                string name = line.Substring(0, colon).Trim(), value = line.Substring(colon + 1).Trim();
+                if (!System.Text.RegularExpressions.Regex.IsMatch(name, @"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$") || value.IndexOf('\r') >= 0 || value.IndexOf('\0') >= 0)
+                    throw new Exception("请求头包含无效字符");
+                if (result.ContainsKey(name)) throw new Exception("请求头重复：" + name);
+                if (WebHeaderCollection.IsRestricted(name) && !name.Equals("Accept", StringComparison.OrdinalIgnoreCase)
+                    && !name.Equals("User-Agent", StringComparison.OrdinalIgnoreCase) && !name.Equals("Content-Type", StringComparison.OrdinalIgnoreCase))
+                    throw new Exception("此请求头由程序自动管理：" + name);
+                result.Add(name, value);
+            }
+            return result;
+        }
+
+        private static object Deserialize(string json)
+        {
+            try { return new JavaScriptSerializer { MaxJsonLength = MaxBody }.DeserializeObject(json); }
+            catch { throw new Exception("接口没有返回有效 JSON，请检查是否填成了网页首页"); }
+        }
+        private static string ReadBody(WebResponse response)
+        {
+            if (response.ContentLength > MaxBody) throw new Exception("响应超过 2 MB");
+            using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
+            {
+                var buffer = new char[4096];
+                var text = new StringBuilder();
+                int n;
+                while ((n = reader.Read(buffer, 0, buffer.Length)) > 0)
+                {
+                    if (text.Length + n > MaxBody) throw new Exception("响应超过 2 MB");
+                    text.Append(buffer, 0, n);
+                }
+                return text.ToString();
+            }
+        }
+        private static int Delay(object root, string key)
+        {
+            double n;
+            object v = JsonFieldPath.Optional(root, key);
+            if (v == null || !double.TryParse(Convert.ToString(v, CultureInfo.InvariantCulture), NumberStyles.Float, CultureInfo.InvariantCulture, out n) || double.IsNaN(n) || n <= 0) return 0;
+            return (int)Math.Min(604800, Math.Ceiling(n));
+        }
+        private static int RetryAfter(string value)
+        {
+            int seconds;
+            if (int.TryParse(value, out seconds)) return Math.Max(0, Math.Min(604800, seconds));
+            DateTimeOffset time;
+            return DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out time)
+                ? (int)Math.Max(0, Math.Min(604800, Math.Ceiling((time.UtcDateTime - DateTime.UtcNow).TotalSeconds))) : 0;
+        }
+        public static CustomFetchResult Fetch(ProviderConfig p, bool requestOnly = false)
+        {
+            if (!p.Enabled) return new CustomFetchResult { Statuses = new List<ProviderStatus>(), PreviewJson = "" };
+            if (p.Custom == null) throw new Exception("缺少自定义接口配置");
+            if (requestOnly) p.Custom.ValidateRequest(); else p.Custom.Validate();
+            string headerText = p.GetKey();
+            if (headerText == null) throw new Exception("无法解密请求头，请重新填写");
+            var headers = ParseHeaders(headerText);
+            string method = p.Custom.HttpMethod;
+            string body = method == "POST" ? p.Custom.GetBody() : "";
+            if (body == null) throw new Exception("无法解密请求体，请重新填写");
+            if (body.Length > 1048576) throw new Exception("请求体超过 1 MB");
+            string cacheKey;
+            var headerNames = new List<string>(headers.Keys); headerNames.Sort(StringComparer.OrdinalIgnoreCase);
+            var identity = new StringBuilder(new Uri(p.Custom.Url).AbsoluteUri);
+            identity.Append('\n').Append(method).Append('\n').Append(body.Length).Append(':').Append(body);
+            foreach (string name in headerNames) identity.Append('\n').Append(name.ToLowerInvariant()).Append(':').Append(headers[name]);
+            using (var hash = SHA256.Create()) cacheKey = Convert.ToBase64String(hash.ComputeHash(Encoding.UTF8.GetBytes(identity.ToString())));
+            Entry entry;
+            lock (Cache)
+            {
+                if (!Cache.TryGetValue(cacheKey, out entry)) Cache.Add(cacheKey, entry = new Entry());
+            }
+            lock (entry)
+            {
+                bool cached = DateTime.UtcNow < entry.NextUtc;
+                if (!cached)
+                {
+                    var req = (HttpWebRequest)WebRequest.Create(p.Custom.Url);
+                    req.Method = method; req.Timeout = 15000; req.ReadWriteTimeout = 15000;
+                    req.AllowAutoRedirect = false; // 自定义认证头不得随重定向发到其他地址。
+                    req.Accept = "application/json"; req.UserAgent = "QuotaWidget/" + AppInfo.Version;
+                    if (method == "POST") req.ContentType = "application/json; charset=utf-8";
+                    foreach (var h in headers)
+                    {
+                        if (h.Key.Equals("Accept", StringComparison.OrdinalIgnoreCase)) req.Accept = h.Value;
+                        else if (h.Key.Equals("User-Agent", StringComparison.OrdinalIgnoreCase)) req.UserAgent = h.Value;
+                        else if (h.Key.Equals("Content-Type", StringComparison.OrdinalIgnoreCase)) req.ContentType = h.Value;
+                        else req.Headers[h.Key] = h.Value;
+                    }
+                    try
+                    {
+                        if (method == "POST")
+                        {
+                            byte[] data = Encoding.UTF8.GetBytes(body);
+                            req.ContentLength = data.Length;
+                            using (var stream = req.GetRequestStream()) stream.Write(data, 0, data.Length);
+                        }
+                        using (var resp = (HttpWebResponse)req.GetResponse())
+                        {
+                            if ((int)resp.StatusCode >= 300) throw new Exception("接口发生重定向，请填写最终数据接口地址");
+                            string json = ReadBody(resp);
+                            object root = Deserialize(json);
+                            entry.Json = json; entry.FetchedUtc = DateTime.UtcNow;
+                            entry.CooldownError = null;
+                            entry.NextUtc = entry.FetchedUtc.AddSeconds(Math.Max(Delay(root, "next_allowed_in"), RetryAfter(resp.Headers["Retry-After"])));
+                        }
+                    }
+                    catch (WebException ex)
+                    {
+                        using (var resp = ex.Response as HttpWebResponse)
+                        {
+                            if (resp == null) throw new Exception("连接失败或超时（" + ex.Status + "）");
+                            int status = (int)resp.StatusCode;
+                            if (status == 429 || status == 503)
+                            {
+                                int wait = Math.Max(60, RetryAfter(resp.Headers["Retry-After"]));
+                                try { wait = Math.Max(wait, Delay(Deserialize(ReadBody(resp)), "retry_after")); } catch { }
+                                entry.NextUtc = DateTime.UtcNow.AddSeconds(wait);
+                                if (status == 429 && entry.Json != null) cached = true;
+                                else { entry.CooldownError = "HTTP " + status + "：接口暂不可用"; throw new Exception(entry.CooldownError + "，请等待 " + wait + " 秒后重试"); }
+                            }
+                            else throw new Exception("HTTP " + status + (status == 401 || status == 403 ? "：请检查认证请求头" : "：接口请求失败"));
+                        }
+                    }
+                }
+                int left = (int)Math.Max(0, Math.Ceiling((entry.NextUtc - DateTime.UtcNow).TotalSeconds));
+                if (entry.CooldownError != null) throw new Exception(entry.CooldownError + "，请等待 " + left + " 秒后重试");
+                if (entry.Json == null) throw new Exception("接口冷却中，请等待 " + left + " 秒后重试");
+                var statuses = new List<ProviderStatus>();
+                if (!requestOnly)
+                {
+                    try { statuses = Parse(p, entry.Json); }
+                    catch (Exception ex) { statuses = new List<ProviderStatus> { QuotaService.EmptyStatus(p, ex.Message) }; }
+                }
+                foreach (var st in statuses) st.UpdatedAt = entry.FetchedUtc.ToLocalTime();
+                var secrets = new List<string>(headers.Values);
+                if (body.Length > 0) secrets.Add(body);
+                object previewRoot = Redact(Deserialize(entry.Json), secrets);
+                string preview = new JavaScriptSerializer { MaxJsonLength = MaxBody }.Serialize(previewRoot);
+                return new CustomFetchResult { Statuses = statuses, PreviewJson = PrettyJson(preview), Cached = cached,
+                    WaitSeconds = left, FetchedUtc = entry.FetchedUtc, Json = entry.Json, PreviewRoot = previewRoot };
+            }
+        }
+        private static object Redact(object value, ICollection<string> secrets)
+        {
+            var obj = value as Dictionary<string, object>;
+            if (obj != null)
+            {
+                var copy = new Dictionary<string, object>();
+                foreach (var pair in obj) copy[pair.Key] = System.Text.RegularExpressions.Regex.IsMatch(pair.Key, "(?i)token|secret|password|authorization|cookie|api.?key|management.?key") ? "[已隐藏]" : Redact(pair.Value, secrets);
+                return copy;
+            }
+            var list = value as IList;
+            if (list != null) { var copy = new List<object>(); foreach (object item in list) copy.Add(Redact(item, secrets)); return copy; }
+            if (value is string)
+            {
+                string text = (string)value;
+                foreach (string secret in secrets) if (!string.IsNullOrEmpty(secret)) text = text.Replace(secret, "[已隐藏]");
+                return text;
+            }
+            return value;
+        }
+        private static string PrettyJson(string json)
+        {
+            var output = new StringBuilder(); int depth = 0; bool quoted = false, escaped = false;
+            foreach (char c in json)
+            {
+                if (quoted)
+                {
+                    output.Append(c);
+                    if (escaped) escaped = false;
+                    else if (c == '\\') escaped = true;
+                    else if (c == '"') quoted = false;
+                    continue;
+                }
+                if (c == '"') { quoted = true; output.Append(c); }
+                else if (c == '{' || c == '[') { output.Append(c).AppendLine(); depth++; output.Append(' ', depth * 2); }
+                else if (c == '}' || c == ']') { depth--; output.AppendLine().Append(' ', depth * 2).Append(c); }
+                else if (c == ',') output.Append(c).AppendLine().Append(' ', depth * 2);
+                else if (c == ':') output.Append(": ");
+                else output.Append(c);
+            }
+            return output.ToString();
+        }
+
+        private static bool MissingRuleValue(object value)
+        {
+            return value == null || (value is string && string.IsNullOrWhiteSpace((string)value));
+        }
+
+        // 本次响应缺少规则所需的数值时返回 null；规则保留，下次取到值会自动恢复。
+        public static QuotaPool ParseRule(CustomQuotaRule rule, object root)
+        {
+            rule.Validate();
+            object rawValue = JsonFieldPath.Get(root, rule.ValuePath);
+            object rawTotal = rule.Mode == "usedTotal" ? JsonFieldPath.Get(root, rule.TotalPath) : null;
+            if (MissingRuleValue(rawValue) || (rule.Mode == "usedTotal" && MissingRuleValue(rawTotal))) return null;
+            double value = JsonFieldPath.Number(rawValue, rule.ValuePath);
+            var pool = new QuotaPool { Label = rule.Name };
+            if (rule.Mode == "balance")
+            {
+                value *= rule.Multiplier;
+                if (double.IsNaN(value) || double.IsInfinity(value)) throw new Exception("余额换算结果超出范围");
+                pool.IsMoney = true; pool.Currency = rule.Currency ?? ""; pool.Remaining = value; pool.Total = Math.Max(0, value); pool.Percent = value > 0 ? 0 : 100;
+            }
+            else
+            {
+                double used;
+                if (rule.Mode == "usedTotal")
+                {
+                    double total = JsonFieldPath.Number(rawTotal, rule.TotalPath);
+                    if (total <= 0 || value < 0 || value > total) throw new Exception("总量必须大于 0，已用量须在 0 到总量之间");
+                    pool.Total = total; pool.Used = value; pool.Remaining = total - value; used = value / total * 100;
+                }
+                else
+                {
+                    if (rule.Fraction) value *= 100;
+                    if (value < 0 || value > 100) throw new Exception("百分比超出范围，请检查已用/剩余及数值范围");
+                    used = rule.IsRemaining ? 100 - value : value;
+                    pool.PercentOnly = true; pool.Total = 100; pool.Used = used; pool.Remaining = 100 - used;
+                }
+                pool.Percent = (int)Math.Round(used);
+            }
+            object reset = JsonFieldPath.Optional(root, rule.ResetPath);
+            if (reset != null && !string.IsNullOrWhiteSpace(Convert.ToString(reset, CultureInfo.InvariantCulture)))
+            {
+                string text = Convert.ToString(reset, CultureInfo.InvariantCulture); double epoch; DateTimeOffset time;
+                if (double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out epoch))
+                    pool.ResetLocal = new DateTimeOffset(1970, 1, 1, 0, 0, 0, TimeSpan.Zero).AddSeconds(epoch >= 100000000000 ? epoch / 1000 : epoch).LocalDateTime;
+                else if (DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out time)) pool.ResetLocal = time.LocalDateTime;
+                else throw new Exception("重置时间格式无效");
+            }
+            return pool;
+        }
+        internal static string FormatPool(QuotaPool pool)
+        {
+            return pool.Label + ": " + (pool.IsMoney ? pool.Currency + St.FmtMoney(pool.Remaining) : "剩余" + (100 - pool.Percent) + "%");
+        }
+        private static void SelectPrimary(ProviderStatus status)
+        {
+            status.Primary5h = status.Pools.Count == 0 ? null : status.Pools[0];
+            foreach (var pool in status.Pools) if (!pool.IsMoney && pool.Percent >= 100) { status.Primary5h = pool; break; }
+        }
+        internal static object ParseJson(string json) { return Deserialize(json); }
+        public static List<ProviderStatus> Parse(ProviderConfig p, string json)
+        {
+            p.Custom.Validate();
+            object root = Deserialize(json);
+            var status = QuotaService.EmptyStatus(p, null);
+            foreach (var rule in p.Custom.Rules)
+            {
+                try
+                {
+                    var pool = ParseRule(rule, root);
+                    if (pool != null) status.Pools.Add(pool);
+                }
+                catch (Exception ex) { status.Error = rule.Name + "：" + ex.Message; status.Pools.Clear(); break; }
+            }
+            SelectPrimary(status);
+            return new List<ProviderStatus> { status };
+        }
+    }
     internal class QuotaPool
     {
         public string Label = "";
@@ -196,7 +696,11 @@ namespace QuotaWidget
         public string Name = "";
         public string Type = "";        // "glm" / "mx" / "kimi" / "ds" / "claude" / "codex" 用于决定主题色
         public string Region = "";
-        public bool ShowName = true;    // false=悬浮窗/置顶栏以品牌图标+环形进度展示（随 ProviderConfig 同步）
+        public bool ShowName = true;    // false=悬浮窗以品牌图标+环形进度展示（随 ProviderConfig 同步）
+        public string CustomIcon;
+        public string CustomDisplayName;
+        public string IconType { get { return Type == "custom" ? (CustomIcon ?? "custom") : Type; } }
+        public string WidgetName { get { return Type == "custom" && ShowName && !string.IsNullOrWhiteSpace(CustomDisplayName) ? CustomDisplayName : Name; } }
         public string Level = "";
         public string Error = null;
         public List<QuotaPool> Pools = new List<QuotaPool>();
@@ -207,7 +711,18 @@ namespace QuotaWidget
 
         // 悬浮窗/托盘等文本场景的展示名：图标模式显示接口类型名（如"GLM 国内版"）
         [ScriptIgnore]
-        public string DisplayName { get { return ShowName ? Name : ProviderConfig.TypeDisplay(Type, Region); } }
+        public string DisplayName { get { return ShowName || Type == "custom" ? WidgetName : ProviderConfig.TypeDisplay(Type, Region); } }
+
+        internal ProviderStatus WithConfig(ProviderConfig p)
+        {
+            var st = (ProviderStatus)MemberwiseClone();
+            st.Name = p.Name ?? ""; st.Type = p.Type; st.Region = p.Region; st.ShowName = p.ShowName; st.CustomIcon = p.IconType;
+            if (p.Type == "custom")
+            {
+                st.CustomDisplayName = p.Custom == null || string.IsNullOrWhiteSpace(p.Custom.DisplayName) ? st.Name : p.Custom.DisplayName;
+            }
+            return st;
+        }
     }
 
     // ============================= 配置 =============================
@@ -227,8 +742,7 @@ namespace QuotaWidget
         public int Y { get; set; }
         public bool AutoStart { get; set; }
         public bool LockPosition { get; set; }   // 固定位置：禁止拖拽悬浮窗
-        public string DisplayMode { get; set; }  // "float"(悬浮窗) / "topbar"(置顶栏)
-        public int AppBarScreen { get; set; }    // 置顶栏模式：显示在哪个屏幕（索引，默认0=主屏）
+        public bool FloatingEnabled { get; set; } // 仅右键菜单切换；关闭后仍保留托盘与后台刷新
         public string FloatLayout { get; set; }  // 悬浮窗排列："island"(条形灵动岛，默认) / "card"(矩形卡片)
         public int DockSide { get; set; }        // 灵动岛吸附边（重启恢复用）：-1 未吸附 / 0 顶 / 1 左 / 2 右
         public bool Vertical { get; set; }       // 竖向岛形态（左右吸附或竖向固定时为 true，重启恢复用）
@@ -238,7 +752,7 @@ namespace QuotaWidget
             Providers = new List<ProviderConfig>();
             GlmKey = ""; GlmRegion = "cn"; MxKey = ""; MxRegion = "cn";
             RefreshSec = 60; OpacityPct = 95; TopMost = true; Theme = "light"; X = -1; Y = -1; AutoStart = false; LockPosition = false; DockSide = -1;
-            DisplayMode = "float"; AppBarScreen = 0; FloatLayout = "island";
+            FloatingEnabled = true; FloatLayout = "island";
         }
 
         // 配置与日志统一放 %LOCALAPPDATA%\QuotaWidget\。exe 常随源码仓库或便携目录放置，
@@ -255,10 +769,7 @@ namespace QuotaWidget
             get { return Path.Combine(DataDir, "config.json"); }
         }
 
-        /// 是否已有可用配置：首个"填了 key（明文或密文任一）或可回退本机 CLI 凭证"的供应商即算已配置。
-        /// 判据与 RefreshData 的跳过条件（!HasKey && !CanUseLocalCreds）严格一致 —— 两者不一致时，
-        /// 会出现"启动判定未配置、实际却有供应商在正常查询"的误判，把设置页强塞给已配置好的用户。
-        /// Claude/Codex 无 Key 也能查（自动读本机 Claude Code / Codex CLI 登录凭证），故不能只按 HasKey 判
+        /// 是否存在已启用且可查询的供应商，与首屏、刷新、连接测试保持一致。
         [ScriptIgnore]
         public bool IsConfigured
         {
@@ -266,8 +777,20 @@ namespace QuotaWidget
             {
                 if (Providers == null) return false;
                 foreach (var p in Providers)
-                    if (p != null && (p.HasKey || p.CanUseLocalCreds)) return true;
+                    if (p != null && p.CanQuery) return true;
                 return false;
+            }
+        }
+
+        [ScriptIgnore]
+        public bool AllProvidersDisabled
+        {
+            get
+            {
+                if (Providers == null || Providers.Count == 0) return false;
+                foreach (var p in Providers)
+                    if (p != null && p.Enabled) return false;
+                return true;
             }
         }
 
@@ -280,6 +803,7 @@ namespace QuotaWidget
                 if (File.Exists(FilePath))
                 {
                     var ser = new JavaScriptSerializer();
+                    // 旧 DisplayMode / AppBarScreen 字段由反序列化器忽略，沿用原悬浮窗位置与排列。
                     cfg = ser.Deserialize<Config>(File.ReadAllText(FilePath, Encoding.UTF8)) ?? new Config();
                 }
             }
@@ -306,7 +830,7 @@ namespace QuotaWidget
                 foreach (var p in cfg.Providers)
                 {
                     // 旧配置无 ShowName 字段：自定义过名称的供应商保持名称模式，其余进入图标模式
-                    if (!p.ShowName)
+                    if (p.Type != "custom" && !p.ShowName)
                     {
                         string def = ProviderConfig.TypeDefaultNames[ProviderConfig.TypeIndex(p.Type, p.Region)];
                         if (!string.IsNullOrEmpty(p.Name) && p.Name != def) p.ShowName = true;
@@ -413,6 +937,29 @@ namespace QuotaWidget
     // ============================= 查询服务 =============================
     internal static class QuotaService
     {
+        public static List<ProviderStatus> FetchProvider(ProviderConfig p, bool force)
+        {
+            if (!p.Enabled) return new List<ProviderStatus>();
+            if (p.Type == "custom")
+            {
+                var result = CustomApiService.Fetch(p);
+                p.CooldownUntilUtc = DateTime.UtcNow.AddSeconds(result.WaitSeconds);
+                return result.Statuses;
+            }
+            ProviderStatus st;
+            if (p.Type == "mx") st = FetchMiniMax(p);
+            else if (p.Type == "kimi") st = FetchKimi(p);
+            else if (p.Type == "ds") st = FetchDeepSeek(p);
+            else if (p.Type == "claude") st = FetchClaude(p, force);
+            else if (p.Type == "codex") st = FetchCodex(p);
+            else st = FetchGlm(p);
+            return new List<ProviderStatus> { st };
+        }
+
+        public static ProviderStatus EmptyStatus(ProviderConfig p, string error)
+        {
+            return new ProviderStatus { Error = error }.WithConfig(p);
+        }
         // 携带 HTTP 状态码的查询异常（当前作为错误信息载体；待验证 MiniMax 两端点鉴权一致后，
         // 可据此对 401/403 做跳过回退的短路优化）
         private class HttpException : Exception
@@ -1500,7 +2047,7 @@ namespace QuotaWidget
             return 96;
         }
 
-        // 悬浮窗 / 置顶栏 / 明细面板配色。对比度与设置页（contrast-proposal 方案 A）同方向：
+        // 悬浮窗 / 明细面板配色。对比度与设置页（contrast-proposal 方案 A）同方向：
         // 边框 / 分割线提到可见强度，浅色明细面板提纯白与悬浮窗底拉开，深色反向加深底层。
         public static Color Bg { get { return Theme == 1 ? Color.FromArgb(20, 20, 25) : Color.FromArgb(237, 238, 242); } }
         public static Color Card { get { return Theme == 1 ? Color.FromArgb(20, 20, 25) : Color.FromArgb(255, 255, 255); } }
@@ -1550,7 +2097,7 @@ namespace QuotaWidget
         // 不随主题切换的 accent（恒用浅色高饱和原色）：深色模式下详情面板徽标保持与浅色一致的浓度
         public static Color AccentForFixed(string type) { return Acc(type, 2); }
 
-        // ---- 横向徽标（置顶栏 / 悬浮窗条形灵动岛共用）----
+        // ---- 横向徽标（条形灵动岛）----
         public struct BadgeInfo
         {
             public string Name, Value;
@@ -1568,7 +2115,7 @@ namespace QuotaWidget
         }
 
         // 品牌图标 + 外圈环形进度（图标模式的核心绘制）：底环常显，弧长=剩余百分比，0 时只画底环。
-        // 几何：内圈（图标）恒 18 DIP，ringD 为环外径 DIP（灵动岛 38 / 置顶栏 0 无环），penW 环粗 DIP。
+        // 几何：内圈（图标）恒 18 DIP，ringD 为环外径 DIP（灵动岛 38），penW 环粗 DIP。
         // ringD / penW 必须与图标一样按 s 缩放绘制——此前漏乘 s，高 DPI 下环外径与环粗不随面板/图标放大
         public static void DrawRingIcon(Graphics g, string type, int ringPct, Color ringColor, float cx, float cy, float s, float ringD, float penW, bool dark)
         {
@@ -1591,7 +2138,7 @@ namespace QuotaWidget
             {
                 if (ringD <= 0)
                 {
-                    // 无环模式（置顶栏）：空间紧凑，只显示品牌图标本身
+                    // 无环模式：空间紧凑，只显示品牌图标本身
                     int isz = SiF(18, s);
                     BrandIcons.Draw(g, bi.IconType, dark, (int)Math.Round(x), (int)Math.Round(centerY - isz / 2f), isz);
                     using (var b = new SolidBrush(bi.DotColor))
@@ -1620,13 +2167,13 @@ namespace QuotaWidget
         // 两端必须同源测量，否则灵动岛按此定宽后徽标会被裁切）
         public static List<BadgeInfo> BuildBadges(List<ProviderStatus> providers, Graphics g, float s, out float totalW, int ringD, float penW, bool dark)
         {
-            float gap = 12f * s;   // 徽标间距（灵动岛 / 置顶栏绘制处与此必须同源）
+            float gap = 12f * s;   // 徽标间距（灵动岛绘制处与此必须同源）
             var fs = FontsForScale(s); // [1]=FNorm
             var badges = new List<BadgeInfo>(providers.Count);
             totalW = 0;
             foreach (var st in providers)
             {
-                var bi = new BadgeInfo { Name = st.Name };
+                var bi = new BadgeInfo { Name = st.WidgetName };
                 bool err = st.Error != null;
                 var pool = st.Primary5h;
                 int usedPct = pool != null ? Math.Max(0, Math.Min(100, pool.Percent)) : 0;
@@ -1637,9 +2184,9 @@ namespace QuotaWidget
                         ? (pool.IsMoney ? pool.Currency + FmtMoney(pool.Remaining) : remain + "%")
                         : "--");
                 // 图标模式（无可用品牌图标时回退名称模式，如"未配置"占位行）
-                if (!st.ShowName && BrandIcons.Get(st.Type, dark) != null)
+                if (!st.ShowName && BrandIcons.Get(st.IconType, dark) != null)
                 {
-                    bi.IconType = st.Type;
+                    bi.IconType = st.IconType;
                     bi.RingPct = err ? 0 : remain;
                 }
                 bi.NameW = g.MeasureString(bi.Name, fs[0]).Width;   // 名称粗体，与绘制同源
@@ -1738,15 +2285,15 @@ namespace QuotaWidget
             Color dotColor = err ? Red : RemainColor(remain);
             var fs = FontsForScale(s); // [0]=FTitle [1]=FNorm [2]=FSmall [3]=FPct
 
-            if (!st.ShowName && BrandIcons.Get(st.Type, dark) != null)
+            if (!st.ShowName && BrandIcons.Get(st.IconType, dark) != null)
             {
                 int isz = SiF(16, s);
-                BrandIcons.Draw(g, st.Type, dark, SiF(12, s), y + (SiF(24, s) - isz) / 2, isz);
+                BrandIcons.Draw(g, st.IconType, dark, SiF(12, s), y + (SiF(24, s) - isz) / 2, isz);
             }
             else
             {
                 using (var b = new SolidBrush(Text))
-                    g.DrawString(st.Name, fs[0], b, SiF(12, s), y + SiF(3, s));
+                    g.DrawString(st.WidgetName, fs[0], b, SiF(12, s), y + SiF(3, s));
             }
 
             if (err)
@@ -1893,6 +2440,13 @@ namespace QuotaWidget
             string key = type + "#" + (dark ? 1 : 0);
             Bitmap b;
             if (_cache.TryGetValue(key, out b)) return b;
+            if (type == "custom")
+            {
+                b = new Bitmap(64, 64);
+                using (var g = Graphics.FromImage(b)) IconFactory.DrawServer(g, 4, 4, 56, dark ? Color.White : Color.FromArgb(24, 24, 27));
+                _cache[key] = b;
+                return b;
+            }
             Def d;
             if (!_defs.TryGetValue(type, out d)) return null;
             string b64 = dark
@@ -1908,6 +2462,7 @@ namespace QuotaWidget
         {
             var img = Get(type, dark) as Bitmap;
             if (img == null) return;
+            if (type == "custom") { g.DrawImage(img, x, y, size, size); return; }
             Def d = _defs[type];
             bool usedColor = dark ? !string.IsNullOrEmpty(d.ColorDark) : !string.IsNullOrEmpty(d.Color);
             if (usedColor)
@@ -2248,48 +2803,31 @@ namespace QuotaWidget
         public FloatingForm Floating;
         public NotifyIcon Tray;
         private SettingsForm _settings;
-        private TopBarForm _topBar;
         private bool _exiting;
         internal bool IsExiting { get { return _exiting; } }
-
-        // 懒加载置顶栏（仅在首次切换到 topbar 模式时创建）
-        public TopBarForm TopBar
-        {
-            get
-            {
-                if (_topBar == null || _topBar.IsDisposed)
-                {
-                    _topBar = new TopBarForm(this);
-                }
-                return _topBar;
-            }
-        }
 
         // ---- 首启自动打开设置 ----
         // 一个可用供应商都没有时（config.json 不存在、被清空、供应商被删光，或文件损坏后回退默认），
         // 悬浮窗只会显示"正在获取"再变成一行错误提示，用户不知道下一步该做什么，只能自己摸到右键菜单；
-        // 此处直接把设置页推到最前。配置成功保存后 SettingsForm 会调 ApplyConfig → RefreshData，
+        // 此处直接把设置页推到最前。配置成功保存后 SettingsForm 会调 ApplyConfig → RefreshDue，
         // 一切照旧；若用户没配置就关掉设置页，悬浮窗仍以它原有的未配置样式留在屏幕上（托盘也可再唤出）。
         private bool _autoOpenedSettings;
         internal bool IsConfigured { get { return Cfg.IsConfigured; } }
 
-        // 延后到消息循环真正跑起来之后再显示：构造期 Show() 出来的窗口虽然能正常绘制/命中，
-        // 但排在它前面的 Floating/HoverTip 等窗口在 Run 启动时还会被 MainForm 逻辑再显示一次，
-        // 有盖住设置页的风险。BeginInvoke 排队到消息队列，天然在所有启动期显示动作之后执行
+        // 延后到消息循环启动后再打开设置，确保悬浮窗已完成首屏布局。
         private void AutoOpenSettingsOnce()
         {
             if (_autoOpenedSettings || _exiting) return;   // 回调出队前用户可能已从托盘退出
             _autoOpenedSettings = true;
-            if (IsConfigured) return;   // 出队前已通过其它入口配置好（保险，避免设置页重复弹出）
+            if (IsConfigured || Cfg.AllProvidersDisabled) return;
             ShowSettings();
         }
 
         public AppContext()
         {
             Cfg = Config.Load();
-            // 上次崩溃/强杀残留的工作区预留：启动时无条件清理（此前仅进入 topbar 模式才清，
-            // float 模式启动会让"桌面变矮"的残留一直留着）
-            try { TopBarForm.CleanupStartupResidue(); } catch { }
+            // 升级时恢复旧置顶栏留下的工作区预留；新版本不再预留工作区。
+            try { LegacyWorkAreaCleanup.CleanupStartupResidue(); } catch { }
             Floating = new FloatingForm(this);
 
             Tray = new NotifyIcon
@@ -2298,81 +2836,29 @@ namespace QuotaWidget
                 Visible = true,
                 Text = "AI 额度工具 v" + AppInfo.Version
             };
-            // 托盘点击只可能在消息循环启动后送达，而窗口在构造末尾已按 DisplayMode 显示完毕，
-            // 因此不需要"首次显示完成"标志来挡掉早期点击（原 _firstShow 恒为 false，是死条件）
+            // 左键仅定位已开启的悬浮窗；开关统一放在右键菜单，双击也不切换可见性。
             Tray.MouseClick += delegate(object s, MouseEventArgs e)
             {
                 if (e.Button == MouseButtons.Right) { ShowMenu(); return; }
                 if (e.Button == MouseButtons.Left)
-                {
-                    if (Cfg.DisplayMode == "topbar")
-                    {
-                        if (TopBar.Visible)
-                        {
-                            TopBar.UnregisterAppBar();
-                            TopBar.Hide();
-                        }
-                        else
-                        {
-                            TopBar.ApplyFromConfig();
-                            // MainForm 必须指向本模式的窗口：ApplicationContext 的 RunMessageLoop
-                            // 会在消息循环启动时自动 Show(MainForm)，指向悬浮窗会让它在置顶栏
-                            // 模式下也被弹出来（两个窗口同时出现）
-                            MainForm = TopBar;
-                            TopBar.Show();
-                        }
-                    }
-                    else
-                        Floating.Visible = !Floating.Visible;
-                }
+                    Floating.RevealFromTray();
             };
 
-            // 不在此处设置 MainForm：设置后 Application.Run 会立即显示空白窗口；
-            // 仅创建窗口句柄，使后台线程能通过 BeginInvoke 回到 UI 线程
+            // 不设置 MainForm，避免消息循环启动时把用户已关闭的悬浮窗自动显示。
+            // 句柄供后台线程 BeginInvoke 使用；应用退出统一走 ExitApp。
             var h = Floating.Handle;
-            // 首屏即刻显示：此前首次 Show 押在全部供应商查询完成之后（数据到达回调里才
-            // ShowActiveForm），任一端点超时（15s，GLM/MiniMax 双端点回退最坏 30s）窗口就迟迟
-            // 不出现。占位行必须按配置里的供应商数量逐条生成：窗口尺寸由 Providers.Count 决定
-            // （卡片行数 / 竖向岛高度 / 岛宽与徽标数），只塞一条的话首屏会先以"一行/单徽标"
-            // 的形态出现，等数据回来 Rebuild 才变成上次关闭前的形态，视觉上就是"加载完才归位"。
-            // 跳过条件与 RefreshData 完全一致（未配置 key 且无本地凭证的供应商最终不会进列表），
-            // 否则首屏会多出一行、数据到达后又消失，行数变化照样引起尺寸跳变
-            if (Cfg.Providers != null)
-            {
-                foreach (var p in Cfg.Providers)
-                {
-                    if (!p.HasKey && !p.CanUseLocalCreds) continue;
-                    // Name 与 QuotaService 各 Fetch* 的赋值保持一致，不在这里做 TypeDisplay 回退：
-                    // 回退只出现在占位行会让首屏宽度先宽后窄（CardWidth 按名称测量）
-                    Providers.Add(new ProviderStatus
-                    {
-                        Name = p.Name ?? "",
-                        Type = p.Type,
-                        Region = p.Region,
-                        ShowName = p.ShowName
-                    });
-                }
-            }
-            if (Providers.Count == 0)
-                Providers.Add(new ProviderStatus { Name = "正在获取", Type = "glm" });
-            ShowActiveForm();
-            // 未配置时没有任何请求可发：跳过首轮刷新。RefreshData 会把构造期铺好的占位行换成
-            // Name="未配置" + Error="右键 → 设置，添加供应商" 的报错态，托盘提示也随之变成
-            // "未配置连接失败"；保留占位行并改写托盘提示，指向真正该做的下一步
+            // 先按启用的供应商铺占位行，首屏无需等待请求，也不会短暂显示已停用项。
+            ResetProviderDisplay();
+            ApplyFloatingConfig();
+            // 没有可查询项时跳过请求；主动全部停用属于正常暂停，不自动打开设置。
             if (IsConfigured) RefreshData();
             else
             {
-                Tray.Text = "AI 额度工具 v" + AppInfo.Version + " · 未配置，右键打开设置";
+                UpdateTrayTip();
                 // 延后到消息循环跑起来之后再显示，避开启动期各窗口的显示顺序（见 AutoOpenSettingsOnce）
                 try { Floating.BeginInvoke((Action)AutoOpenSettingsOnce); }
                 catch { AutoOpenSettingsOnce(); }   // 句柄异常时直接打开，别把唯一入口整个吃掉
             }
-            // 任何退出路径（含未处理异常对话框选"退出"）都兜底恢复工作区；RestoreWorkArea 以
-            // _originalLoaded 哨兵保证幂等，正常退出链路已恢复过时此处为空操作
-            Application.ApplicationExit += delegate
-            {
-                if (_topBar != null) { try { _topBar.UnregisterAppBar(); } catch { } }
-            };
         }
 
         public void ShowSettings()
@@ -2387,125 +2873,233 @@ namespace QuotaWidget
             _settings.Activate();
         }
 
-        // 悬浮窗 / 置顶栏 / 托盘图标共用的右键菜单（自绘 WidgetMenu，样式与设置页统一）。
-        // 每次弹出按当前配置构建：勾选态天然实时；置顶栏模式下固定位置无意义不显示（与旧 ContextMenuStrip 行为一致）
+        // 悬浮窗与托盘共用菜单，每次弹出按当前可见性与配置构建。
+        private WidgetMenu _menu;
         public void ShowMenu()
         {
+            if (_menu != null && !_menu.IsDisposed) _menu.Close();
             var menu = new WidgetMenu();
-            menu.AddItem("立即刷新", false, false, delegate { RefreshData(); });
-            if (Cfg.DisplayMode != "topbar")
+            _menu = menu;
+            Floating.SetContextMenuOpen(true);
+            menu.FormClosed += delegate
             {
-                menu.AddItem("固定位置", true, Cfg.LockPosition, delegate
-                {
-                    Cfg.LockPosition = !Cfg.LockPosition;
-                    if (Cfg.LockPosition) Floating.RestoreFromEdge();
-                    else Floating.OnLockReleased();
-                    Cfg.Save();
-                });
-            }
+                if (!object.ReferenceEquals(_menu, menu)) return;
+                _menu = null;
+                if (!Floating.IsDisposed) Floating.SetContextMenuOpen(false);
+            };
+            menu.AddItem(Floating.Visible ? "关闭悬浮窗" : "开启悬浮窗", false, false, delegate
+            {
+                Cfg.FloatingEnabled = !Floating.Visible;
+                Floating.Visible = Cfg.FloatingEnabled;
+                if (Floating.Visible) Floating.RevealFromTray();
+                Cfg.Save();
+            });
+            menu.AddItem("立即刷新", false, false, delegate { RefreshData(); });
+            menu.AddItem("固定位置", true, Cfg.LockPosition, delegate
+            {
+                Cfg.LockPosition = !Cfg.LockPosition;
+                if (Cfg.LockPosition) Floating.RestoreFromEdge();
+                else Floating.OnLockReleased();
+                Cfg.Save();
+            });
             menu.AddItem("设置…", false, false, delegate { ShowSettings(); });
             menu.AddSeparator();
             menu.AddItem("退出", false, false, delegate { ExitApp(); });
-            menu.ShowAt(Cursor.Position);
+            try { menu.ShowAt(Cursor.Position); }
+            catch { _menu = null; Floating.SetContextMenuOpen(false); menu.Dispose(); throw; }
         }
 
-        public void ApplyConfig()
+        public void ApplyConfig(List<ProviderConfig> previousProviders = null, int previousRefreshSec = 0)
         {
             Cfg.Save();
             Config.SetAutoStart(Cfg.AutoStart);
-            ShowActiveForm();
-            RefreshData();
+            if (previousProviders != null) PreserveRefreshSchedule(previousProviders, previousRefreshSec);
+            ResetProviderDisplay(); // 保存后立即移除停用项，不等待旧请求完成。
+            ApplyFloatingConfig();
+            UpdateTrayTip();
+            RefreshDue(false);
             // 保存后变得无可查询供应商（把最后一个供应商删掉并保存）：别让窗口停在"正在获取"，
             // 把设置页重新推到前面（此时设置窗正在 Close，_settings 会被置为新实例），
             // 用户才有下一步可走。首次打开时用户尚未点过保存，不会命中这里
-            if (!IsConfigured && (_settings == null || _settings.IsDisposed || !_settings.Visible))
+            if (!IsConfigured && !Cfg.AllProvidersDisabled && (_settings == null || _settings.IsDisposed || !_settings.Visible))
             {
                 UpdateTrayTip();
                 ShowSettings();
             }
         }
 
-        // 根据当前 DisplayMode 显示对应窗口，隐藏另一个；
-        // 隐藏的窗口同时停掉刷新/重绘定时器，避免两个模式的定时器同时常驻触发
-        private void ShowActiveForm()
+        private static List<ProviderStatus> CopyResults(ProviderConfig source, ProviderConfig target)
         {
-            if (Cfg.DisplayMode == "topbar")
+            return source.LastResults == null ? null : source.LastResults.ConvertAll(st => st.WithConfig(target));
+        }
+
+        private void PreserveRefreshSchedule(List<ProviderConfig> previousProviders, int previousRefreshSec)
+        {
+            var previous = new Dictionary<Guid, ProviderConfig>();
+            foreach (var p in previousProviders) if (p != null) previous[p.RuntimeId] = p;
+            DateTime now = DateTime.UtcNow;
+            foreach (var p in Cfg.Providers)
             {
-                Floating.SuspendTimers();
-                // 无条件 Hide：启动时悬浮窗从未 Show 过，Visible 为 false，若只按可见性判断
-                // 就不会收起它，而 MainForm 指向的窗口会在消息循环启动时被自动显示
-                Floating.Hide();
-                TopBar.ApplyFromConfig();
-                // MainForm 必须指向本模式的窗口（原因见托盘左键分支）
-                MainForm = TopBar;
-                if (!TopBar.Visible) TopBar.Show();
-            }
-            else
-            {
-                if (_topBar != null)
+                ProviderConfig old;
+                if (p == null || !p.CanQuery) continue;
+                if (!previous.TryGetValue(p.RuntimeId, out old))
                 {
-                    if (_topBar.Visible) { _topBar.UnregisterAppBar(); _topBar.Hide(); }
-                    _topBar.SuspendTimers();
+                    // 新接口已经在编辑器里测试过，保存时计满当前实际间隔，复用测试结果。
+                    if (p.LastResults != null)
+                    {
+                        p.NextRefreshUtc = now.AddSeconds(p.EffectiveRefreshSec(Cfg.RefreshSec));
+                        if (p.CooldownUntilUtc > p.NextRefreshUtc) p.NextRefreshUtc = p.CooldownUntilUtc;
+                    }
+                    continue;
                 }
-                Floating.ApplyFromConfig();
-                // MainForm 指回悬浮窗（从置顶栏切回时它在消息循环启动后也需要被自动显示）
-                MainForm = Floating;
-                if (!Floating.Visible) { Floating.Show(); }
+                bool sameQuery = old.CanQuery && p.HasSameQuery(old);
+                bool sampled = p.LastResults != null && (!sameQuery || p.LastFetchUtc > old.LastFetchUtc);
+                bool intervalChanged = p.RefreshSec != old.RefreshSec || p.EffectiveRefreshSec(Cfg.RefreshSec) != old.EffectiveRefreshSec(previousRefreshSec);
+                if (sameQuery)
+                {
+                    // 请求可能刚好完成，结果、完成时间和下次时间必须作为同一快照读取。
+                    lock (old)
+                    {
+                        if (p.LastResults == null || old.LastFetchUtc > p.LastFetchUtc)
+                        {
+                            p.LastResults = CopyResults(old, p); p.LastFetchUtc = old.LastFetchUtc;
+                            p.NextRefreshUtc = old.NextRefreshUtc;
+                        }
+                        if (old.CooldownUntilUtc > p.CooldownUntilUtc) p.CooldownUntilUtc = old.CooldownUntilUtc;
+                    }
+                }
+                // 从保存时重新计满新间隔；即使尚无结果，也不能绕过截止时间立即请求。
+                if (intervalChanged || sampled) p.NextRefreshUtc = now.AddSeconds(p.EffectiveRefreshSec(Cfg.RefreshSec));
+                if (p.CooldownUntilUtc > p.NextRefreshUtc) p.NextRefreshUtc = p.CooldownUntilUtc;
             }
+        }
+
+        private void MergeCompletedRefresh(List<ProviderConfig> source)
+        {
+            var current = new Dictionary<Guid, ProviderConfig>();
+            foreach (var p in Cfg.Providers) if (p != null) current[p.RuntimeId] = p;
+            foreach (var old in source)
+            {
+                ProviderConfig p;
+                if (old == null || !current.TryGetValue(old.RuntimeId, out p) || !p.CanQuery || old.LastResults == null
+                    || old.LastFetchUtc <= p.LastFetchUtc || !p.HasSameQuery(old)) continue;
+                p.LastResults = CopyResults(old, p); p.LastFetchUtc = old.LastFetchUtc;
+                if (old.CooldownUntilUtc > p.CooldownUntilUtc) p.CooldownUntilUtc = old.CooldownUntilUtc;
+                DateTime next = old.LastFetchUtc.AddSeconds(p.EffectiveRefreshSec(Cfg.RefreshSec));
+                if (next > p.NextRefreshUtc) p.NextRefreshUtc = next;
+                if (p.CooldownUntilUtc > p.NextRefreshUtc) p.NextRefreshUtc = p.CooldownUntilUtc;
+            }
+        }
+
+        private void ApplyFloatingConfig()
+        {
+            Floating.ApplyFromConfig();
+            if (Cfg.LockPosition) Floating.RestoreFromEdge();
+            Floating.Visible = Cfg.FloatingEnabled;
         }
 
         private int _fetching;
         private string _lastTrayTip = "";   // 缓存上次托盘文本，只在变化时更新（避免每秒调用 Shell_NotifyIcon）
 
+        private ProviderStatus EmptyProviderStatus()
+        {
+            return Cfg.AllProvidersDisabled
+                ? new ProviderStatus { Name = "已暂停" }
+                : new ProviderStatus { Name = "未配置", Error = "右键 → 设置，添加或开启供应商" };
+        }
+
+        private void ResetProviderDisplay()
+        {
+            var list = new List<ProviderStatus>();
+            foreach (var p in Cfg.Providers)
+            {
+                if (p == null || !p.CanQuery) continue;
+                if (p.LastResults != null) list.AddRange(p.LastResults);
+                else list.Add(QuotaService.EmptyStatus(p, null));
+            }
+            if (list.Count == 0) list.Add(EmptyProviderStatus());
+            Providers = list;
+        }
+
         public void RefreshData()
         {
+            RefreshDue(true);
+        }
+
+        public void RefreshDue(bool force)
+        {
+            if (_exiting) return;
+            if (!IsConfigured)
+            {
+                ResetProviderDisplay();
+                Floating.Rebuild();
+                UpdateTrayTip();
+                return;
+            }
+            bool due = force;
+            foreach (var provider in Cfg.Providers)
+                if (provider != null && provider.CanQuery && provider.IsRefreshDue(DateTime.UtcNow)) due = true;
+            if (!due) return;
             if (Interlocked.CompareExchange(ref _fetching, 1, 0) != 0) return;
+            // 保存设置会换成新列表；请求与回调始终绑定发起时的配置快照。
+            var providers = Cfg.Providers;
+            int refreshSec = Cfg.RefreshSec;
             ThreadPool.QueueUserWorkItem(delegate
             {
                 // 并行请求各服务商，避免串行超时叠加（最差 4×15s → 单次 15s）
-                var providers = Cfg.Providers;
-                var results = new ProviderStatus[providers.Count];
+                var results = new List<ProviderStatus>[providers.Count];
                 System.Threading.Tasks.Parallel.For(0, providers.Count, i =>
                 {
                     var p = providers[i];
-                    if (!p.HasKey && !p.CanUseLocalCreds) return;   // 未配置 key 且无本地凭证可用：跳过（该供应商整行不出现，首屏占位循环用同一规则）
+                    if (!object.ReferenceEquals(providers, Cfg.Providers) || p == null || !p.CanQuery) return;
+                    if (!force && !p.IsRefreshDue(DateTime.UtcNow))
+                    { results[i] = p.LastResults ?? new List<ProviderStatus> { QuotaService.EmptyStatus(p, null) }; return; }
                     try
                     {
-                        ProviderStatus st;
-                        if (p.Type == "mx") st = QuotaService.FetchMiniMax(p);
-                        else if (p.Type == "kimi") st = QuotaService.FetchKimi(p);
-                        else if (p.Type == "ds") st = QuotaService.FetchDeepSeek(p);
-                        else if (p.Type == "claude") st = QuotaService.FetchClaude(p, false);
-                        else if (p.Type == "codex") st = QuotaService.FetchCodex(p);
-                        else st = QuotaService.FetchGlm(p);
-                        results[i] = st;
+                        results[i] = QuotaService.FetchProvider(p, false);
                     }
-                    catch (Exception ex) { results[i] = new ProviderStatus { Name = p.Name, Type = p.Type, Region = p.Region, ShowName = p.ShowName, Error = ex.Message }; }
+                    catch (Exception ex) { results[i] = new List<ProviderStatus> { QuotaService.EmptyStatus(p, ex.Message) }; }
+                    lock (p)
+                    {
+                        p.LastResults = results[i];
+                        p.LastFetchUtc = DateTime.UtcNow;
+                        DateTime next = p.LastFetchUtc.AddSeconds(p.EffectiveRefreshSec(refreshSec));
+                        p.NextRefreshUtc = p.CooldownUntilUtc > next ? p.CooldownUntilUtc : next;
+                    }
                 });
                 var list = new List<ProviderStatus>();
-                foreach (var st in results) if (st != null) list.Add(st);
-                if (list.Count == 0)
-                    list.Add(new ProviderStatus { Name = "未配置", Error = "右键 → 设置，添加供应商" });
-
+                foreach (var group in results) if (group != null) list.AddRange(group);
                 try
                 {
-                    Floating.BeginInvoke((Action)delegate
-                    {
-                        // 回调体自包 try/finally：外层 catch 只覆盖 BeginInvoke 分发本身，
-                        // 回调内异常（如 GDI OOM / 退出竞态）若不复位 _fetching，此后所有
-                        // 刷新在重入检查处直接 return，自动刷新静默永久失效
-                        try
-                        {
-                            Providers = list;
-                            Floating.Rebuild();
-                            if (_topBar != null && _topBar.Visible) _topBar.Rebuild();
-                            UpdateTrayTip();
-                        }
-                        finally { Interlocked.Exchange(ref _fetching, 0); }
-                    });
+                    Floating.BeginInvoke((Action)delegate { CompleteRefresh(providers, list); });
                 }
                 catch { Interlocked.Exchange(ref _fetching, 0); }
             });
+        }
+
+        private void CompleteRefresh(List<ProviderConfig> source, List<ProviderStatus> results)
+        {
+            bool stale = !object.ReferenceEquals(source, Cfg.Providers);
+            try
+            {
+                if (_exiting) return;
+                if (stale)
+                {
+                    // 只接收仍启用且请求未改变的接口结果，保留保存后设定的下一次查询时间。
+                    MergeCompletedRefresh(source);
+                    ResetProviderDisplay(); Floating.Rebuild(); UpdateTrayTip();
+                    return;
+                }
+                if (results.Count == 0) results.Add(EmptyProviderStatus());
+                Providers = results;
+                Floating.Rebuild();
+                UpdateTrayTip();
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _fetching, 0);
+                if (stale && !_exiting) RefreshDue(false); // 仅补上已到期的查询，不强制刷新新配置。
+            }
         }
 
         public void UpdateTrayTip()
@@ -2523,6 +3117,8 @@ namespace QuotaWidget
                 else sb.Append(p.DisplayName).Append(" --");
             }
             string tip = sb.ToString();
+            if (!IsConfigured)
+                tip = "AI 额度工具 v" + AppInfo.Version + (Cfg.AllProvidersDisabled ? " · 已暂停所有供应商" : " · 未配置，右键打开设置");
             // 压缩分隔符/措辞后仍超长时，优先保留末尾完整项（最后配置的供应商），
             // 从前往后舍去并加省略号，避免像旧逻辑那样把末尾余额直接截掉
             if (tip.Length > 63)
@@ -2538,9 +3134,9 @@ namespace QuotaWidget
             // 防重入：Floating.Close() 会再次触发 OnFormClosing 路由回此处
             if (_exiting) return;
             _exiting = true;
-            if (_topBar != null) _topBar.UnregisterAppBar();
             Tray.Visible = false;
             Floating.Close();
+            Tray.Dispose();
             ExitThread();
         }
     }
@@ -2553,17 +3149,14 @@ namespace QuotaWidget
         private System.Windows.Forms.Timer _uiTimer;
         private System.Windows.Forms.Timer _refreshTimer;
         private System.Windows.Forms.Timer _hideTimer;
+        private bool _contextMenuOpen;
         private System.Windows.Forms.Timer _showTimer;
-        // 详情面板"看守"定时器：只兜底，不参与唤出/收起的事件配对。
-        // 面板的显隐原本全靠 MouseEnter/MouseLeave 配对驱动，鼠标从悬浮窗直接移开、
-        // 既没掠过面板、离开后那一发 _hideTimer 判定又恰好落在面板矩形内时，
-        // _hideTimer 判定不通过便自行 Stop()，此后没有任何入口再关面板 → 面板永久驻留。
+        private System.Windows.Forms.Timer _trayRevealTimer;
+        private const int TrayRevealMs = 2000;
+        // 悬停看守只补上透明区域漏掉的进出事件；所有移出路径共用一个收起计时器。
         private System.Windows.Forms.Timer _watchdogTimer;
-        private int? _detailOffSince;   // 鼠标既不在悬浮窗也不在面板内的起始时刻；null = 尚未离开过
-        // 看守节奏：250ms 轮询一次，光标离开悬浮窗与面板后须持续 700ms 才收面板。
-        // 两处硬编码收敛成常量，TopBarForm 的同名成员必须保持一致
-        private const int WatchdogIntervalMs = 250;
-        private const int DetailOffGraceMs = 700;
+        private const int WatchdogIntervalMs = 50;
+        private const int HoverHideDelayMs = 500;
         private bool _dragging;
         private Point _dragOffset;
 
@@ -2666,39 +3259,44 @@ namespace QuotaWidget
             _uiTimer = new System.Windows.Forms.Timer { Interval = 1000 };
             _uiTimer.Tick += delegate
             {
-                // 灵动岛吸附兜底：初始显示/切换排列后鼠标不在窗口上时贴顶收起
-                //（MouseLeave 覆盖不到"从未进入过窗口"的场景）
-                if (VerticalDocked && !_edgeCollapsed && !_dragging && !AnimRunning
-                    && !Bounds.Contains(Cursor.Position))
-                    EdgeCollapse();
-                else if (_island && _edgeDocked && !_edgeCollapsed && !_dragging && !AnimRunning
-                    && !Bounds.Contains(Cursor.Position))
-                    EdgeCollapse();
+                _ctx.UpdateTrayTip();
+                if (!Visible) return; // 关闭悬浮窗后仍刷新托盘摘要，不再重绘隐藏窗口。
                 UpdateLayered();
                 if (_detail.Visible) _detail.UpdateLayered();
-                _ctx.UpdateTrayTip();
             };
             _uiTimer.Start();
 
             _refreshTimer = new System.Windows.Forms.Timer();
-            _refreshTimer.Tick += delegate { _ctx.RefreshData(); };
+            _refreshTimer.Tick += delegate { _ctx.RefreshDue(false); };
 
-            // 500ms：原 350ms 对"卡片→面板"路径偏短——鼠标还在两者间隙里时这一发判定必然落空。
-            // 根因是显隐依赖事件配对（间隙里没人调 CancelHide），500ms 只是把命中率降低，
-            // 真正的兜底是下面的看门狗；鼠标只要进了面板就会被 DetailForm.OnMouseEnter 取消
-            _hideTimer = new System.Windows.Forms.Timer { Interval = 500 };
+            // 从首次离开悬浮窗和详情区域开始计时，重复移出事件和轮询不得重置倒计时。
+            _hideTimer = new System.Windows.Forms.Timer { Interval = HoverHideDelayMs };
             _hideTimer.Tick += delegate
             {
-                _hideTimer.Stop();
-                if (!Bounds.Contains(Cursor.Position) && !_detail.Bounds.Contains(Cursor.Position))
+                CancelHide();
+                if (!KeepHoverOpen())
+                {
                     HideDetail();
+                    if (_edgeDocked) EdgeCollapse();
+                }
             };
 
             _showTimer = new System.Windows.Forms.Timer { Interval = 1000 };
             _showTimer.Tick += delegate
             {
                 _showTimer.Stop();
-                if (!_dragging && Bounds.Contains(Cursor.Position)) ShowDetail();
+                if (Visible && !_contextMenuOpen && !_dragging && PointerOverWidget()) ShowDetail();
+            };
+
+            _trayRevealTimer = new System.Windows.Forms.Timer { Interval = TrayRevealMs };
+            _trayRevealTimer.Tick += delegate
+            {
+                _trayRevealTimer.Stop();
+                if (Visible && _edgeDocked && !KeepHoverOpen())
+                {
+                    HideDetail();
+                    EdgeCollapse();
+                }
             };
 
             _watchdogTimer = new System.Windows.Forms.Timer { Interval = WatchdogIntervalMs };
@@ -2711,6 +3309,8 @@ namespace QuotaWidget
 
         public void ApplyFromConfig()
         {
+            _trayRevealTimer.Stop();
+            if (_animTimer != null) _animTimer.Stop();
             var cfg = _ctx.Cfg;
             // 排列：矩形卡片 / 条形灵动岛（岛复用贴边吸附机制，仅外观与默认停靠不同）
             bool wasIsland = _island;
@@ -2730,11 +3330,8 @@ namespace QuotaWidget
             if (_detail.Visible) _detail.UpdateLayered();
 
             _refreshTimer.Stop();
-            _refreshTimer.Interval = Math.Max(15, cfg.RefreshSec) * 1000;
+            _refreshTimer.Interval = 1000; // 每秒检查独立到期时间，未到期的供应商不发请求。
             _refreshTimer.Start();
-            // 从置顶栏模式切回时 _uiTimer 处于停止态（SuspendTimers 所停），必须在此重启；
-            // 构造函数里的 Start() 只执行一次，缺了这行倒计时/托盘 tip 将永久冻结。
-            // 看门狗同理必须在 SuspendTimers/此处成对停启，且位置要在下面的分支 return 之前
             _uiTimer.Start();
             _watchdogTimer.Start();
 
@@ -2775,7 +3372,7 @@ namespace QuotaWidget
                         _edgeCollapsed = false;
                         _edgeJustUndocked = false;
                         _edgeTargetY = cfg.Y;
-                        Rebuild();      // 竖向尺寸 + 贴边展开落位；鼠标不在窗口上时由 _uiTimer 兜底收起
+                        Rebuild();      // 竖向尺寸 + 贴边展开落位；鼠标不在窗口上时由悬停看守延迟收起
                         return;
                     }
                     if (cfg.Vertical)
@@ -2836,18 +3433,45 @@ namespace QuotaWidget
             Rebuild();
         }
 
-        // 切到置顶栏模式后本窗口隐藏，停止刷新/重绘定时器，避免两个模式的定时器
-        // 同时常驻触发（此前仅靠 _fetching 防重入兜底）；托盘 tip 改由 TopBarForm 的 _uiTimer 接管
-        public void SuspendTimers()
+        // 托盘仅定位已开启的窗口。重复单击重新计时，普通悬浮/固定窗口保持常驻。
+        public void RevealFromTray()
         {
-            _uiTimer.Stop();
-            _refreshTimer.Stop();
-            _watchdogTimer.Stop();   // 与 ApplyFromConfig 成对，切回本模式时必须重启
-            // 切模式时窗口整体隐藏，详情面板是独立窗口会留在屏幕上，必须一起收掉
-            if (_detail.Visible) HideDetail();
+            if (!Visible) return;
+            _trayRevealTimer.Stop();
+            if (_edgeDocked && !PointerOverWidget())
+                _trayRevealTimer.Start(); // 先保护展开期，避免鼠标事件或悬停看守提前收起。
+            if (_edgeDocked) EdgeExpand();
+            BringToFront();
         }
 
-        // Alt+F4 / WM_CLOSE 走正规退出流程（清理托盘图标与工作区），否则消息循环直接结束、
+        public void SetContextMenuOpen(bool open)
+        {
+            _contextMenuOpen = open;
+            _trayRevealTimer.Stop(); _showTimer.Stop(); _hideTimer.Stop();
+            if (open || !Visible) return;
+            if (PointerOverWidget()) _showTimer.Start();
+            else ArmHide(); // 菜单释放后留出正常的鼠标移动宽限期。
+        }
+
+        protected override void OnVisibleChanged(EventArgs e)
+        {
+            base.OnVisibleChanged(e);
+            if (Visible) return;
+            if (_trayRevealTimer != null) _trayRevealTimer.Stop();
+            if (_showTimer != null) _showTimer.Stop();
+            if (_hideTimer != null) _hideTimer.Stop();
+            if (AnimRunning)
+            {
+                _animTimer.Stop();
+                Location = _animTarget;
+            }
+            _dragging = false;
+            _edgeArmed = false;
+            HideGhost();
+            if (_detail != null) HideDetail();
+        }
+
+        // Alt+F4 / WM_CLOSE 走正规退出流程（清理托盘图标），否则消息循环直接结束、
         // ExitApp 被跳过，托盘留下幽灵图标；ExitApp 内部通过 IsExiting 防止二次路由
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
@@ -2893,6 +3517,12 @@ namespace QuotaWidget
                 Width = IslandWidth();
                 Height = St.SiF(IslandH, _scale);
                 if (Width != oldW) Left += (oldW - Width) / 2;
+                if (_edgeDocked)
+                {
+                    // 内容宽度变化后，同步停靠目标与悬停区域，避免右侧圆角落在旧范围外。
+                    _edgeTargetX = Left;
+                    if (AnimRunning) _animTarget.X = Left;
+                }
             }
             else
             {
@@ -2917,9 +3547,9 @@ namespace QuotaWidget
                 {
                     bool err = st.Error != null;
                     var pool = st.Primary5h;
-                    float lw = (!st.ShowName && BrandIcons.Get(st.Type, dark) != null)
+                    float lw = (!st.ShowName && BrandIcons.Get(st.IconType, dark) != null)
                         ? St.SiF(12 + 16, s)
-                        : g.MeasureString(st.Name, fs[0]).Width + St.SiF(12, s);
+                        : g.MeasureString(st.WidgetName, fs[0]).Width + St.SiF(12, s);
                     float rw = 0;
                     if (err) rw = g.MeasureString("失败", fs[2]).Width;
                     else if (pool != null)
@@ -3027,7 +3657,13 @@ namespace QuotaWidget
                 int remain = pool == null ? 0 : Math.Max(0, Math.Min(100, 100 - pool.Percent));
                 Color c = err ? St.Red : St.RemainColor(remain);
                 // 第一行：环形进度 + 厂商图标（与横向岛同款大环）
-                St.DrawRingIcon(g, st.Type, err ? 0 : remain, c, Width / 2f, y + ringD / 2f, _scale, 38, 4f, dark);
+                if (st.ShowName)
+                {
+                    using (var b = new SolidBrush(St.Text))
+                    using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter })
+                        g.DrawString(st.WidgetName, fs[1], b, new RectangleF(St.SiF(4, _scale), y, Width - St.SiF(8, _scale), ringD), sf);
+                }
+                else St.DrawRingIcon(g, st.IconType, err ? 0 : remain, c, Width / 2f, y + ringD / 2f, _scale, 38, 4f, dark);
                 // 第二行：百分比 / 余额 / 失败
                 string txt = err ? "失败" : (pool == null ? "--" : (pool.IsMoney ? pool.Currency + St.FmtMoney(pool.Remaining) : remain + "%"));
                 using (var b = new SolidBrush(err ? St.Dim : c))
@@ -3143,21 +3779,26 @@ namespace QuotaWidget
 
         private void OnEnterAny(object s, EventArgs e)
         {
-            _hideTimer.Stop(); _showTimer.Stop();
-            if (_edgeDocked)
-            {
-                EdgeExpand();
-                // 展开后正常允许唤出详情面板（鼠标仍在窗口上时计时）
-                _showTimer.Start();
-                return;
-            }
-            _showTimer.Start();
+            _trayRevealTimer.Stop(); // 鼠标接管后恢复正常悬停/移出行为。
+            CancelHide();
+            if (_edgeDocked) EdgeExpand();
+            // 透明圆角或动画产生的重复进入事件不重置详情唤出时间。
+            if (!_contextMenuOpen && !_dragging && !_detail.Visible && !_showTimer.Enabled) _showTimer.Start();
         }
         private void OnLeaveAny(object s, EventArgs e)
         {
-            _showTimer.Stop(); _hideTimer.Stop();
-            if (_edgeDocked) { EdgeCollapse(); return; }  // 吸附态：滑回收起（左右竖向岛常驻，见 EdgeCollapse）
-            _hideTimer.Start();
+            // 分层窗口的透明圆角、滑动动画都会产生 MouseLeave；仍在展开区域内时忽略。
+            if (PointerOverWidget()) return;
+            _showTimer.Stop(); ArmHide();
+        }
+
+        private bool PointerOverWidget()
+        {
+            if (!Visible) return false;
+            // 展开时使用固定目标区域，不跟随动画中的窗口位置或圆角透明像素跳变。
+            Rectangle area = _edgeDocked && !_edgeCollapsed ? EdgeExpandBounds() : Bounds;
+            if (_edgeDocked && !_edgeCollapsed) area.Inflate(St.SiF(2, _scale), St.SiF(2, _scale));
+            return area.Contains(Cursor.Position);
         }
 
         // ---- 贴边隐藏逻辑 ----
@@ -3241,7 +3882,7 @@ namespace QuotaWidget
 
         private void EdgeCollapse()
         {
-            if (_edgeCollapsed) return;
+            if (_edgeCollapsed || _dragging || _contextMenuOpen || _trayRevealTimer.Enabled || _hideTimer.Enabled) return;
             var wa = Screen.FromControl(this).WorkingArea;
             // 左右竖向吸附：向屏幕外侧滑出，只露 PeekPx 一条便于再次移入展开
             if (VerticalDocked)
@@ -3269,6 +3910,7 @@ namespace QuotaWidget
         // 锁定位置开启时调用：停动画、清吸附态、窗口靠顶部展开固定
         public void RestoreFromEdge()
         {
+            _trayRevealTimer.Stop();
             if (_animTimer != null) _animTimer.Stop();   // 防止收缩动画把位置改回去
             _edgeArmed = false;
             _edgeJustUndocked = false;
@@ -3339,7 +3981,7 @@ namespace QuotaWidget
 
         private void ShowDetail()
         {
-            if (_ctx.Providers.Count == 0) return;
+            if (!Visible || _ctx.Providers.Count == 0) return;
             _detail.UpdateData();
             var wa = Screen.FromControl(this).WorkingArea;
             int x = Left;
@@ -3360,38 +4002,40 @@ namespace QuotaWidget
             if (!_detail.Visible) _detail.Show();
         }
 
-        public void ArmHide() { _hideTimer.Stop(); _hideTimer.Start(); }
+        private bool PointerOverHoverArea()
+        {
+            return PointerOverWidget() || (_detail.Visible && _detail.Bounds.Contains(Cursor.Position));
+        }
+
+        private bool KeepHoverOpen()
+        {
+            return !Visible || _contextMenuOpen || _dragging || _trayRevealTimer.Enabled || PointerOverHoverArea();
+        }
+
+        public void ArmHide()
+        {
+            if (KeepHoverOpen()) { CancelHide(); return; }
+            _showTimer.Stop();
+            if (!_hideTimer.Enabled && ((_edgeDocked && !_edgeCollapsed) || _detail.Visible)) _hideTimer.Start();
+        }
         public void CancelHide() { _hideTimer.Stop(); }
 
-        // ---- 详情面板看守（兜底）----
-        // 只负责"鼠标已经离开悬浮窗和面板、但面板还挂着"这一种漏网情况，不改变原有
-        // 唤出/收起语义：鼠标停在悬浮窗或面板上时计数永远清零，面板一直显示。
+        // ---- 悬停看守（兜底）----
+        // 模态配置窗口会禁用同线程窗体的鼠标消息，透明圆角也可能漏掉进出事件。
+        // 定时检查固定区域，补齐进入与离开；沿用原有计时，重复检查不重新计时。
         private void WatchdogTick()
         {
-            if (!_detail.Visible) { _detailOffSince = null; return; }
-            if (ShouldHideStuckDetail()) HideDetail();
+            if (!Visible) return;
+            if (PointerOverWidget())
+            {
+                OnEnterAny(this, EventArgs.Empty);
+                return;
+            }
+            if (_detail.Visible && _detail.Bounds.Contains(Cursor.Position)) _trayRevealTimer.Stop();
+            ArmHide();
         }
 
-        // 是否满足"鼠标已离开悬浮窗和面板、且持续超过缓冲时长"→ 可以收面板
-        private bool ShouldHideStuckDetail()
-        {
-            // 吸附态收起中：光标若落在岛体"展开后"应占的范围内（Peek 条上方那条空带，
-            // 再往下一点就会触发 EdgeExpand），不能按"已离开"处理，否则展开动画期间面板会被误关。
-            // 注意这里只 return false、不复位 _detailOffSince，等价于"暂停倒计时"：
-            // 光标离开该带区后会立刻（≤250ms）收面板，而不是再等一个完整宽限期
-            if (_edgeDocked && _edgeCollapsed && EdgeExpandBounds().Contains(Cursor.Position)) return false;
-            // Visible：宿主整体隐藏后（托盘切换 / 切到置顶栏模式 / 置顶栏 Alt+F4），光标可能仍停在
-            // 本窗口矩形内，只按 Bounds 判断会让面板永远收不掉——被 owner 隐藏的窗口托管 Visible
-            // 依旧是 true，而 _detail 在置顶栏下是 Show(this) 的从属窗口
-            bool over = _dragging || (Visible && Bounds.Contains(Cursor.Position)) || _detail.Bounds.Contains(Cursor.Position);
-            if (over) { _detailOffSince = null; return false; }
-            // 哨兵必须是 null 而不是 0：Environment.TickCount 本身是约 22 亿的正数，
-            // 用 0 作"尚未离开"的标记时 TickCount-0 已远大于阈值，首帧就会误判为超时
-            if (!_detailOffSince.HasValue) { _detailOffSince = Environment.TickCount; return false; }
-            return unchecked(Environment.TickCount - _detailOffSince.Value) >= DetailOffGraceMs;
-        }
-
-        // 吸附收起态下，岛体"展开后"应占的矩形：用于判断光标是否仍压在 Peek 条上
+        // 岛体展开后占用的固定矩形：圆角和动画期间都按同一范围判断悬停。
         private Rectangle EdgeExpandBounds()
         {
             var wa = Screen.FromControl(this).WorkingArea;
@@ -3400,12 +4044,12 @@ namespace QuotaWidget
             return new Rectangle(_edgeTargetX, wa.Top, Width, Height);
         }
 
-        // 关面板统一入口：顺带复位看守计数，避免旧时间戳残留导致下次弹出被立刻收掉
+        // 关面板统一入口：清掉共用的移出倒计时，避免下次进入时沿用旧计时。
         private void HideDetail()
         {
-            _hideTimer.Stop();
-            _detailOffSince = null;
             _detail.Hide();
+            // Hide 可能同步触发详情的 MouseLeave，在其回调之后清理，避免重新启动计时。
+            CancelHide();
         }
 
         protected override void Dispose(bool disposing)
@@ -3416,6 +4060,7 @@ namespace QuotaWidget
                 if (_refreshTimer != null) _refreshTimer.Dispose();
                 if (_hideTimer != null) _hideTimer.Dispose();
                 if (_showTimer != null) _showTimer.Dispose();
+                if (_trayRevealTimer != null) _trayRevealTimer.Dispose();
                 if (_watchdogTimer != null) _watchdogTimer.Dispose();
                 if (_animTimer != null) _animTimer.Dispose();
                 if (_detail != null) _detail.Dispose();
@@ -3448,38 +4093,13 @@ namespace QuotaWidget
         }
     }
 
-    // ============================= 置顶栏拖拽虚影预览 =============================
-    internal class AppBarGhostForm : LayeredForm
-    {
-        public AppBarGhostForm()
-        {
-            FormBorderStyle = FormBorderStyle.None;
-            ShowInTaskbar = false;
-            StartPosition = FormStartPosition.Manual;
-            TopMost = true;
-            AutoScaleMode = AutoScaleMode.None;
-        }
-
-        protected override void OnLayeredPaint(Graphics g)
-        {
-            // 半透明绿色描边 + 极淡填充，提示「松手将停靠到此屏幕顶部」
-            using (var path = St.RoundRect(new Rectangle(0, 0, Width - 1, Height - 1), 6))
-            {
-                using (var brush = new SolidBrush(Color.FromArgb(36, St.Green.R, St.Green.G, St.Green.B)))
-                    g.FillPath(brush, path);
-                using (var pen = new Pen(St.Green, 2.5f))
-                    g.DrawPath(pen, path);
-            }
-        }
-    }
-
     // ============================= 详情面板 =============================
     internal class DetailForm : LayeredForm
     {
         private readonly AppContext _ctx;
         private const int BaseW = 380;
 
-        // 由宿主窗口（FloatingForm / TopBarForm）设置，解耦对具体窗口类型的依赖
+        // 由宿主窗口 FloatingForm 设置，解耦对具体窗口类型的依赖
         public Action RequestCancelHide;
         public Action RequestArmHide;
         // DPI 缩放因子（由宿主窗口设置，默认跟主屏一致）
@@ -3586,8 +4206,8 @@ namespace QuotaWidget
                 // 图标垂直对齐标题行文字中心；未定义图标的类型回退为原来的彩色圆点
                 bool dark = St.Theme == 1;
                 int isz = Si(16);
-                if (BrandIcons.Get(p.Type, dark) != null)
-                    BrandIcons.Draw(g, p.Type, dark, Si(16), (int)Math.Round(y + Si(2) + (fs[0].GetHeight(g) - isz) / 2f), isz);
+                if (BrandIcons.Get(p.IconType, dark) != null)
+                    BrandIcons.Draw(g, p.IconType, dark, Si(16), (int)Math.Round(y + Si(2) + (fs[0].GetHeight(g) - isz) / 2f), isz);
                 else
                     using (var b = new SolidBrush(St.AccentFor(p.Type)))
                         g.FillEllipse(b, Si(16), y + Si(6), Si(9), Si(9));
@@ -3671,27 +4291,11 @@ namespace QuotaWidget
         }
     }
 
-    // ============================= 置顶栏（普通置顶窗口 + 手动工作区预留） =============================
-    // 不使用 SHAppBarMessage（混合 DPI 下会导致系统疯狂广播 ABN_POSCHANGED → 卡顿）。
-    // 改用普通 TopMost 窗口 + SystemParametersInfo(SPI_SETWORKAREA) 手动预留工作区。
-    // SPI_SETWORKAREA 只修改系统工作区度量，不触发 AppBar 消息循环，不会卡顿。
-    internal class TopBarForm : LayeredForm
+    // ============================= 旧版置顶栏工作区清理 =============================
+    // 升级兼容：仅检测到旧残留文件才恢复；不再创建快照或预留屏幕空间。
+    internal static class LegacyWorkAreaCleanup
     {
-        private readonly AppContext _ctx;
-        internal DetailForm _detail;
-        private System.Windows.Forms.Timer _uiTimer;
-        private System.Windows.Forms.Timer _refreshTimer;
-        private System.Windows.Forms.Timer _hideTimer;
-        private System.Windows.Forms.Timer _showTimer;
-
-        // 详情面板"看守"定时器：只兜底，不参与唤出/收起的事件配对（详见 FloatingForm 同名成员）
-        private System.Windows.Forms.Timer _watchdogTimer;
-        private int? _detailOffSince;   // 鼠标既不在置顶栏也不在面板内的起始时刻；null = 尚未离开过
-        // 与 FloatingForm 的 WatchdogIntervalMs / DetailOffGraceMs 必须保持一致
-        private const int WatchdogIntervalMs = 250;
-        private const int DetailOffGraceMs = 700;
-
-        // ---- 工作区预留 P/Invoke ----
+        // 仅用于恢复旧版遗留的工作区与最大化窗口。
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
         private static extern bool SystemParametersInfo(int uAction, int uParam, ref RECT pvParam, int fuWinIni);
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
@@ -3712,8 +4316,6 @@ namespace QuotaWidget
         private static extern IntPtr MonitorFromPoint(Point pt, uint flags);
         [DllImport("user32.dll")]
         private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
-        [DllImport("shcore.dll")]
-        private static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
 
         private const int SPI_SETWORKAREA = 47;
         private const int WM_SETTINGCHANGE = 0x001A;
@@ -3736,111 +4338,10 @@ namespace QuotaWidget
         private static extern IntPtr SHAppBarMessage(int dwMessage, ref APPBARDATA pData);
         private const int ABM_GETTASKBARPOS = 5;
 
-        private int _currentScreen = -1;
-        // 系统原始工作区（不含本程序 bar 预留，但含任务栏预留）：用于计算预留后的真实可用区，避免最大化窗口被任务栏遮挡
         private static List<Rectangle> _originalWorkAreas;
         private static bool _originalLoaded;
-        private bool _startupCleaned;               // 启动时是否已完成崩溃残留清理
-
-        // ---- 拖拽 ----
-        private bool _dragging;
-        private AppBarGhostForm _ghost;
-        private int _ghostScreen = -1;
-
-        private const int BaseBarHeight = 38;   // DIP 基准高度（96DPI 下）
-        private int _barHeight = BaseBarHeight;    // 当前屏幕缩放后的实际像素高度
-        // 当前屏缩放因子（DPI/96）：直接保存，避免由 int 截断的 _barHeight 反推产生精度误差（如 125% 屏反推得 1.2368 而非 1.25）
-        private float _scale = 1f;
-
-        // 获取目标屏幕的 DPI（复用 St 公共实现）
-        private static int GetScreenDpi(Screen screen) { return St.DpiOf(screen); }
-
-        public TopBarForm(AppContext ctx)
-        {
-            _ctx = ctx;
-            FormBorderStyle = FormBorderStyle.None;
-            ShowInTaskbar = false;
-            StartPosition = FormStartPosition.Manual;
-            Height = _barHeight;
-            TopMost = true;
-
-            // 首次显示后强制修正高度（WinForms 首次 Show 时可能因非客户区/自动缩放导致高度偏大）
-            Shown += delegate
-            {
-                if (Height != _barHeight)
-                {
-                    Height = _barHeight;
-                    // 高度变了，重新预留工作区以匹配
-                    if (_currentScreen >= 0) ReserveWorkArea(_currentScreen);
-                }
-                UpdateLayered();
-            };
-
-            _detail = new DetailForm(ctx);
-            _detail.DpiScale = St.Scale;
-            _detail.RequestCancelHide = CancelHide;
-            _detail.RequestArmHide = ArmHide;
-
-            _uiTimer = new System.Windows.Forms.Timer { Interval = 1000 };
-            _uiTimer.Tick += delegate
-            {
-                UpdateLayered();
-                if (_detail.Visible) _detail.UpdateLayered();
-                _ctx.UpdateTrayTip();
-            };
-
-            _refreshTimer = new System.Windows.Forms.Timer();
-            _refreshTimer.Tick += delegate { _ctx.RefreshData(); };
-
-            // 500ms：与悬浮窗保持一致，避免两条关闭路径延迟差近一倍（详见 FloatingForm 构造函数）
-            _hideTimer = new System.Windows.Forms.Timer { Interval = 500 };
-            _hideTimer.Tick += delegate
-            {
-                _hideTimer.Stop();
-                if (!Bounds.Contains(Cursor.Position) && !_detail.Bounds.Contains(Cursor.Position))
-                    HideDetail();
-            };
-
-            _showTimer = new System.Windows.Forms.Timer { Interval = 800 };
-            _showTimer.Tick += delegate
-            {
-                _showTimer.Stop();
-                if (!_dragging && Bounds.Contains(Cursor.Position)) ShowDetail();
-            };
-
-            _watchdogTimer = new System.Windows.Forms.Timer { Interval = WatchdogIntervalMs };
-            _watchdogTimer.Tick += delegate { WatchdogTick(); };
-            _watchdogTimer.Start();
-        }
-
-        // ---- 辅助 ----
-        private Screen GetScreen(int index)
-        {
-            var screens = Screen.AllScreens;
-            if (screens.Length == 0) return Screen.PrimaryScreen;
-            if (index < 0 || index >= screens.Length) return screens[0];
-            return screens[index];
-        }
-
-        private static int FindScreenIndex(Point pt)
-        {
-            var screens = Screen.AllScreens;
-            for (int i = 0; i < screens.Length; i++)
-                if (screens[i].Bounds.Contains(pt)) return i;
-            return 0;
-        }
-
-        // 预留工作区：把目标屏的工作区顶部下移 BarHeight。
-        // SPI_SETWORKAREA 是每屏独立的：传入的 RECT 必须位于目标屏幕区域内。
-        // 关键发现（来自微软文档 + ExplorerPatcher/AutoIt 实践）：
-        //   - 设小工作区时系统自动重排最大化窗口（缩小）；
-        //   - 设大工作区时最大化窗口不会自动恢复（增大），必须手动 SetWindowPos 触发。
-        //   - 多屏下传虚拟桌面并集是错误的，必须传目标屏自己的 Bounds。
         private static string WorkAreaFile { get { return Path.Combine(Path.GetTempPath(), "QuotaWidget-workarea.txt"); } }
 
-        // 加载系统原始工作区（含任务栏预留、不含本程序 bar 预留）：
-        // - 首次运行（无持久化文件）：以当前各屏 WorkingArea 作为原始值并持久化；
-        // - 崩溃恢复（文件存在）：解析文件中保存的原始值，避免读到被本程序修改过的工作区。
         private static List<Rectangle> LoadOriginalWorkAreas()
         {
             if (_originalLoaded) return _originalWorkAreas;
@@ -3870,7 +4371,7 @@ namespace QuotaWidget
                         for (int i = 0; i < screens.Length && i < list.Count; i++)
                         {
                             var b = screens[i].Bounds;
-                            if (list[i].Left < b.Left || list[i].Top < b.Top ||
+                            if (list[i].Width <= 0 || list[i].Height <= 0 || list[i].Left < b.Left || list[i].Top < b.Top ||
                                 list[i].Right > b.Right || list[i].Bottom > b.Bottom)
                             { valid = false; break; }
                         }
@@ -3883,61 +4384,14 @@ namespace QuotaWidget
             if (!fromFile)
             {
                 // 文件存在说明上次未正常退出，当前 WorkingArea 可能仍残留本程序的 bar 预留；
-                // 屏数/分辨率变化导致文件整体校验失败时尤甚——直接采集会把污染值当"原始值"
-                // 持久化，退出恢复后屏幕顶部将永久损失一条 bar 高度，采集前先净化
+                // 屏数/分辨率变化导致旧快照无效时，先净化顶部残留再恢复。
                 bool sanitize = fileExists;
                 _originalWorkAreas = new List<Rectangle>();
                 foreach (var s in screens) _originalWorkAreas.Add(sanitize ? SanitizeOriginalArea(s) : s.WorkingArea);
-                // 采集后持久化；从文件成功加载时不回写，消除冗余 I/O。
-                SaveOriginalWorkAreas();
             }
             return _originalWorkAreas;
         }
 
-        private static void SaveOriginalWorkAreas()
-        {
-            if (_originalWorkAreas == null) return;
-            try
-            {
-                var sb = new StringBuilder();
-                foreach (var r in _originalWorkAreas)
-                    sb.Append(r.Left).Append(',').Append(r.Top).Append(',').Append(r.Right).Append(',').Append(r.Bottom).Append('|');
-                File.WriteAllText(WorkAreaFile, sb.ToString().TrimEnd('|'));
-            }
-            catch { }
-        }
-
-        // 运行中热插显示器：屏数变化时重采集快照。旧屏沿用已保存的原始值（按 Bounds 包含
-        // 关系匹配，容忍屏幕顺序变化），新屏按当前 WorkingArea 入册（本程序从未预留过该屏，
-        // 当前值即原始值）
-        private static void RefreshOriginalWorkAreasForScreenChange()
-        {
-            if (!_originalLoaded) return;
-            var screens = Screen.AllScreens;
-            if (screens.Length == _originalWorkAreas.Count) return;
-            var used = new bool[_originalWorkAreas.Count];
-            var list = new List<Rectangle>();
-            foreach (var s in screens)
-            {
-                int hit = -1;
-                for (int i = 0; i < _originalWorkAreas.Count; i++)
-                {
-                    if (used[i]) continue;
-                    var b = s.Bounds;
-                    var r = _originalWorkAreas[i];
-                    if (r.Left >= b.Left && r.Top >= b.Top && r.Right <= b.Right && r.Bottom <= b.Bottom) { hit = i; break; }
-                }
-                if (hit >= 0) { used[hit] = true; list.Add(_originalWorkAreas[hit]); }
-                // 未命中兜底走净化而非直接取 WorkingArea：同屏重应用时该屏可能仍带着本程序
-                // 的 bar 预留，直接采集会把预留态烙进"原始值"，退出后顶部永久缺一条 bar 高度
-                else list.Add(SanitizeOriginalArea(s));
-            }
-            _originalWorkAreas = list;
-            SaveOriginalWorkAreas();
-        }
-
-        // 启动时无条件清理上次崩溃/强杀残留的 bar 预留（残留文件存在才动作，正常退出无文件则空操作）；
-        // 此前仅进入 topbar 模式才清，float 模式启动会永远留着"桌面变矮"的残留
         public static void CleanupStartupResidue()
         {
             if (!File.Exists(WorkAreaFile)) return;
@@ -3949,10 +4403,6 @@ namespace QuotaWidget
             _originalLoaded = false;
         }
 
-        // 净化疑似残留的工作区：顶部留白超出任务栏高度的部分视为上次 bar 预留残留，
-        // 将 Top 修回 Bounds.Top + 任务栏在该屏顶部的占位（任务栏不在该屏顶部时记 0）。
-        // 仅在检测到上次异常退出（WorkAreaFile 存在）时调用，正常运行不修正，
-        // 避免误伤其他 appbar 类工具（Dock 等）的合法预留。
         private static Rectangle SanitizeOriginalArea(Screen s)
         {
             var wa = s.WorkingArea;
@@ -3975,10 +4425,6 @@ namespace QuotaWidget
             return wa;
         }
 
-        private int _reservedScreen = -1;
-
-        // 重排指定屏幕上的所有最大化窗口到目标工作区（工作区变化后系统不自动调整已最大化窗口）
-        // targetWorkArea: 窗口应适配的最终工作区矩形（恢复后的原始区 或 缩小后的预留区）
         private static void ReflowMaximizedWindows(Screen screen, Rectangle targetWorkArea)
         {
             EnumWindows(delegate(IntPtr hWnd, IntPtr lp)
@@ -3989,8 +4435,6 @@ namespace QuotaWidget
                 var screenHmon = MonitorFromPoint(
                     new Point(screen.Bounds.Left + screen.Bounds.Width / 2, screen.Bounds.Top + 1), 2);
                 if (hmon != screenHmon) return true;
-                // 跳过自己（置顶栏窗口）
-                if (hWnd == lp) return true;
                 // 主动设置最大化窗口到目标工作区的完整区域（去掉 SWP_NOSIZE / SWP_NOMOVE）。
                 // 仅用 SWP_FRAMECHANGED + 不变坐标，在资源管理器等部分窗口上无效——
                 // 它们收到 WM_SIZE 时 RECT 未变就不会重查工作区，顶部会卡在旧偏移。
@@ -4003,9 +4447,6 @@ namespace QuotaWidget
             }, IntPtr.Zero);
         }
 
-        // 恢复目标屏的【原始】工作区（含任务栏预留），并手动重排最大化窗口。
-        // Per-Monitor DPI 感知下坐标已统一为物理像素，广播 WM_SETTINGCHANGE 会让 Explorer
-        // 正确地将桌面图标移入可用工作区（仅顶部图标下移，其余不动）。
         private static void ResetWorkAreaForScreen(Screen screen)
         {
             var orig = LoadOriginalWorkAreas();
@@ -4026,334 +4467,6 @@ namespace QuotaWidget
                 PostMessage(progman, WM_SETTINGCHANGE, IntPtr.Zero, IntPtr.Zero);
         }
 
-        private void ReserveWorkArea(int screenIndex)
-        {
-            var bounds = GetScreen(screenIndex).Bounds;
-            var orig = LoadOriginalWorkAreas();
-            var origRect = (screenIndex >= 0 && screenIndex < orig.Count) ? orig[screenIndex] : bounds;
-
-            // 基于原始工作区（含任务栏预留）收缩而非全屏 Bounds：任务栏贴顶/贴左/贴右时，
-            // Left/Top/Right 保持任务栏占位，仅顶部为 bar 下压，预留结果不吞任务栏区域
-            var newRect = new RECT
-            {
-                Left = origRect.Left,
-                Top = origRect.Top + _barHeight,
-                Right = origRect.Right,
-                Bottom = origRect.Bottom
-            };
-
-            SystemParametersInfo(SPI_SETWORKAREA, 0, ref newRect, 0);
-            var shrunk = Rectangle.FromLTRB(newRect.Left, newRect.Top, newRect.Right, newRect.Bottom);
-            ReflowMaximizedWindows(GetScreen(screenIndex), shrunk);
-            // 广播工作区变更，让 Explorer 正确调整桌面图标（仅顶部图标下移）
-            PostMessage(HWND_BROADCAST, WM_SETTINGCHANGE, IntPtr.Zero, IntPtr.Zero);
-            var progman = FindWindow("Progman", null);
-            if (progman != IntPtr.Zero)
-                PostMessage(progman, WM_SETTINGCHANGE, IntPtr.Zero, IntPtr.Zero);
-            _reservedScreen = screenIndex;
-        }
-
-        // 切屏时清除旧屏预留
-        private void ClearWorkArea(int screenIndex)
-        {
-            ResetWorkAreaForScreen(GetScreen(screenIndex));
-        }
-
-        // 退出时恢复所有屏到原始工作区
-        private void RestoreWorkArea()
-        {
-            if (!_originalLoaded) return;
-            foreach (var s in Screen.AllScreens)
-                ResetWorkAreaForScreen(s);
-            try { File.Delete(WorkAreaFile); } catch { }
-            _originalWorkAreas = null;
-            _originalLoaded = false;
-            _reservedScreen = -1;
-        }
-
-        // 把置顶栏贴到目标屏顶部（全宽常驻），并预留工作区
-        private void ApplyToScreen(int screenIndex)
-        {
-            // 切屏时先清除旧屏的预留（恢复旧屏原始工作区）
-            if (_reservedScreen >= 0 && _reservedScreen != screenIndex)
-                ClearWorkArea(_reservedScreen);
-
-            // 运行中热插显示器：屏数变化时重采集快照，新增屏按当前工作区入册，避免索引错位
-            RefreshOriginalWorkAreasForScreenChange();
-
-            // 首次应用：加载/持久化原始工作区；若检测到上次崩溃残留（文件已存在），先恢复所有屏到原始值
-            if (!_startupCleaned)
-            {
-                _startupCleaned = true;
-                bool crashed = File.Exists(WorkAreaFile);
-                LoadOriginalWorkAreas();
-                if (crashed)
-                {
-                    foreach (var s in Screen.AllScreens)
-                        ResetWorkAreaForScreen(s);
-                }
-            }
-
-            var screen = GetScreen(screenIndex);
-            _scale = GetScreenDpi(screen) / 96f;
-            _barHeight = (int)(BaseBarHeight * _scale); // 与原实现一致：int 截断（125% 屏为 47px）
-            // 位置与宽度基于原始工作区（含任务栏预留）：任务栏贴顶/贴左时置于任务栏内侧，不遮挡任务栏
-            var origAreas = LoadOriginalWorkAreas();
-            var origRect = (screenIndex >= 0 && screenIndex < origAreas.Count) ? origAreas[screenIndex] : screen.Bounds;
-            Width = origRect.Width;
-            Height = _barHeight;
-            Location = new Point(origRect.Left, origRect.Top);
-            _currentScreen = screenIndex;
-            // 详情面板跟随目标屏 DPI（跨缩放屏切换时尺寸一致）
-            _detail.DpiScale = GetScreenDpi(screen) / 96f;
-            ReserveWorkArea(screenIndex);
-            UpdateLayered();
-        }
-
-        // 退出时恢复工作区
-        public void UnregisterAppBar()
-        {
-            RestoreWorkArea();
-        }
-
-        // ---- 配置应用 ----
-        public void ApplyFromConfig()
-        {
-            var cfg = _ctx.Cfg;
-            St.Theme = cfg.Theme == "dark" ? 1 : 2;
-            int pct = Math.Max(50, Math.Min(100, cfg.OpacityPct));
-            // 置顶栏与悬浮窗同为分层窗口：用 LayeredAlpha 控制不透明度（Form.Opacity 对 ULW 窗口无效）
-            LayeredAlpha = (byte)(255 * pct / 100);
-            _detail.LayeredAlpha = (byte)(255 * pct / 100);
-            // 置顶栏同样消费"窗口置顶"配置（此前硬编码 true，取消勾选后设置静默失效）
-            TopMost = cfg.TopMost;
-            _detail.TopMost = cfg.TopMost;
-
-            _refreshTimer.Stop();
-            _refreshTimer.Interval = Math.Max(15, cfg.RefreshSec) * 1000;
-            _refreshTimer.Start();
-
-            int targetScreen = Math.Max(0, Math.Min(Screen.AllScreens.Length - 1, cfg.AppBarScreen));
-            ApplyToScreen(targetScreen);
-
-            _uiTimer.Start();
-            _watchdogTimer.Start();   // 与 SuspendTimers 成对：切回置顶栏模式时必须重启看守
-            UpdateLayered();
-        }
-
-        // 切回悬浮窗模式后置顶栏隐藏且工作区已恢复，停止其刷新/重绘定时器，
-        // 避免与悬浮窗的定时器同时常驻触发
-        public void SuspendTimers()
-        {
-            _uiTimer.Stop();
-            _refreshTimer.Stop();
-            _watchdogTimer.Stop();   // 与 ApplyFromConfig 成对，切回本模式时必须重启
-            // 切模式时窗口整体隐藏，详情面板是独立窗口会留在屏幕上，必须一起收掉
-            if (_detail.Visible) HideDetail();
-        }
-
-        public void Rebuild()
-        {
-            UpdateLayered();
-        }
-
-        // ---- 绘制：全宽背景 + 居中横向徽标 ----
-        protected override void OnLayeredPaint(Graphics g)
-        {
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
-
-            // 背景
-            using (var brush = new SolidBrush(St.Bg))
-                g.FillRectangle(brush, 0, 0, Width, Height);
-            // 底部细线
-            using (var pen = new Pen(St.Border, 1f))
-                g.DrawLine(pen, 0, Height - 1, Width, Height - 1);
-
-            var providers = _ctx.Providers;
-            if (providers.Count == 0) return;
-
-            // 徽标绘制（数据与测量均来自 St.BuildBadges）
-            float s = _scale; // 当前屏缩放因子（直接保存的 DPI/96，避免 int 截断反推的精度误差）
-            float gap = 12f * s;
-            float totalW;
-            var badges = St.BuildBadges(providers, g, s, out totalW, 0, 0, St.Theme == 1);   // 置顶栏：无环纯图标
-
-            // 居中起始 X
-            float x = (Width - totalW) / 2;
-            if (x < 8) x = 8;
-
-            var fs = St.FontsForScale(s);
-            float textH = g.MeasureString("Ay", fs[1]).Height;
-            float textY = (Height - textH) / 2;
-
-            for (int i = 0; i < badges.Count; i++)
-            {
-                x += St.DrawBadge(g, badges[i], x, Height / 2f, textY, s, fs[0], fs[1], 0, 0, St.Theme == 1) + gap;
-            }
-        }
-
-        // ---- 鼠标交互 ----
-        protected override void OnMouseDoubleClick(MouseEventArgs e)
-        {
-            base.OnMouseDoubleClick(e);
-            _ctx.RefreshData();
-        }
-
-        protected override void OnMouseDown(MouseEventArgs e)
-        {
-            base.OnMouseDown(e);
-            if (e.Button != MouseButtons.Left) return;
-            // 拖拽属于移动意图：停掉悬停唤出计时并收起详情面板，拖拽中不再弹出
-            _showTimer.Stop();
-            if (_detail.Visible) HideDetail();
-            _dragging = true;
-        }
-
-        protected override void OnMouseMove(MouseEventArgs e)
-        {
-            base.OnMouseMove(e);
-            if (!_dragging) return;
-            int target = FindScreenIndex(Cursor.Position);
-            if (target != _ghostScreen)
-            {
-                _ghostScreen = target;
-                ShowGhost(target);
-            }
-        }
-
-        protected override void OnMouseUp(MouseEventArgs e)
-        {
-            base.OnMouseUp(e);
-            if (e.Button == MouseButtons.Right) { _ctx.ShowMenu(); return; }
-            if (!_dragging) return;
-            _dragging = false;
-            HideGhost();
-
-            int target = FindScreenIndex(Cursor.Position);
-            if (target != _currentScreen)
-            {
-                ApplyToScreen(target);
-                _ctx.Cfg.AppBarScreen = target;
-                _ctx.Cfg.Save();
-            }
-            _ghostScreen = -1;
-            // 松手后鼠标仍悬停时恢复悬停唤出计时
-            _showTimer.Start();
-        }
-
-        protected override void OnMouseEnter(EventArgs e)
-        {
-            base.OnMouseEnter(e);
-            _showTimer.Stop(); _hideTimer.Stop();
-            _showTimer.Start();
-        }
-        protected override void OnMouseLeave(EventArgs e)
-        {
-            base.OnMouseLeave(e);
-            _showTimer.Stop();
-            _hideTimer.Start();
-        }
-
-        // ---- 拖拽虚影 ----
-        private void ShowGhost(int screenIndex)
-        {
-            var screen = GetScreen(screenIndex);
-            if (_ghost == null) _ghost = new AppBarGhostForm();
-            _ghost.Width = screen.Bounds.Width;
-            // 用目标屏的 DPI 计算高度（跨不同缩放屏拖拽时，虚影与实际置顶栏高度一致）
-            int ghostH = (int)(BaseBarHeight * GetScreenDpi(screen) / 96f);
-            _ghost.Height = ghostH;
-            _ghost.Location = new Point(screen.Bounds.Left, screen.Bounds.Top);
-            if (!_ghost.Visible)
-            {
-                _ghost.Show(this);
-                // 首次 Show() 后 WinForms 可能撑大高度，强制修正
-                if (_ghost.Height != ghostH) _ghost.Height = ghostH;
-            }
-            _ghost.UpdateLayered();
-        }
-        private void HideGhost()
-        {
-            if (_ghost != null && _ghost.Visible) _ghost.Hide();
-        }
-
-        // 分层窗口移动后需重新提交位图，否则跨屏切换时画面停留在旧位置
-        protected override void OnLocationChanged(EventArgs e)
-        {
-            base.OnLocationChanged(e);
-            if (IsHandleCreated) UpdateLayered();
-        }
-
-        // ---- 详情面板 ----
-        private void ShowDetail()
-        {
-            if (_ctx.Providers.Count == 0) return;
-            _detail.UpdateData();
-            var screen = GetScreen(_currentScreen >= 0 ? _currentScreen : 0);
-            int x = screen.Bounds.Left + (screen.Bounds.Width - _detail.Width) / 2;
-            int y = Bottom + St.SiF(4, _scale);
-            _detail.Location = new Point(x, y);
-            if (!_detail.Visible) _detail.Show(this);
-        }
-
-        public void ArmHide() { _hideTimer.Stop(); _hideTimer.Start(); }
-        public void CancelHide() { _hideTimer.Stop(); }
-
-        // ---- 详情面板看守（兜底，逻辑与 FloatingForm 一致）----
-        private void WatchdogTick()
-        {
-            if (!_detail.Visible) { _detailOffSince = null; return; }
-            if (ShouldHideStuckDetail()) HideDetail();
-        }
-
-        // 是否满足"鼠标已离开置顶栏和面板、且持续超过缓冲时长"→ 可以收面板
-        private bool ShouldHideStuckDetail()
-        {
-            // Visible：置顶栏被隐藏后（托盘切换 / Alt+F4 走 Hide()），光标可能仍停在原矩形内，
-            // 只按 Bounds 判断会让面板永远收不掉（详见 FloatingForm 同名方法）
-            bool over = _dragging || (Visible && Bounds.Contains(Cursor.Position)) || _detail.Bounds.Contains(Cursor.Position);
-            if (over) { _detailOffSince = null; return false; }
-            // 哨兵必须是 null 而不是 0（原因见 FloatingForm.ShouldHideStuckDetail）
-            if (!_detailOffSince.HasValue) { _detailOffSince = Environment.TickCount; return false; }
-            return unchecked(Environment.TickCount - _detailOffSince.Value) >= DetailOffGraceMs;
-        }
-
-        // 关面板统一入口：顺带复位看守计数，避免旧时间戳残留导致下次弹出被立刻收掉
-        private void HideDetail()
-        {
-            _hideTimer.Stop();
-            _detailOffSince = null;
-            _detail.Hide();
-        }
-
-        // Alt+F4 / WM_CLOSE：恢复工作区并转为隐藏（与托盘左键切换行为一致），
-        // 避免绕过 UnregisterAppBar 导致系统工作区顶部永久残留一条 bar 高度
-        protected override void OnFormClosing(FormClosingEventArgs e)
-        {
-            base.OnFormClosing(e);
-            if (e.CloseReason == CloseReason.UserClosing)
-            {
-                e.Cancel = true;
-                UnregisterAppBar();
-                Hide();
-            }
-        }
-
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-            {
-                if (_uiTimer != null) _uiTimer.Dispose();
-                if (_refreshTimer != null) _refreshTimer.Dispose();
-                if (_hideTimer != null) _hideTimer.Dispose();
-                if (_showTimer != null) _showTimer.Dispose();
-                if (_watchdogTimer != null) _watchdogTimer.Dispose();
-                if (_detail != null) _detail.Dispose();
-                if (_ghost != null) _ghost.Dispose();
-            }
-            base.Dispose(disposing);
-        }
     }
 
     // ============================= 托盘图标 =============================
@@ -4799,10 +4912,13 @@ namespace QuotaWidget
         private static readonly string[] TypeIconTypes = new string[] { "glm", "glm", "mx", "mx", "kimi", "ds", "claude", "codex" };
 
         private readonly TextBox _txtKey, _txtName;
+        private Rectangle _rcRefresh;
+        private int _refreshSec;
         private readonly Rectangle _rcSelect, _rcKeyBox;
         private Rectangle _rcSeg, _rcNameBox, _rcOk, _rcCancel;
         private int _typeIndex;
         private bool _showName;                    // 显示方式：false=图标(默认，悬浮窗展示图标+环形进度) true=显示名称
+        private readonly bool _providerEnabled;
         private bool _hotOk, _hotCancel, _hotSelect, _hotSeg;
         private SettingsPopupList _popup;
         public ProviderConfig Result { get; private set; }
@@ -4810,6 +4926,7 @@ namespace QuotaWidget
         public ProviderEditDialog(ProviderConfig existing, SettingsPal pal, float scale)
             : base(existing != null ? "编辑供应商" : "添加供应商", pal, scale, new Size(St.SiF(400, scale), St.SiF(334, scale)))
         {
+            _providerEnabled = existing == null || existing.Enabled;
             int x = S(20), w = ClientSize.Width - S(40);
 
             // 前两组「标签 + 输入区」固定；显示方式分段控件与名称组（可选）在 ApplyLayout 里排布
@@ -4820,6 +4937,7 @@ namespace QuotaWidget
             _txtName = new TextBox { BorderStyle = BorderStyle.None, BackColor = pal.Win, ForeColor = pal.Text, Font = Fs[1] };
             Controls.Add(_txtKey);
             Controls.Add(_txtName);
+            _refreshSec = existing == null ? 0 : existing.RefreshSec;
             // 单行 TextBox 高度跟随字体，垂直居中在输入框内；边框由 OnPaint 画
             _txtKey.Bounds = new Rectangle(_rcKeyBox.X + S(10), _rcKeyBox.Y + (S(34) - _txtKey.PreferredHeight) / 2, _rcKeyBox.Width - S(20), _txtKey.PreferredHeight);
             // 空 Key 框在未聚焦时是隐藏的（见 UpdateKeyBox），打开对话框自动聚焦会跳过它，占位提示得以显示
@@ -4839,8 +4957,7 @@ namespace QuotaWidget
             // 编辑模式：用现有配置预填
             if (existing != null)
             {
-                _typeIndex = existing.Type == "codex" ? 7 : existing.Type == "claude" ? 6 :
-                    (existing.Type == "ds" ? 5 : (existing.Type == "kimi" ? 4 : (existing.Type == "mx" ? (existing.Region == "intl" ? 3 : 2) : (existing.Region == "intl" ? 1 : 0))));
+                _typeIndex = ProviderConfig.TypeIndex(existing.Type, existing.Region);
                 _showName = existing.ShowName;
                 // 预填解密后的真实 key（输入框本身以 ● 掩码显示）；密文解不开时留空待重填
                 _txtKey.Text = existing.GetKey() ?? "";
@@ -4870,7 +4987,7 @@ namespace QuotaWidget
         private void ApplyLayout()
         {
             int x = S(20), w = S(400) - S(40);
-            int h = S(334) + (_showName ? S(74) : 0);
+            int h = S(408) + (_showName ? S(74) : 0);
             // 本窗口吞掉了 WM_NCCALCSIZE,客户区即整个外框;句柄已创建后再设 ClientSize,
             // WinForms 会按 WS_THICKFRAME 用 AdjustWindowRectEx 补算边框,把窗口撑宽一圈,
             // 故运行期切换显示方式时直接设置外框尺寸(构造期仍走 ClientSize,创建句柄时正好抵消)
@@ -4881,6 +4998,8 @@ namespace QuotaWidget
             _rcCancel = new Rectangle(_rcOk.X - S(10) - S(88), _rcOk.Y, S(88), S(34));
             _txtName.Visible = _showName;
             _txtName.Bounds = new Rectangle(_rcNameBox.X + S(10), _rcNameBox.Y + (S(34) - _txtName.PreferredHeight) / 2, _rcNameBox.Width - S(20), _txtName.PreferredHeight);
+            _rcRefresh = new Rectangle(x, S(306) + (_showName ? S(74) : 0), w, S(34));
+            UpdateKeyBox();
             Invalidate();
         }
 
@@ -4899,6 +5018,7 @@ namespace QuotaWidget
                 // 名称仍为默认名时跟随接口切换（与旧对话框行为一致，手动改过则不动）
                 if (string.IsNullOrWhiteSpace(_txtName.Text) || IsDefaultName(_txtName.Text))
                     _txtName.Text = ProviderConfig.TypeDefaultNames[idx];
+                ApplyLayout();
                 Invalidate();
             }, TypeIconTypes);
             _popup.Show(this);
@@ -4925,12 +5045,13 @@ namespace QuotaWidget
             string region = (i == 1 || i == 3) ? "intl" : "cn";
             // 图标模式不展示自定义名，名称固定回默认名；名称模式取输入（空则回默认）
             string name = _showName && !string.IsNullOrWhiteSpace(_txtName.Text) ? _txtName.Text.Trim() : ProviderConfig.TypeDefaultNames[i];
-            var r = new ProviderConfig { Type = type, Region = region, Name = name, ShowName = _showName };
+            var r = new ProviderConfig { Type = type, Region = region, Name = name, ShowName = _showName, Enabled = _providerEnabled, RefreshSec = _refreshSec };
             r.SetKey(_txtKey.Text.Trim());   // 明文仅存在于输入框与本次加密调用，配置文件里只落 DPAPI 密文
             Result = r;
             DialogResult = DialogResult.OK;
             Close();
         }
+
 
         protected override void OnPaint(PaintEventArgs e)
         {
@@ -4953,12 +5074,14 @@ namespace QuotaWidget
                 DrawFieldLabel(g, "显示名称", S(46) + S(232));
                 DrawFieldBox(g, _rcNameBox, _txtName.Focused);
             }
+            DrawFieldLabel(g, "刷新间隔", _rcRefresh.Y - S(28));
+            PaintSelectBox(g, _rcRefresh, RefreshChoices.Label(_refreshSec), false, "");
 
             PaintBtn(g, _rcOk, "确认", true, _hotOk);
             PaintBtn(g, _rcCancel, "取消", false, _hotCancel);
         }
 
-        // 显示方式分段控件：左=显示图标（默认） 右=显示名称，选中半 Sel 底 + 高亮字
+        // 显示方式分段控件：左=图标（默认） 右=名称，选中半 Sel 底 + 高亮字
         private void PaintSegmented(Graphics g, Rectangle r)
         {
             int half = r.Width / 2;
@@ -4970,8 +5093,8 @@ namespace QuotaWidget
             using (var path = St.RoundRect(r, S(8)))
             using (var pen = new Pen(_hotSeg ? Pal.CardHover : Pal.Line))
                 g.DrawPath(pen, path);
-            TextRenderer.DrawText(g, "显示图标", Fs[1], rl, !_showName ? Pal.Text : Pal.Text2, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
-            TextRenderer.DrawText(g, "显示名称", Fs[1], rr, _showName ? Pal.Text : Pal.Text2, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+            TextRenderer.DrawText(g, "图标", Fs[1], rl, !_showName ? Pal.Text : Pal.Text2, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+            TextRenderer.DrawText(g, "名称", Fs[1], rr, _showName ? Pal.Text : Pal.Text2, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
         }
 
         private void DrawFieldLabel(Graphics g, string label, int y)
@@ -5018,6 +5141,15 @@ namespace QuotaWidget
             base.OnMouseDown(e);
             if (e.Button != MouseButtons.Left) return;
             if (_rcSelect.Contains(e.Location)) { OpenTypePopup(); return; }
+            if (_rcRefresh.Contains(e.Location))
+            {
+                ClosePopup();
+                var values = RefreshChoices.Values(_refreshSec, true);
+                var labels = values.ConvertAll(RefreshChoices.Label).ToArray();
+                _popup = new SettingsPopupList(RectangleToScreen(_rcRefresh), labels, values.IndexOf(_refreshSec), Pal, Fs[1], Fs[1], Sf,
+                    delegate(int idx) { _refreshSec = values[idx]; Invalidate(); });
+                _popup.Show(this); return;
+            }
             if (_rcSeg.Contains(e.Location))
             {
                 bool toName = e.X >= _rcSeg.X + _rcSeg.Width / 2;
@@ -5062,6 +5194,835 @@ namespace QuotaWidget
             }
         }
     }
+
+    internal static class RefreshChoices
+    {
+        internal static readonly int[] Presets = { 15, 30, 60, 120, 300, 600, 1800, 3600 };
+        public static List<int> Values(int current, bool inherit)
+        {
+            var values = new List<int>(Presets);
+            if (current > 0 && !values.Contains(current)) { values.Add(current); values.Sort(); }
+            if (inherit) values.Insert(0, 0);
+            return values;
+        }
+        public static string Label(int seconds)
+        {
+            if (seconds <= 0) return "跟随通用";
+            return seconds % 60 == 0 ? (seconds / 60) + " 分钟" : seconds + " 秒";
+        }
+    }
+
+    // 自定义接口面板的按钮、输入框和内容边框使用同一圆角刻度。
+    internal static class ApiAppearance
+    {
+        public const int CornerRadius = 8;
+    }
+
+    internal sealed class ApiButton : Button
+    {
+        private readonly SettingsPal _pal;
+        private readonly float _scale;
+        private bool _hot, _pressed, _primary;
+        public bool Primary { get { return _primary; } set { _primary = value; Invalidate(); } }
+        public ApiButton(SettingsPal pal, float scale)
+        {
+            _pal = pal; _scale = scale;
+            FlatStyle = FlatStyle.Flat; FlatAppearance.BorderSize = 0; UseVisualStyleBackColor = false;
+            BackColor = pal.Win; ForeColor = pal.Text; Font = St.FontsForScale(scale)[1]; Cursor = Cursors.Hand;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.Clear(Parent == null ? _pal.Win : Parent.BackColor);
+            if (Width < 2 || Height < 2) return;
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            Color fill = Primary ? _pal.Primary : _pal.Win;
+            if (!Enabled) fill = Primary ? SettingsPal.Mix(fill, _pal.Win, 0.7) : _pal.Win;
+            else if (_pressed || _hot) fill = Primary ? SettingsPal.Mix(fill, _pal.Win, _pressed ? 0.24 : 0.12) : (_pressed ? _pal.Sel : _pal.Hover);
+            int radius = St.SiF(ApiAppearance.CornerRadius, _scale);
+            using (var path = St.RoundRect(new Rectangle(0, 0, Width - 1, Height - 1), radius))
+            {
+                using (var brush = new SolidBrush(fill)) e.Graphics.FillPath(brush, path);
+                if (!Primary)
+                    using (var pen = new Pen(Enabled && Focused ? _pal.Primary : _pal.Line)) e.Graphics.DrawPath(pen, path);
+            }
+            if (Enabled && Focused && Primary && ShowFocusCues)
+            {
+                int inset = Math.Max(2, St.SiF(3, _scale));
+                using (var path = St.RoundRect(new Rectangle(inset, inset, Width - inset * 2 - 1, Height - inset * 2 - 1), Math.Max(1, radius - inset)))
+                using (var pen = new Pen(_pal.PrimaryText)) e.Graphics.DrawPath(pen, path);
+            }
+            TextRenderer.DrawText(e.Graphics, Text, Font, ClientRectangle, !Enabled ? _pal.Text3 : Primary ? _pal.PrimaryText : ForeColor,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        }
+        protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); _hot = true; Invalidate(); }
+        protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); _hot = false; Invalidate(); }
+        protected override void OnMouseDown(MouseEventArgs e) { base.OnMouseDown(e); if (e.Button == MouseButtons.Left) { _pressed = true; Invalidate(); } }
+        protected override void OnMouseUp(MouseEventArgs e) { _pressed = false; Invalidate(); base.OnMouseUp(e); }
+        protected override void OnMouseCaptureChanged(EventArgs e) { base.OnMouseCaptureChanged(e); if (!Capture) { _pressed = false; Invalidate(); } }
+        protected override void OnKeyDown(KeyEventArgs e) { base.OnKeyDown(e); if (e.KeyCode == Keys.Space) { _pressed = true; Invalidate(); } }
+        protected override void OnKeyUp(KeyEventArgs e) { _pressed = false; Invalidate(); base.OnKeyUp(e); }
+        protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+        protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); _pressed = false; Invalidate(); }
+        protected override void OnEnabledChanged(EventArgs e) { base.OnEnabledChanged(e); if (!Enabled) _hot = _pressed = false; Invalidate(); }
+    }
+
+    internal class ApiRoundedPanel : Panel
+    {
+        private readonly SettingsPal _pal;
+        private readonly float _scale;
+        public ApiRoundedPanel(SettingsPal pal, float scale)
+        {
+            _pal = pal; _scale = scale; BackColor = pal.Win;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            if (Width < 2 || Height < 2) return;
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var path = St.RoundRect(new Rectangle(0, 0, Width - 1, Height - 1), St.SiF(ApiAppearance.CornerRadius, _scale)))
+            using (var pen = new Pen(_pal.Line)) e.Graphics.DrawPath(pen, path);
+        }
+    }
+
+    internal sealed class ApiValuePreview : Label
+    {
+        private readonly SettingsPal _pal;
+        private readonly float _scale;
+        public ApiValuePreview(SettingsPal pal, float scale)
+        {
+            _pal = pal; _scale = scale; BackColor = pal.Win; ForeColor = pal.Text3;
+            Font = St.FontsForScale(scale)[1];
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.Clear(_pal.Win);
+            if (Width < 2 || Height < 2) return;
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var path = St.RoundRect(new Rectangle(0, 0, Width - 1, Height - 1), St.SiF(ApiAppearance.CornerRadius, _scale)))
+            using (var brush = new SolidBrush(_pal.Pill)) e.Graphics.FillPath(brush, path);
+            int inset = St.SiF(8, _scale);
+            TextRenderer.DrawText(e.Graphics, Text, Font, new Rectangle(inset, 0, Math.Max(0, Width - inset * 2), Height), ForeColor,
+                TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        }
+    }
+
+    // 复用现有设置下拉浮层，供自定义接口各字段使用。
+    internal class SettingsChoice : Control
+    {
+        private readonly SettingsPal _pal;
+        private readonly float _scale;
+        private int _index;
+        private SettingsPopupList _popup;
+        public string[] Items;
+        public string[] IconTypes;
+        public bool Segmented { get; set; }
+        public event EventHandler SelectedIndexChanged;
+        public int SelectedIndex
+        {
+            get { return _index; }
+            set { _index = Math.Max(0, Math.Min(Items.Length - 1, value)); Invalidate(); if (SelectedIndexChanged != null) SelectedIndexChanged(this, EventArgs.Empty); }
+        }
+        public SettingsChoice(SettingsPal pal, float scale, string[] items)
+        {
+            _pal = pal; _scale = scale; Items = items; BackColor = pal.Win;
+            Font = St.FontsForScale(scale)[1]; TabStop = true; Cursor = Cursors.Hand;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        }
+        private int S(int n) { return St.SiF(n, _scale); }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.Clear(_pal.Win); e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            if (Segmented)
+            {
+                int cell = Width / Items.Length;
+                var selected = new Rectangle(_index * cell, 0, _index == Items.Length - 1 ? Width - _index * cell : cell, Height);
+                using (var path = St.RoundRect(selected, S(ApiAppearance.CornerRadius)))
+                using (var brush = new SolidBrush(_pal.Sel)) e.Graphics.FillPath(brush, path);
+                using (var path = St.RoundRect(new Rectangle(0, 0, Width - 1, Height - 1), S(ApiAppearance.CornerRadius)))
+                using (var pen = new Pen(Focused ? _pal.Primary : _pal.Line)) e.Graphics.DrawPath(pen, path);
+                for (int i = 0; i < Items.Length; i++)
+                    TextRenderer.DrawText(e.Graphics, Items[i], Font, new Rectangle(i * cell, 0, cell, Height), i == _index ? _pal.Text : _pal.Text2,
+                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+                return;
+            }
+            using (var path = St.RoundRect(new Rectangle(0, 0, Width - 1, Height - 1), S(ApiAppearance.CornerRadius)))
+            using (var pen = new Pen(Focused ? _pal.Primary : _pal.Line)) e.Graphics.DrawPath(pen, path);
+            int x = S(10);
+            if (IconTypes != null && _index < IconTypes.Length)
+            { BrandIcons.Draw(e.Graphics, IconTypes[_index], _pal.Dark, x, (Height - S(18)) / 2, S(18)); x += S(26); }
+            TextRenderer.DrawText(e.Graphics, Items[_index], Font, new Rectangle(x, 0, Width - x - S(28), Height), Enabled ? _pal.Text : _pal.Text3,
+                TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+            using (var pen = new Pen(_pal.Text2, 1.4f))
+            { int cx = Width - S(16), cy = Height / 2; e.Graphics.DrawLines(pen, new[] { new Point(cx - S(4), cy - S(2)), new Point(cx, cy + S(2)), new Point(cx + S(4), cy - S(2)) }); }
+        }
+        private void OpenPopup()
+        {
+            if (_popup != null && !_popup.IsDisposed) { _popup.Close(); return; }
+            _popup = new SettingsPopupList(RectangleToScreen(ClientRectangle), Items, _index, _pal, Font, Font, _scale,
+                delegate(int index) { SelectedIndex = index; }, IconTypes);
+            _popup.Show(FindForm());
+        }
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left) return;
+            Focus();
+            if (Segmented) SelectedIndex = e.X / Math.Max(1, Width / Items.Length);
+            else OpenPopup();
+        }
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            base.OnKeyDown(e);
+            if (Segmented)
+            {
+                if (e.KeyCode == Keys.Left || e.KeyCode == Keys.Right)
+                { e.SuppressKeyPress = true; SelectedIndex = (_index + (e.KeyCode == Keys.Right ? 1 : Items.Length - 1)) % Items.Length; }
+                return;
+            }
+            if (e.KeyCode == Keys.Space || e.KeyCode == Keys.Enter || e.KeyCode == Keys.Down) { e.SuppressKeyPress = true; OpenPopup(); }
+        }
+        protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+        protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+        protected override void Dispose(bool disposing) { if (disposing && _popup != null) _popup.Dispose(); base.Dispose(disposing); }
+    }
+
+    internal class SettingsTabs : Control
+    {
+        private readonly SettingsPal _pal;
+        private readonly float _scale;
+        private readonly string[] _items;
+        private int _selected;
+        public event EventHandler SelectedIndexChanged;
+        public int SelectedIndex
+        {
+            get { return _selected; }
+            set
+            {
+                int next = Math.Max(0, Math.Min(_items.Length - 1, value));
+                if (next == _selected) return;
+                _selected = next; Invalidate();
+                if (SelectedIndexChanged != null) SelectedIndexChanged(this, EventArgs.Empty);
+            }
+        }
+        public SettingsTabs(SettingsPal pal, float scale, string[] items)
+        {
+            _pal = pal; _scale = scale; _items = items; Font = St.FontsForScale(scale)[1];
+            BackColor = pal.Win; TabStop = true; Cursor = Cursors.Hand; AccessibleRole = AccessibleRole.PageTabList;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        }
+        private int TabWidth { get { return St.SiF(124, _scale); } }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.Clear(_pal.Win);
+            using (var pen = new Pen(_pal.Line)) e.Graphics.DrawLine(pen, 0, Height - 1, Width, Height - 1);
+            for (int i = 0; i < _items.Length; i++)
+            {
+                var r = new Rectangle(i * TabWidth, 0, TabWidth, Height - St.SiF(4, _scale));
+                TextRenderer.DrawText(e.Graphics, _items[i], Font, r, i == _selected ? _pal.Text : _pal.Text3,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+                if (i == _selected)
+                {
+                    int inset = St.SiF(20, _scale), h = Math.Max(2, St.SiF(2, _scale));
+                    using (var brush = new SolidBrush(_pal.Primary)) e.Graphics.FillRectangle(brush, r.X + inset, Height - h, r.Width - 2 * inset, h);
+                }
+            }
+        }
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button == MouseButtons.Left && e.X < _items.Length * TabWidth) { Focus(); SelectedIndex = e.X / TabWidth; }
+        }
+        protected override bool IsInputKey(Keys keyData)
+        { return (keyData & Keys.KeyCode) == Keys.Left || (keyData & Keys.KeyCode) == Keys.Right || base.IsInputKey(keyData); }
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            base.OnKeyDown(e);
+            if (e.KeyCode == Keys.Left || e.KeyCode == Keys.Right)
+            { e.SuppressKeyPress = true; SelectedIndex = (_selected + (e.KeyCode == Keys.Right ? 1 : _items.Length - 1)) % _items.Length; }
+        }
+        protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+        protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+    }
+
+    // 自定义接口编辑器：请求一次，树节点、字段预览和额度预览均在内存中计算。
+    internal sealed class ApiTextField : Panel
+    {
+        private readonly SettingsPal _pal;
+        private readonly float _scale;
+        private readonly Panel _frame;
+        private readonly Label _caption, _value;
+        private readonly ToolTip _tip = new ToolTip();
+        private bool _dropHot, _hasValue;
+        private readonly bool _multiline;
+        public readonly TextBox Input;
+        public const string PathFormat = "QuotaWidget.JsonFieldPath";
+        public ApiTextField(SettingsPal pal, float scale, string label, bool path, int inputHeight = 34)
+        {
+            _pal = pal; _scale = scale; _multiline = inputHeight > 34;
+            BackColor = pal.Win; Height = S(28 + inputHeight); Width = S(468);
+            _caption = new Label { Text = label, Font = St.FontsForScale(scale)[1], ForeColor = pal.Text, BackColor = pal.Win };
+            _frame = new Panel { BackColor = pal.Win };
+            _value = new ApiValuePreview(pal, scale) { Visible = false };
+            Input = new TextBox { BorderStyle = BorderStyle.None, Font = St.FontsForScale(scale)[1], ForeColor = pal.Text,
+                BackColor = pal.Win, Multiline = _multiline, AcceptsReturn = _multiline, ScrollBars = _multiline ? ScrollBars.Vertical : ScrollBars.None,
+                MaxLength = _multiline ? 1048576 : 4096 };
+            Controls.Add(_caption); Controls.Add(_frame); Controls.Add(_value); _frame.Controls.Add(Input);
+            _frame.Paint += delegate(object sender, PaintEventArgs e)
+            {
+                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                using (var shape = St.RoundRect(new Rectangle(0, 0, _frame.Width - 1, _frame.Height - 1), S(ApiAppearance.CornerRadius)))
+                using (var pen = new Pen(_dropHot || Input.Focused ? pal.Primary : pal.Line)) e.Graphics.DrawPath(pen, shape);
+            };
+            Input.GotFocus += delegate { _frame.Invalidate(); }; Input.LostFocus += delegate { _frame.Invalidate(); };
+            if (path)
+            {
+                foreach (Control control in new Control[] { this, _frame, Input, _value })
+                {
+                    control.AllowDrop = true;
+                    control.DragEnter += delegate(object sender, DragEventArgs e)
+                    {
+                        bool accepted = Enabled && e.Data.GetDataPresent(PathFormat);
+                        e.Effect = accepted ? DragDropEffects.Copy : DragDropEffects.None;
+                        _dropHot = accepted; _frame.Invalidate();
+                    };
+                    control.DragLeave += delegate { _dropHot = false; _frame.Invalidate(); };
+                    control.DragDrop += delegate(object sender, DragEventArgs e)
+                    {
+                        _dropHot = false; _frame.Invalidate();
+                        if (!Enabled || !e.Data.GetDataPresent(PathFormat)) return;
+                        Input.Text = e.Data.GetData(PathFormat) as string ?? "";
+                        Input.Focus(); Input.SelectionStart = Input.Text.Length;
+                    };
+                }
+            }
+            Arrange();
+        }
+        private int S(int n) { return St.SiF(n, _scale); }
+        public void SetPreview(bool exists, string text)
+        {
+            _hasValue = exists; _value.Visible = exists; _value.Text = exists ? text : "";
+            _tip.SetToolTip(_value, exists ? text : ""); Arrange();
+        }
+        public void SetCaption(string text) { _caption.Text = text; }
+        private void Arrange()
+        {
+            if (_frame == null) return;
+            int valueWidth = _hasValue ? Math.Min(S(132), Width / 3) : 0;
+            _caption.Bounds = new Rectangle(0, 0, Width, S(24));
+            _frame.Bounds = new Rectangle(0, S(28), Math.Max(S(60), Width - (valueWidth > 0 ? valueWidth + S(8) : 0)), Height - S(28));
+            _value.Bounds = new Rectangle(Width - valueWidth, S(28), valueWidth, Height - S(28));
+            Input.Bounds = _multiline ? new Rectangle(S(10), S(7), _frame.Width - S(20), _frame.Height - S(14))
+                : new Rectangle(S(10), Math.Max(0, (_frame.Height - Input.PreferredHeight) / 2), _frame.Width - S(20), Input.PreferredHeight);
+            _frame.Invalidate();
+        }
+        protected override void OnSizeChanged(EventArgs e) { base.OnSizeChanged(e); Arrange(); }
+        protected override void Dispose(bool disposing) { if (disposing) _tip.Dispose(); base.Dispose(disposing); }
+    }
+
+    internal sealed class ApiJsonTree : TreeView
+    {
+        private sealed class NodeValue
+        {
+            public string Path;
+            public object Value;
+            public bool Loaded, IsRange;
+            public int Start, Count;
+            public string[] Keys;
+        }
+        private readonly SettingsPal _pal;
+        private readonly float _scale;
+        public ApiJsonTree(SettingsPal pal, float scale)
+        {
+            _pal = pal; _scale = scale; BackColor = pal.Win; ForeColor = pal.Text;
+            BorderStyle = BorderStyle.None; ShowLines = false; ShowRootLines = false; ShowPlusMinus = true;
+            HideSelection = false; FullRowSelect = false; ShowNodeToolTips = true; DrawMode = TreeViewDrawMode.OwnerDrawText;
+            Font = St.FontsForScale(scale)[1]; ItemHeight = St.SiF(26, scale); Indent = St.SiF(18, scale);
+            ItemDrag += delegate(object sender, ItemDragEventArgs e)
+            {
+                var node = e.Item as TreeNode;
+                var data = node == null ? null : node.Tag as NodeValue;
+                if (data == null || data.IsRange || e.Button != MouseButtons.Left) return;
+                SelectedNode = node;
+                var drag = new DataObject(); drag.SetData(ApiTextField.PathFormat, data.Path);
+                DoDragDrop(drag, DragDropEffects.Copy);
+            };
+            BeforeExpand += delegate(object sender, TreeViewCancelEventArgs e) { LoadChildren(e.Node); };
+        }
+        internal static string ValueText(object value)
+        {
+            if (value == null) return "null";
+            var obj = value as IDictionary;
+            if (obj != null) return "{ " + obj.Count + " 个字段 }";
+            var list = value as IList;
+            if (list != null) return "[ " + list.Count + " 项 ]";
+            if (value is bool) return (bool)value ? "true" : "false";
+            if (value is string)
+            {
+                string text = (string)value;
+                if (text.Length > 180) text = text.Substring(0, 180) + "…";
+                return new JavaScriptSerializer().Serialize(text);
+            }
+            return Convert.ToString(value, CultureInfo.InvariantCulture);
+        }
+        private TreeNode MakeNode(string key, string path, object value)
+        {
+            var node = new TreeNode(key + ": " + ValueText(value)) { Tag = new NodeValue { Path = path, Value = value }, ToolTipText = path };
+            var obj = value as IDictionary; var list = value as IList;
+            if ((obj != null && obj.Count > 0) || (list != null && list.Count > 0)) node.Nodes.Add(new TreeNode("…"));
+            return node;
+        }
+        private void LoadChildren(TreeNode node)
+        {
+            var data = node.Tag as NodeValue;
+            if (data == null || data.Loaded) return;
+            data.Loaded = true; node.Nodes.Clear();
+            var obj = data.Value as Dictionary<string, object>;
+            var list = data.Value as IList;
+            if (obj == null && list == null) return;
+            if (obj != null && data.Keys == null) data.Keys = new List<string>(obj.Keys).ToArray();
+            int start = data.IsRange ? data.Start : 0;
+            int count = data.IsRange ? data.Count : obj != null ? obj.Count : list.Count;
+            // 大数组分组加载；分组只影响树的展示，实际路径仍保留原始下标。
+            if (count > 250)
+            {
+                int groupSize = 250;
+                while ((count + groupSize - 1) / groupSize > 250) groupSize *= 250;
+                for (int i = start; i < start + count; i += groupSize)
+                {
+                    int size = Math.Min(groupSize, start + count - i);
+                    string label = obj == null ? "[" + i + " … " + (i + size - 1) + "]" : "字段 " + (i + 1) + "–" + (i + size);
+                    var group = new TreeNode(label) { Tag = new NodeValue { Path = data.Path, Value = data.Value,
+                        Keys = data.Keys, IsRange = true, Start = i, Count = size } };
+                    group.Nodes.Add(new TreeNode("…")); node.Nodes.Add(group);
+                }
+                return;
+            }
+            for (int i = start; i < start + count; i++)
+                if (obj != null) node.Nodes.Add(MakeNode(data.Keys[i], JsonFieldPath.Append(data.Path, data.Keys[i]), obj[data.Keys[i]]));
+                else node.Nodes.Add(MakeNode("[" + i + "]", data.Path + "[" + i + "]", list[i]));
+        }
+        private void ExpandSample(TreeNode node, ref int budget, int depth)
+        {
+            if (--budget < 0 || depth > 24) return;
+            var data = node.Tag as NodeValue;
+            if (data != null && data.IsRange && !data.Loaded) return;
+            LoadChildren(node); node.Expand();
+            foreach (TreeNode child in node.Nodes)
+            { if (budget <= 0) break; ExpandSample(child, ref budget, depth + 1); }
+        }
+        public void SetJson(object root)
+        {
+            BeginUpdate();
+            try
+            {
+                Nodes.Clear(); var node = MakeNode("result", "result", root); Nodes.Add(node);
+                int budget = 1500; ExpandSample(node, ref budget, 0); SelectedNode = node; node.EnsureVisible();
+            }
+            finally { EndUpdate(); }
+        }
+        public void ExpandVisibleData()
+        {
+            BeginUpdate();
+            try { int budget = 5000; foreach (TreeNode node in Nodes) ExpandSample(node, ref budget, 0); }
+            finally { EndUpdate(); }
+        }
+        protected override void OnDrawNode(DrawTreeNodeEventArgs e)
+        {
+            bool selected = (e.State & TreeNodeStates.Selected) != 0;
+            var r = e.Bounds; r.Width = Math.Max(r.Width, TextRenderer.MeasureText(e.Node.Text, Font).Width + St.SiF(8, _scale));
+            using (var b = new SolidBrush(selected ? _pal.Sel : _pal.Win)) e.Graphics.FillRectangle(b, r);
+            TextRenderer.DrawText(e.Graphics, e.Node.Text, Font, r, selected ? _pal.Text : _pal.Text2,
+                TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+        }
+    }
+
+    internal sealed class ApiRuleCard : ApiRoundedPanel
+    {
+        private readonly SettingsPal _pal;
+        private readonly float _scale;
+        private readonly ApiTextField _name, _value, _total, _reset, _currency, _multiplier;
+        private readonly Panel _meaningGroup, _rangeGroup;
+        private readonly SettingsChoice _mode, _meaning, _range;
+        private readonly Label _title, _error;
+        private readonly Button _remove;
+        private bool _loading;
+        private object _previewRoot, _rawRoot;
+        private bool _hasSample;
+        public event EventHandler Changed;
+        public event EventHandler RemoveRequested;
+        public ApiRuleCard(SettingsPal pal, float scale, CustomQuotaRule rule) : base(pal, scale)
+        {
+            _pal = pal; _scale = scale; BackColor = pal.Win; Width = S(500); _loading = true;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+            _title = LabelAt("额度规则", 16, 12, 320, 22, true);
+            _remove = new ApiButton(pal, scale) { Text = "删除", Bounds = new Rectangle(S(416), S(8), S(68), S(28)), ForeColor = pal.Text2 };
+            Controls.Add(_remove);
+            _remove.Click += delegate { if (RemoveRequested != null) RemoveRequested(this, EventArgs.Empty); };
+            _name = Field("额度名称", 16, 42, 468, false);
+            _mode = Choice(this, "额度类型", 16, 114, 148, new[] { "百分比", "余额", "已用量 / 总量" });
+            _meaningGroup = new Panel { Bounds = new Rectangle(S(176), S(114), S(148), S(62)), BackColor = pal.Win }; Controls.Add(_meaningGroup);
+            _rangeGroup = new Panel { Bounds = new Rectangle(S(336), S(114), S(148), S(62)), BackColor = pal.Win }; Controls.Add(_rangeGroup);
+            _meaning = Choice(_meaningGroup, "数值含义", 0, 0, 148, new[] { "已用", "剩余" });
+            _range = Choice(_rangeGroup, "数值范围", 0, 0, 148, new[] { "0–100", "0–1" });
+            _currency = Field("余额单位", 176, 114, 148, false);
+            _multiplier = Field("余额倍率", 336, 114, 148, false);
+            _value = Field("数值路径", 16, 186, 468, true);
+            _total = Field("总量路径", 16, 258, 468, true);
+            _reset = Field("重置时间路径（可选）", 16, 258, 468, true);
+            _error = LabelAt("", 16, 330, 468, 36, true); _error.ForeColor = St.Red;
+            _name.Input.Text = rule.Name; _value.Input.Text = rule.ValuePath; _total.Input.Text = rule.TotalPath; _reset.Input.Text = rule.ResetPath;
+            _currency.Input.Text = rule.Currency; _multiplier.Input.Text = rule.Multiplier.ToString(CultureInfo.InvariantCulture);
+            _mode.SelectedIndex = rule.Mode == "balance" ? 1 : rule.Mode == "usedTotal" ? 2 : 0;
+            _meaning.SelectedIndex = rule.IsRemaining ? 1 : 0; _range.SelectedIndex = rule.Fraction ? 1 : 0;
+            foreach (var field in new[] { _name, _value, _total, _reset, _currency, _multiplier }) field.Input.TextChanged += delegate { NotifyChange(); };
+            foreach (var choice in new[] { _mode, _meaning, _range }) choice.SelectedIndexChanged += delegate { NotifyChange(); };
+            _loading = false; UpdateFields();
+        }
+        private int S(int n) { return St.SiF(n, _scale); }
+        private Label LabelAt(string text, int x, int y, int w, int h, bool muted)
+        {
+            var label = new Label { Text = text, Bounds = new Rectangle(S(x), S(y), S(w), S(h)), BackColor = _pal.Win,
+                ForeColor = muted ? _pal.Text3 : _pal.Text, Font = St.FontsForScale(_scale)[1] };
+            Controls.Add(label); return label;
+        }
+        private ApiTextField Field(string label, int x, int y, int width, bool path)
+        {
+            var field = new ApiTextField(_pal, _scale, label, path) { Location = new Point(S(x), S(y)), Width = S(width) };
+            Controls.Add(field); return field;
+        }
+        private SettingsChoice Choice(Control parent, string label, int x, int y, int width, string[] items)
+        {
+            parent.Controls.Add(new Label { Text = label, Bounds = new Rectangle(S(x), S(y), S(width), S(24)),
+                ForeColor = _pal.Text, BackColor = _pal.Win, Font = St.FontsForScale(_scale)[1] });
+            var choice = new SettingsChoice(_pal, _scale, items) { Bounds = new Rectangle(S(x), S(y + 28), S(width), S(34)) };
+            parent.Controls.Add(choice); return choice;
+        }
+        public void SetIndex(int index, bool canRemove) { _title.Text = "额度规则 " + index; _remove.Enabled = canRemove; }
+        public void FocusName() { _name.Input.Focus(); }
+        private void UpdateFields()
+        {
+            bool named = !string.IsNullOrWhiteSpace(_name.Input.Text), percent = _mode.SelectedIndex == 0, money = _mode.SelectedIndex == 1;
+            _mode.Enabled = named; _meaningGroup.Visible = _rangeGroup.Visible = percent;
+            _currency.Visible = _multiplier.Visible = money; _total.Visible = _mode.SelectedIndex == 2;
+            _meaning.Enabled = _range.Enabled = named;
+            foreach (var field in new[] { _value, _total, _reset, _currency, _multiplier }) field.Enabled = named;
+            _value.SetCaption(_mode.SelectedIndex == 2 ? "已用量路径" : "数值路径");
+            _reset.Top = S(_mode.SelectedIndex == 2 ? 330 : 258);
+            _error.Top = _reset.Bottom + S(10); Height = _error.Bottom + S(12);
+        }
+        private void NotifyChange()
+        {
+            if (_loading) return;
+            UpdateFields();
+            if (Changed != null) Changed(this, EventArgs.Empty);
+        }
+        public CustomQuotaRule ReadRule()
+        {
+            return new CustomQuotaRule { Name = _name.Input.Text.Trim(), ValuePath = _value.Input.Text.Trim(), TotalPath = _total.Input.Text.Trim(),
+                ResetPath = _reset.Input.Text.Trim(), Mode = _mode.SelectedIndex == 1 ? "balance" : _mode.SelectedIndex == 2 ? "usedTotal" : "percent",
+                IsRemaining = _meaning.SelectedIndex == 1, Fraction = _range.SelectedIndex == 1, Currency = _currency.Input.Text.Trim(),
+                Multiplier = _mode.SelectedIndex == 1 ? JsonFieldPath.Number(_multiplier.Input.Text, "倍率") : 1 };
+        }
+        private void UpdateValue(ApiTextField field)
+        {
+            object value = null; bool exists = false;
+            if (_hasSample && !string.IsNullOrWhiteSpace(field.Input.Text))
+                try { exists = JsonFieldPath.TryGet(_previewRoot, field.Input.Text.Trim(), out value); } catch { }
+            field.SetPreview(exists, exists ? ApiJsonTree.ValueText(value) : "");
+        }
+        public string UpdatePreview(bool hasSample, object rawRoot, object previewRoot)
+        {
+            _hasSample = hasSample; _rawRoot = rawRoot; _previewRoot = previewRoot;
+            UpdateValue(_value); UpdateValue(_total); UpdateValue(_reset);
+            _error.Text = "";
+            try
+            {
+                var rule = ReadRule();
+                if (!hasSample) return null;
+                var pool = CustomApiService.ParseRule(rule, _rawRoot);
+                return pool == null ? null : CustomApiService.FormatPool(pool);
+            }
+            catch (Exception ex)
+            {
+                if (hasSample) _error.Text = ex.Message;
+                return null;
+            }
+        }
+    }
+
+    internal class CustomApiDialog : StyledDialogBase
+    {
+        private readonly ProviderConfig _source;
+        private readonly Panel[] _pages = new Panel[2];
+        private readonly SettingsTabs _tabs;
+        private readonly Dictionary<string, ApiTextField> _fields = new Dictionary<string, ApiTextField>();
+        private readonly SettingsChoice _method, _display, _icon, _interval;
+        private readonly Panel _requestContent, _bodyGroup, _displayGroup, _iconGroup, _nameGroup, _rulesHost, _previewPanel;
+        private readonly List<int> _intervals;
+        private readonly List<ApiRuleCard> _cards = new List<ApiRuleCard>();
+        private readonly ApiJsonTree _tree;
+        private readonly Label _responseStatus, _emptyTree;
+        private readonly TextBox _previewLine;
+        private readonly ApiButton _test, _ok, _add;
+        private bool _loading, _testing, _displayNameEdited, _syncingDisplayName;
+        private object _rawRoot, _previewRoot;
+        private bool _hasSample;
+        private DateTime _sampleFetchedUtc, _sampleCooldownUntilUtc;
+        private readonly int _globalRefreshSec;
+        private const string ExampleHeader = "Authorization: Bearer XXXXXXXXXX";
+        private static readonly string[] IconTypes = { "custom", "codex", "claude", "glm", "mx", "kimi", "ds" };
+        public ProviderConfig Result { get; private set; }
+
+        public CustomApiDialog(ProviderConfig existing, SettingsPal pal, float scale, int globalRefreshSec = 60)
+            : base("自定义接口", pal, FitScale(scale), new Size(St.SiF(1100, FitScale(scale)), St.SiF(760, FitScale(scale))))
+        {
+            _loading = true; _globalRefreshSec = globalRefreshSec;
+            _source = (existing ?? new ProviderConfig { Type = "custom", Name = "自定义接口", Custom = new CustomApiConfig() }).Clone();
+            var config = _source.Custom ?? new CustomApiConfig();
+            _tabs = new SettingsTabs(pal, Sf, new[] { "请求配置", "规则配置" }) { Bounds = new Rectangle(S(20), S(52), S(1060), S(40)) };
+            Controls.Add(_tabs);
+            for (int i = 0; i < 2; i++)
+            {
+                _pages[i] = new Panel { Bounds = new Rectangle(S(20), S(104), S(1060), S(530)), BackColor = pal.Win, AutoScroll = i == 0 };
+                Controls.Add(_pages[i]);
+            }
+            _tabs.SelectedIndexChanged += delegate { SelectTab(_tabs.SelectedIndex); };
+            _requestContent = new Panel { Bounds = new Rectangle(S(130), 0, S(800), S(470)), BackColor = pal.Win };
+            _pages[0].Controls.Add(_requestContent);
+            Field(_requestContent, "name", "接口名称", 0, 0, 800);
+            _method = Choice(_requestContent, "请求方式", 0, 72, 108, new[] { "GET", "POST" });
+            Field(_requestContent, "url", "接口地址", 124, 72, 676);
+            Field(_requestContent, "headers", "请求头（每行 名称: 值）", 0, 144, 800, 80);
+            LabelAt(_requestContent, "将 XXXXXXXXXX 替换为令牌，也可修改请求头；无需认证可清空。请求头与请求体加密保存。", 0, 260, 800, 34, true);
+            _bodyGroup = new Panel { Bounds = new Rectangle(0, S(300), S(800), S(132)), BackColor = pal.Win };
+            _requestContent.Controls.Add(_bodyGroup);
+            Field(_bodyGroup, "body", "请求体（默认 JSON，Content-Type 可在请求头中修改）", 0, 0, 800, 96);
+            _displayGroup = new Panel { Bounds = new Rectangle(0, S(300), S(800), S(136)), BackColor = pal.Win };
+            _requestContent.Controls.Add(_displayGroup);
+            _display = Choice(_displayGroup, "显示方式", 0, 0, 388, new[] { "图标", "名称" }); _display.Segmented = true;
+            _intervals = RefreshChoices.Values(_source.RefreshSec, true);
+            _interval = Choice(_displayGroup, "刷新间隔", 412, 0, 388, _intervals.ConvertAll(RefreshChoices.Label).ToArray());
+            _iconGroup = new Panel { Bounds = new Rectangle(0, S(72), S(800), S(64)), BackColor = pal.Win }; _displayGroup.Controls.Add(_iconGroup);
+            _icon = Choice(_iconGroup, "选择图标", 0, 0, 388, new[] { "通用接口", "Codex", "Claude", "GLM", "MiniMax", "Kimi", "DeepSeek" }); _icon.IconTypes = IconTypes;
+            _nameGroup = new Panel { Bounds = _iconGroup.Bounds, BackColor = pal.Win }; _displayGroup.Controls.Add(_nameGroup);
+            Field(_nameGroup, "displayName", "显示名称", 0, 0, 388);
+
+            var rules = _pages[1];
+            LabelAt(rules, "接口响应", 0, 0, 220, 26, false);
+            ButtonAt(rules, "展开", 364, 0, 68, delegate { _tree.ExpandVisibleData(); });
+            ButtonAt(rules, "折叠", 440, 0, 68, delegate { _tree.CollapseAll(); });
+            _responseStatus = LabelAt(rules, "先点击“测试与配置”获取 JSON，再将节点拖到右侧字段。", 0, 34, 508, 36, true);
+            var treeFrame = new ApiRoundedPanel(pal, Sf) { Bounds = new Rectangle(0, S(76), S(508), S(448)) };
+            rules.Controls.Add(treeFrame);
+            _tree = new ApiJsonTree(pal, Sf) { Bounds = new Rectangle(S(8), S(8), S(492), S(432)) }; treeFrame.Controls.Add(_tree);
+            _emptyTree = LabelAt(treeFrame, "获取响应后，这里会显示可展开的 JSON。\n拖动节点即可填写右侧路径。", 24, 164, 454, 76, true);
+            _emptyTree.TextAlign = ContentAlignment.MiddleCenter; _emptyTree.BringToFront();
+            LabelAt(rules, "额度规则", 538, 0, 300, 26, false);
+            _add = ButtonAt(rules, "+ 添加额度", 920, 0, 120, delegate { AddRule(new CustomQuotaRule(), true); });
+            LabelAt(rules, "先填写额度名称，再拖入数值。数组保留具体下标。", 538, 34, 502, 36, true);
+            _rulesHost = new Panel { Bounds = new Rectangle(S(538), S(76), S(522), S(448)), BackColor = pal.Win, AutoScroll = true };
+            rules.Controls.Add(_rulesHost);
+            _previewPanel = new ApiRoundedPanel(pal, Sf) { Bounds = new Rectangle(S(20), S(640), S(1060), S(62)) };
+            Controls.Add(_previewPanel); LabelAt(_previewPanel, "显示预览", 16, 6, 1028, 22, true);
+            _previewLine = new TextBox { Bounds = new Rectangle(S(16), S(30), S(1028), S(24)), ReadOnly = true, Multiline = false, AutoSize = false,
+                ScrollBars = ScrollBars.None, BorderStyle = BorderStyle.None, BackColor = pal.Win, ForeColor = pal.Text, Font = Fs[1] };
+            _previewPanel.Controls.Add(_previewLine);
+            _test = ButtonAt(this, "测试与配置", 20, 710, 136, delegate { Test(); });
+            ButtonAt(this, "取消", 868, 710, 96, delegate { Close(); });
+            _ok = ButtonAt(this, "确认", 976, 710, 104, delegate { Confirm(); });
+            _ok.Primary = true;
+            _fields["name"].Input.Text = _source.Name;
+            _displayNameEdited = !string.IsNullOrWhiteSpace(config.DisplayName);
+            _fields["displayName"].Input.Text = _displayNameEdited ? config.DisplayName : InterfaceName();
+            _fields["url"].Input.Text = config.Url;
+            _fields["headers"].Input.Text = (existing == null ? ExampleHeader : _source.GetKey() ?? "").Replace("\r\n", "\n").Replace("\n", "\r\n");
+            _fields["body"].Input.Text = config.GetBody() ?? "";
+            _method.SelectedIndex = config.HttpMethod == "POST" ? 1 : 0;
+            _display.SelectedIndex = _source.ShowName ? 1 : 0;
+            _icon.SelectedIndex = Math.Max(0, Array.IndexOf(IconTypes, _source.IconType));
+            _interval.SelectedIndex = Math.Max(0, _intervals.IndexOf(_source.RefreshSec));
+            if (config.Rules != null) foreach (var rule in config.Rules) if (rule != null) AddRule(rule, false);
+            if (_cards.Count == 0) AddRule(new CustomQuotaRule(), false);
+            _fields["name"].Input.TextChanged += delegate { SyncDisplayName(); };
+            _fields["displayName"].Input.TextChanged += delegate { if (!_loading && !_syncingDisplayName) _displayNameEdited = true; };
+            foreach (string key in new[] { "url", "headers", "body" }) _fields[key].Input.TextChanged += delegate { ClearResponse(); };
+            _method.SelectedIndexChanged += delegate { UpdateRequestLayout(); ClearResponse(); };
+            _display.SelectedIndexChanged += delegate { UpdateRequestLayout(); };
+            _loading = false; UpdateRequestLayout(); LayoutRules(); UpdatePreview(); SelectTab(0);
+            KeyDown += delegate(object sender, KeyEventArgs e) { if (e.KeyCode == Keys.Escape) { e.SuppressKeyPress = true; Close(); } };
+        }
+        private static float FitScale(float scale)
+        {
+            var area = Screen.FromPoint(Cursor.Position).WorkingArea;
+            return Math.Max(0.5f, Math.Min(scale, Math.Min((area.Width - 40) / 1100f, (area.Height - 40) / 760f)));
+        }
+        private Label LabelAt(Control parent, string text, int x, int y, int width, int height, bool muted)
+        {
+            var label = new Label { Text = text, Bounds = new Rectangle(S(x), S(y), S(width), S(height)), Font = Fs[1],
+                ForeColor = muted ? Pal.Text3 : Pal.Text, BackColor = Pal.Win };
+            parent.Controls.Add(label); return label;
+        }
+        private void Field(Control parent, string key, string label, int x, int y, int width, int height = 34)
+        {
+            var field = new ApiTextField(Pal, Sf, label, false, height) { Bounds = new Rectangle(S(x), S(y), S(width), S(28 + height)) };
+            parent.Controls.Add(field); _fields.Add(key, field);
+        }
+        private SettingsChoice Choice(Control parent, string label, int x, int y, int width, string[] items)
+        {
+            LabelAt(parent, label, x, y, width, 24, false);
+            var choice = new SettingsChoice(Pal, Sf, items) { Bounds = new Rectangle(S(x), S(y + 28), S(width), S(34)) };
+            parent.Controls.Add(choice); return choice;
+        }
+        private ApiButton ButtonAt(Control parent, string text, int x, int y, int width, Action click)
+        {
+            var button = new ApiButton(Pal, Sf) { Text = text, Bounds = new Rectangle(S(x), S(y), S(width), S(34)) };
+            button.Click += delegate { click(); }; parent.Controls.Add(button); return button;
+        }
+        internal void SelectTab(int index)
+        {
+            for (int i = 0; i < _pages.Length; i++) _pages[i].Visible = i == index;
+            _tabs.SelectedIndex = index; _previewPanel.Visible = index == 1;
+            _test.Text = index == 0 ? "测试与配置" : "重新获取响应";
+        }
+        private void UpdateRequestLayout()
+        {
+            Point scroll = _pages[0].AutoScrollPosition;
+            _pages[0].SuspendLayout(); _pages[0].AutoScrollPosition = Point.Empty;
+            _bodyGroup.Visible = _method.SelectedIndex == 1;
+            _displayGroup.Top = S(_method.SelectedIndex == 1 ? 444 : 300);
+            _requestContent.Height = _displayGroup.Bottom + S(12);
+            _iconGroup.Visible = _display.SelectedIndex == 0; _nameGroup.Visible = _display.SelectedIndex == 1;
+            _pages[0].AutoScrollMinSize = new Size(0, _requestContent.Height);
+            _pages[0].ResumeLayout(true); _pages[0].AutoScrollPosition = new Point(0, -scroll.Y);
+        }
+        private string InterfaceName() { return string.IsNullOrWhiteSpace(_fields["name"].Input.Text) ? "自定义接口" : _fields["name"].Input.Text.Trim(); }
+        private void SyncDisplayName()
+        {
+            if (_displayNameEdited) return;
+            _syncingDisplayName = true;
+            try { _fields["displayName"].Input.Text = InterfaceName(); } finally { _syncingDisplayName = false; }
+        }
+        private void AddRule(CustomQuotaRule rule, bool focus)
+        {
+            if (_cards.Count >= 100) return;
+            var card = new ApiRuleCard(Pal, Sf, rule);
+            card.SizeChanged += delegate { LayoutRules(); };
+            card.Changed += delegate { UpdatePreview(); };
+            card.RemoveRequested += delegate
+            {
+                if (_cards.Count <= 1) return;
+                _cards.Remove(card); _rulesHost.Controls.Remove(card); card.Dispose(); LayoutRules(); UpdatePreview();
+            };
+            _cards.Add(card); _rulesHost.Controls.Add(card); LayoutRules();
+            if (!_loading) UpdatePreview();
+            if (focus) { _rulesHost.ScrollControlIntoView(card); card.FocusName(); }
+        }
+        private void LayoutRules()
+        {
+            Point scroll = _rulesHost.AutoScrollPosition;
+            _rulesHost.SuspendLayout(); _rulesHost.AutoScrollPosition = Point.Empty;
+            int y = 0;
+            for (int i = 0; i < _cards.Count; i++)
+            { _cards[i].Location = new Point(0, y); _cards[i].SetIndex(i + 1, _cards.Count > 1); y += _cards[i].Height + S(12); }
+            _rulesHost.AutoScrollMinSize = new Size(0, y); _rulesHost.ResumeLayout(true);
+            _rulesHost.AutoScrollPosition = new Point(0, -scroll.Y); _add.Enabled = _cards.Count < 100;
+        }
+        private void ClearResponse()
+        {
+            if (_loading) return;
+            _hasSample = false; _rawRoot = _previewRoot = null; _tree.Nodes.Clear(); _emptyTree.Visible = true;
+            _responseStatus.Text = "请求已修改，请点击“测试与配置”重新获取 JSON。"; UpdatePreview();
+        }
+        private void UpdatePreview()
+        {
+            if (_loading) return;
+            var parts = new List<string>();
+            foreach (var card in _cards)
+            {
+                string part = card.UpdatePreview(_hasSample, _rawRoot, _previewRoot);
+                if (!string.IsNullOrEmpty(part)) parts.Add(part);
+            }
+            _previewLine.Text = parts.Count > 0 ? string.Join(" ; ", parts.ToArray())
+                : _hasSample ? "当前响应没有可展示的额度。" : "获取响应后，配置结果会在这里实时显示。";
+            _previewLine.SelectionStart = 0; _previewLine.SelectionLength = 0;
+        }
+        private ProviderConfig ReadRequest()
+        {
+            var p = _source.Clone(); p.Type = "custom"; p.Name = InterfaceName(); p.ShowName = _display.SelectedIndex == 1;
+            p.RefreshSec = _intervals[_interval.SelectedIndex];
+            p.Custom = new CustomApiConfig { Url = _fields["url"].Input.Text.Trim(), Method = _method.SelectedIndex == 1 ? "POST" : "GET",
+                IconType = IconTypes[_icon.SelectedIndex], DisplayName = _displayNameEdited ? _fields["displayName"].Input.Text.Trim() : "" };
+            p.Custom.ValidateRequest(); CustomApiService.ParseHeaders(_fields["headers"].Input.Text);
+            p.SetKey(_fields["headers"].Input.Text.Trim()); p.Custom.SetBody(_fields["body"].Input.Text); return p;
+        }
+        internal ProviderConfig ReadDraft()
+        {
+            var p = ReadRequest();
+            foreach (var card in _cards) p.Custom.Rules.Add(card.ReadRule());
+            p.Custom.Validate(); return p;
+        }
+        private void Confirm()
+        {
+            try
+            {
+                Result = ReadDraft();
+                if (_hasSample)
+                {
+                    var status = QuotaService.EmptyStatus(Result, null);
+                    foreach (var rule in Result.Custom.Rules)
+                    {
+                        var pool = CustomApiService.ParseRule(rule, _rawRoot);
+                        if (pool != null) status.Pools.Add(pool);
+                    }
+                    status.Primary5h = status.Pools.Count == 0 ? null : status.Pools[0];
+                    foreach (var pool in status.Pools) if (!pool.IsMoney && pool.Percent >= 100) { status.Primary5h = pool; break; }
+                    status.UpdatedAt = _sampleFetchedUtc.ToLocalTime();
+                    Result.LastResults = new List<ProviderStatus> { status }; Result.LastFetchUtc = _sampleFetchedUtc;
+                    Result.CooldownUntilUtc = _sampleCooldownUntilUtc;
+                    Result.NextRefreshUtc = DateTime.UtcNow.AddSeconds(Result.EffectiveRefreshSec(_globalRefreshSec));
+                    if (Result.CooldownUntilUtc > Result.NextRefreshUtc) Result.NextRefreshUtc = Result.CooldownUntilUtc;
+                }
+                DialogResult = DialogResult.OK; Close();
+            }
+            catch (Exception ex) { StyledMsg.Show(this, "检查配置", ex.Message, Pal, Sf); }
+        }
+        private void Test()
+        {
+            if (_testing) return;
+            ProviderConfig draft;
+            try { draft = ReadRequest(); draft.Enabled = true; }
+            catch (Exception ex) { StyledMsg.Show(this, "检查请求", ex.Message, Pal, Sf); return; }
+            SelectTab(1); _testing = true; _test.Enabled = _ok.Enabled = _pages[0].Enabled = false;
+            _responseStatus.Text = "正在发送 " + draft.Custom.HttpMethod + " 请求…";
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                CustomFetchResult response = null; object root = null; string error = null;
+                try { response = CustomApiService.Fetch(draft, true); root = CustomApiService.ParseJson(response.Json); }
+                catch (Exception ex) { error = ex.Message; }
+                try
+                {
+                    BeginInvoke((Action)delegate
+                    {
+                        if (IsDisposed) return;
+                        _testing = false; _test.Enabled = _ok.Enabled = _pages[0].Enabled = true;
+                        if (error != null)
+                        { _responseStatus.Text = error + (_hasSample ? "（仍显示上次响应）" : ""); return; }
+                        _rawRoot = root; _previewRoot = response.PreviewRoot; _hasSample = true;
+                        _sampleFetchedUtc = response.FetchedUtc; _sampleCooldownUntilUtc = DateTime.UtcNow.AddSeconds(response.WaitSeconds);
+                        _tree.SetJson(_previewRoot); _emptyTree.Visible = false;
+                        _responseStatus.Text = (response.Cached ? "已使用缓存响应" : "已获取响应") + " · 拖动节点填写路径"
+                            + (response.WaitSeconds > 0 ? " · " + response.WaitSeconds + " 秒冷却" : "");
+                        UpdatePreview();
+                    });
+                }
+                catch (InvalidOperationException) { }
+            });
+        }
+    }
+
 
     // ============================= 测试连接结果（设置页同款风格） =============================
     internal class TestResultDialog : StyledDialogBase
@@ -5204,7 +6165,7 @@ namespace QuotaWidget
     // ============================= 设置窗口配色（局部预览主题） =============================
     // 设置窗口自带一套明暗配色（Codex 风格中性色）。与 St.Theme 全局主题分离：
     // 标题栏 🌙 / 「主题」分段控件实时预览时只改本窗口配色，点「保存」后经 ApplyConfig
-    // 才写入 St.Theme，否则未保存的预览会立刻波及悬浮窗 / 置顶栏。
+    // 才写入 St.Theme，否则未保存的预览会立刻波及悬浮窗。
     internal struct SettingsPal
     {
         public Color Win, Side, Text, Text2, Text3, Line, Line2, Hover, Sel, Pill, PillText, Primary, PrimaryText, Track, ToggleOff, CardHover, Danger;
@@ -5552,8 +6513,17 @@ namespace QuotaWidget
         protected override void OnMouseClick(MouseEventArgs e)
         {
             base.OnMouseClick(e);
+            if (IsDisposed || e.Button != MouseButtons.Left || !ClientRectangle.Contains(e.Location)) return;
             int i = ItemAt(e.Location);
             if (i >= 0) Run(i);
+        }
+
+        protected override void OnMouseCaptureChanged(EventArgs e)
+        {
+            base.OnMouseCaptureChanged(e);
+            // 鼠标抬起时先让 OnMouseClick 执行菜单动作，再处理意外丢失捕获。
+            if (Visible && !Capture && IsHandleCreated)
+                BeginInvoke((Action)delegate { if (!IsDisposed && Visible && !Capture) Close(); });
         }
     }
 
@@ -5635,8 +6605,6 @@ namespace QuotaWidget
         private readonly List<ProviderConfig> _editList = new List<ProviderConfig>(); // 编辑副本，保存时才写回
 
         // ---- 待保存设置（纯字段而非控件：跨屏 DPI 重建布局时状态天然保留，无需备份回填） ----
-        private int _pendMode;      // 0=悬浮窗 1=置顶栏
-        private int _pendScreen;    // 置顶栏停靠屏幕索引
         private bool _pendIsland;   // 悬浮窗排列：true=条形灵动岛 / false=矩形卡片
         private int _pendInterval;  // 刷新间隔（秒）
         private int _pendOpacity;   // 不透明度 50-100
@@ -5678,20 +6646,18 @@ namespace QuotaWidget
         private readonly List<Hot> _hots = new List<Hot>();
         private Rectangle _vp;                // 当前页内容视口
         private int _contentH;                // 当前页内容总高（与滚动无关，>视口高时出现滚动）
-        private Rectangle _rcMoon, _rcClose, _rcAdd, _rcTest, _rcCancel, _rcSave, _rcOpenDir, _rcUpdate;
+        private Rectangle _rcMoon, _rcClose, _rcAdd, _rcCustom, _rcTest, _rcCancel, _rcSave, _rcOpenDir, _rcUpdate;
         private readonly List<Rectangle> _cardRects = new List<Rectangle>();
         private Rectangle _grp1, _grp2;
-        private readonly List<int> _visRows = new List<int>();        // 通用页可见行（置顶栏模式才含“显示屏幕”）
+        private readonly List<int> _visRows = new List<int>();        // 通用页第一组设置行
         private readonly List<Rectangle> _rowRects = new List<Rectangle>();
-        private readonly List<Rectangle> _segModeBtns = new List<Rectangle>();
         private readonly List<Rectangle> _segLayoutBtns = new List<Rectangle>();
         private readonly List<Rectangle> _segThemeBtns = new List<Rectangle>();
-        private Rectangle _rcSegMode, _rcSegLayout, _rcSegTheme, _rcSelScreen, _rcSelInt, _rcSlider, _rcTglTop, _rcTglAuto;
+        private Rectangle _rcSegLayout, _rcSegTheme, _rcSelInt, _rcSlider, _rcTglTop, _rcTglAuto;
 
-        // 通用页行号（R_LAYOUT 仅悬浮窗模式显示，R_SCREEN 仅置顶栏模式显示）
-        private const int R_MODE = 0, R_LAYOUT = 1, R_SCREEN = 2, R_INT = 3, R_OP = 4, R_THEME = 5, R_TOP = 6, R_AUTO = 7;
+        // 通用页行号
+        private const int R_LAYOUT = 0, R_INT = 1, R_OP = 2, R_THEME = 3, R_TOP = 4, R_AUTO = 5;
         // 刷新间隔预设（秒）；用户已有自定义值不在预设中时插入列表，保证不丢配置
-        private static readonly int[] IntervalPresets = new int[] { 15, 30, 60, 120, 300, 600, 1800, 3600 };
 
         // ---- 本窗字体缓存（像素字号随缩放，跨实例共享，随进程存活） ----
         // [0]=页面标题17 [1]=按钮/行标题13B [2]=导航13 [3]=正文12.5 [4]=说明11.5 [5]=徽标11
@@ -5740,10 +6706,8 @@ namespace QuotaWidget
             UpdateStyles();
             KeyPreview = true;
 
-            _pendMode = _ctx.Cfg.DisplayMode == "topbar" ? 1 : 0;
-            _pendScreen = Math.Max(0, Math.Min(Screen.AllScreens.Length - 1, _ctx.Cfg.AppBarScreen));
             _pendIsland = _ctx.Cfg.FloatLayout == "island";
-            _pendInterval = Math.Max(15, Math.Min(3600, _ctx.Cfg.RefreshSec));
+            _pendInterval = Math.Max(15, Math.Min(86400, _ctx.Cfg.RefreshSec));
             _pendOpacity = Math.Max(50, Math.Min(100, _ctx.Cfg.OpacityPct));
             _pendTopMost = _ctx.Cfg.TopMost;
             _pendAutoStart = _ctx.Cfg.AutoStart;
@@ -5767,8 +6731,6 @@ namespace QuotaWidget
             };
             Shown += delegate
             {
-                // 打开期间插拔显示器后索引可能越界，收敛到有效范围
-                _pendScreen = Math.Max(0, Math.Min(Screen.AllScreens.Length - 1, _pendScreen));
                 Focus();
             };
             _built = true;
@@ -5833,7 +6795,6 @@ namespace QuotaWidget
             _cardRects.Clear();
             _visRows.Clear();
             _rowRects.Clear();
-            _segModeBtns.Clear();
             _segLayoutBtns.Clear();
             _segThemeBtns.Clear();
         }
@@ -5892,11 +6853,16 @@ namespace QuotaWidget
 
             int btnH = S(34);
             int addW = MeasureW("＋ 添加供应商", fs[1]) + S(28);
+            int customW = MeasureW("自定义接口", fs[1]) + S(24);
             int testW = MeasureW(_testing ? "测试中…" : "测试全部", fs[1]) + S(24);
             _rcAdd = new Rectangle(_vp.X, y, addW, btnH);
-            _rcTest = new Rectangle(_vp.X + addW + S(10), y, testW, btnH);
+            _rcCustom = new Rectangle(_rcAdd.Right + S(10), y, customW, btnH);
+            _rcTest = new Rectangle(_rcCustom.Right + S(10), y, testW, btnH);
             AddHot(_rcAdd, "add");
+            AddHot(_rcCustom, "custom");
             AddHot(_rcTest, "test");
+            _rcSelInt = new Rectangle(_vp.Right - S(120), y, S(120), btnH);
+            AddHot(_rcSelInt, "sel:int");
 
             int cardH = S(54), gap = S(10);
             int listY = y + btnH + S(16);
@@ -5907,10 +6873,17 @@ namespace QuotaWidget
                 AddHot(card, "card:" + i); // 整卡先加（悬停高亮边框），行内按钮后加保证优先命中
                 int cy = card.Y + cardH / 2;
                 AddHot(new Rectangle(card.X + S(10), cy - S(9), S(20), S(18)), "grip:" + i);
+                AddHot(ProviderToggleRect(card), "enabled:" + i);
                 AddHot(new Rectangle(card.Right - S(14) - S(30) * 2 - S(6), cy - S(15), S(30), S(30)), "edit:" + i);
                 AddHot(new Rectangle(card.Right - S(14) - S(30), cy - S(15), S(30), S(30)), "del:" + i);
             }
             _contentH = listY + _editList.Count * (cardH + gap) + S(8) - _vp.Y;
+        }
+
+        private Rectangle ProviderToggleRect(Rectangle card)
+        {
+            return new Rectangle(card.Right - S(14) - S(30) * 2 - S(6) - S(12) - S(40),
+                card.Y + card.Height / 2 - S(11), S(40), S(22));
         }
 
         // 关于页固定布局（页内不滚动）：坐标与 PaintAbout 一致，命中与绘制共用 _rcOpenDir/_rcUpdate
@@ -5942,10 +6915,7 @@ namespace QuotaWidget
             int y = _vp.Y - (int)_scrollG;
 
             int pad = S(16), rowH = S(52);
-            _visRows.Add(R_MODE);
-            if (_pendMode == 0) _visRows.Add(R_LAYOUT); // 仅悬浮窗模式需要选择排列（条形灵动岛 / 矩形卡片）
-            if (_pendMode == 1) _visRows.Add(R_SCREEN); // 仅置顶栏模式需要选择停靠屏幕
-            _visRows.Add(R_INT);
+            _visRows.Add(R_LAYOUT);
             _visRows.Add(R_OP);
 
             _grp1 = new Rectangle(_vp.X, y + S(18), _vp.Width, _visRows.Count * rowH);
@@ -5957,21 +6927,11 @@ namespace QuotaWidget
                 int cy = rr.Y + rowH / 2;
                 switch (_visRows[i])
                 {
-                    case R_MODE:
-                        _rcSegMode = SegRect(rr, new string[] { "悬浮窗", "置顶栏" });
-                        SegBtns(_rcSegMode, _segModeBtns);
-                        AddHot(_segModeBtns[0], "segmode:0");
-                        AddHot(_segModeBtns[1], "segmode:1");
-                        break;
                     case R_LAYOUT:
-                        _rcSegLayout = SegRect(rr, new string[] { "矩形卡片", "条形灵动岛" });
+                        _rcSegLayout = SegRect(rr, new string[] { "条形灵动岛", "矩形卡片" });
                         SegBtns(_rcSegLayout, _segLayoutBtns);
                         AddHot(_segLayoutBtns[0], "seglayout:0");
                         AddHot(_segLayoutBtns[1], "seglayout:1");
-                        break;
-                    case R_SCREEN:
-                        _rcSelScreen = new Rectangle(rr.Right - pad - S(210), cy - S(17), S(210), S(34));
-                        AddHot(_rcSelScreen, "sel:screen");
                         break;
                     case R_INT:
                         _rcSelInt = new Rectangle(rr.Right - pad - S(120), cy - S(17), S(120), S(34));
@@ -6139,6 +7099,9 @@ namespace QuotaWidget
         {
             // 工具栏：＋ 添加供应商（主） / 测试全部（次）
             PaintButton(g, p, fs, _rcAdd, "＋ 添加供应商", true, _hover == "add");
+            PaintButton(g, p, fs, _rcCustom, "自定义接口", false, _hover == "custom");
+            TextRenderer.DrawText(g, "通用刷新", fs[4], new Rectangle(_rcSelInt.X - S(72), _rcSelInt.Y, S(68), _rcSelInt.Height), p.Text2, TextFormatFlags.VerticalCenter | TextFormatFlags.Right);
+            PaintSelect(g, p, fs, _rcSelInt, IntervalText(_pendInterval), _hover == "sel:int");
             PaintButton(g, p, fs, _rcTest, _testing ? "测试中…" : "测试全部", false, _hover == "test" && !_testing);
 
             if (_editList.Count == 0)
@@ -6191,8 +7154,8 @@ namespace QuotaWidget
                         g.FillEllipse(b, card.X + S(13) + c * S(5), card.Y + cardH / 2 - S(6) + r * S(5), S(2), S(2));
 
             // 品牌图标（悬浮窗同款：黑白随主题/彩色原样），无图标时回退标识色圆点
-            if (BrandIcons.Get(prov.Type, p.Dark) != null)
-                BrandIcons.Draw(g, prov.Type, p.Dark, card.X + S(30), card.Y + cardH / 2 - S(9), S(18));
+            if (BrandIcons.Get(prov.IconType, p.Dark) != null)
+                BrandIcons.Draw(g, prov.IconType, p.Dark, card.X + S(30), card.Y + cardH / 2 - S(9), S(18));
             else
                 using (var b = new SolidBrush(St.AccentFor(prov.Type)))
                     g.FillEllipse(b, card.X + S(34), card.Y + cardH / 2 - S(4), S(8), S(8));
@@ -6200,7 +7163,7 @@ namespace QuotaWidget
             // 名称（超长省略）；图标模式显示接口类型名（与悬浮窗/托盘一致）
             string name = Elide(g, prov.DisplayName, fs[1], S(110));
             float nameW = g.MeasureString(name, fs[1]).Width;
-            using (var b = new SolidBrush(p.Text))
+            using (var b = new SolidBrush(prov.Enabled ? p.Text : p.Text3))
                 g.DrawString(name, fs[1], b, new RectangleF(card.X + S(56), card.Y, nameW + S(16), cardH), SFLeftV);
 
             // 接口类型徽标
@@ -6214,14 +7177,17 @@ namespace QuotaWidget
 
             // 打码 Key（与旧表格同规则：前 4 + ****** + 后 4）：内存解密后仅取首尾字符画掩码，
             // 完整明文不出进程内存、不落盘；解不开或未配置时统一显示 ****
-            string key = prov.GetKey() ?? "";
-            string masked = key.Length > 8 ? key.Substring(0, 4) + "******" + key.Substring(key.Length - 4) : "****";
-            int keyMax = (card.Right - S(14) - S(30) * 2 - S(6)) - S(12) - (br.Right + S(12));
+            string key = prov.Enabled && prov.Type != "custom" ? (prov.GetKey() ?? "") : "";
+            string masked = !prov.Enabled ? "已停用" : prov.Type == "custom" ? RefreshChoices.Label(prov.RefreshSec) : key.Length > 8 ? key.Substring(0, 4) + "******" + key.Substring(key.Length - 4) : "****";
+            var toggle = ProviderToggleRect(card);
+            int keyMax = toggle.Left - S(12) - (br.Right + S(12));
+            // 与接口类型共用字体、绘制方式和行框，避免等宽字体的中文回退造成上下错位。
             if (keyMax > S(40))
-                using (var b = new SolidBrush(p.Text3))
-                    g.DrawString(Elide(g, masked, fs[6], keyMax), fs[6], b, new RectangleF(br.Right + S(12), card.Y, keyMax, cardH), SFLeftV);
+                TextRenderer.DrawText(g, masked, fs[5], new Rectangle(br.Right + S(12), br.Y, keyMax, br.Height), p.Text3,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
 
-            // 行内操作：编辑（铅笔） / 删除（垃圾桶）
+            // 行内操作：启用开关 / 编辑（铅笔） / 删除（垃圾桶）。
+            PaintToggle(g, p, toggle, prov.Enabled);
             bool eHot = _hover == "edit:" + i, dHot = _hover == "del:" + i;
             var er = new Rectangle(card.Right - S(14) - S(30) * 2 - S(6), card.Y + cardH / 2 - S(15), S(30), S(30));
             var dr = new Rectangle(card.Right - S(14) - S(30), card.Y + cardH / 2 - S(15), S(30), S(30));
@@ -6243,7 +7209,7 @@ namespace QuotaWidget
             int k = _hover.IndexOf(':');
             if (k < 0) return -1;
             string head = _hover.Substring(0, k);
-            if (head != "card" && head != "grip" && head != "edit" && head != "del") return -1;
+            if (head != "card" && head != "grip" && head != "enabled" && head != "edit" && head != "del") return -1;
             int i;
             return int.TryParse(_hover.Substring(k + 1), out i) ? i : -1;
         }
@@ -6277,13 +7243,11 @@ namespace QuotaWidget
         {
             switch (rowId)
             {
-                case R_MODE: return "显示模式";
                 case R_LAYOUT: return "排列";
-                case R_SCREEN: return "显示屏幕";
                 case R_INT: return "刷新间隔";
                 case R_OP: return "窗口不透明度";
                 case R_THEME: return "主题";
-                case R_TOP: return "窗口置顶";
+                case R_TOP: return "始终置顶";
                 default: return "开机启动";
             }
         }
@@ -6293,12 +7257,10 @@ namespace QuotaWidget
         {
             switch (rowId)
             {
-                case R_MODE: return "悬浮窗为独立小窗，可拖动，有矩形/条形两种排列；置顶栏全宽贴屏幕顶边常驻并预留工作区。";
                 case R_LAYOUT: return "条形灵动岛为内容自适应宽的圆角胶囊，贴顶自动隐藏、可拖拽定位，拖离顶边变为普通悬浮条；矩形卡片为紧凑单行卡片视图。";
-                case R_SCREEN: return "置顶栏停靠的显示器。";
                 case R_INT: return "自动查询额度的时间间隔。";
                 case R_OP: return "数值越低悬浮窗越透明。";
-                case R_THEME: return "跟随此设置，悬浮窗与置顶栏同步切换明暗。";
+                case R_THEME: return "切换悬浮窗与详情面板的明暗主题。";
                 case R_TOP: return "悬浮窗始终显示在其他窗口之上。";
                 default: return "登录 Windows 后自动运行。";
             }
@@ -6317,17 +7279,9 @@ namespace QuotaWidget
             int cy = r.Y + r.Height / 2;
             switch (rowId)
             {
-                case R_MODE:
-                    // 分段顺序：悬浮窗在左（默认模式在前）。段位 0=悬浮窗 / 1=置顶栏，与 _pendMode 一致
-                    PaintSeg(g, p, fs, _rcSegMode, _segModeBtns, new string[] { "悬浮窗", "置顶栏" }, _pendMode, "segmode");
-                    break;
                 case R_LAYOUT:
                     // 分段顺序：条形灵动岛在左（默认排列在前）。段位 0=条形灵动岛 / 1=矩形卡片，与 _pendIsland 一致
                     PaintSeg(g, p, fs, _rcSegLayout, _segLayoutBtns, new string[] { "条形灵动岛", "矩形卡片" }, _pendIsland ? 0 : 1, "seglayout");
-                    break;
-                case R_SCREEN:
-                    string[] items = ScreenItems();
-                    PaintSelect(g, p, fs, _rcSelScreen, items[Math.Min(_pendScreen, items.Length - 1)], _hover == "sel:screen");
                     break;
                 case R_INT:
                     PaintSelect(g, p, fs, _rcSelInt, IntervalText(_pendInterval), _hover == "sel:int");
@@ -6582,33 +7536,15 @@ namespace QuotaWidget
         }
 
         // ============================= 数据源 =============================
-        private string[] ScreenItems()
-        {
-            var screens = Screen.AllScreens;
-            var items = new string[screens.Length];
-            for (int i = 0; i < screens.Length; i++)
-            {
-                var b = screens[i].Bounds;
-                items[i] = (i + 1) + ". " + (screens[i].Primary ? "主显示器" : "显示器 " + (i + 1)) + string.Format(" ({0}×{1})", b.Width, b.Height);
-            }
-            return items;
-        }
-
         // 刷新间隔候选（秒）：预设 + 已有自定义值（保证旧配置里的任意值可见可选）
         private int[] IntervalVals()
         {
-            var vals = new List<int>(IntervalPresets);
-            if (!vals.Contains(_pendInterval))
-            {
-                vals.Add(_pendInterval);
-                vals.Sort();
-            }
-            return vals.ToArray();
+            return RefreshChoices.Values(_pendInterval, false).ToArray();
         }
 
         private static string IntervalText(int v)
         {
-            return v >= 60 && v % 60 == 0 ? (v / 60) + " 分钟" : v + " 秒";
+            return RefreshChoices.Label(v);
         }
 
         // ============================= 交互 =============================
@@ -6637,7 +7573,16 @@ namespace QuotaWidget
             if (_page == 0)
             {
                 if (id == "add") { AddProvider(); return; }
+                if (id == "custom") { AddCustomProvider(); return; }
+                if (id == "sel:int") { OpenIntervalPopup(); return; }
                 if (id == "test") { TestAll(); return; }
+                if (id != null && id.StartsWith("enabled:"))
+                {
+                    int idx = int.Parse(id.Substring(8));
+                    _editList[idx].Enabled = !_editList[idx].Enabled;
+                    Invalidate();
+                    return;
+                }
                 if (id != null && id.StartsWith("grip:") && int.Parse(id.Substring(5)) < _cardRects.Count)
                 {
                     _dragCard = int.Parse(id.Substring(5));
@@ -6651,12 +7596,10 @@ namespace QuotaWidget
             }
             else if (_page == 1)
             {
-                if (id != null && id.StartsWith("segmode:")) { SetMode(int.Parse(id.Substring(8))); return; } // 段位 0=悬浮窗 / 1=置顶栏，与 _pendMode 一致
                 if (id != null && id.StartsWith("seglayout:")) { _pendIsland = int.Parse(id.Substring(10)) == 0; Invalidate(); return; } // 段位 0=条形灵动岛 / 1=矩形卡片
                 if (id != null && id.StartsWith("segtheme:")) { _pendDark = int.Parse(id.Substring(9)) == 1; Invalidate(); return; }
                 if (id == "tgl:top") { _pendTopMost = !_pendTopMost; Invalidate(); return; }
                 if (id == "tgl:auto") { _pendAutoStart = !_pendAutoStart; Invalidate(); return; }
-                if (id == "sel:screen") { OpenScreenPopup(); return; }
                 if (id == "sel:int") { OpenIntervalPopup(); return; }
                 if (id == "sld:op") { _dragSlider = true; Capture = true; SliderSet(e.X); return; }
             }
@@ -6736,16 +7679,6 @@ namespace QuotaWidget
             Invalidate();
         }
 
-        private void SetMode(int m)
-        {
-            if (_pendMode == m) return;
-            _pendMode = m;
-            ClosePopup();
-            HideTip();
-            LayoutAll(); // 屏幕行显隐改变内容高度，滚动随之收敛
-            Invalidate();
-        }
-
         private void SliderSet(int mouseX)
         {
             int v = 50 + (int)Math.Round((mouseX - _rcSlider.X) * 50.0 / Math.Max(1, _rcSlider.Width));
@@ -6790,18 +7723,6 @@ namespace QuotaWidget
             if (_popup != null && !_popup.IsDisposed)
                 _popup.Close();
             _popup = null;
-        }
-
-        private void OpenScreenPopup()
-        {
-            _pendScreen = Math.Max(0, Math.Min(Screen.AllScreens.Length - 1, _pendScreen));
-            string[] items = ScreenItems();
-            int sel = _pendScreen;
-            OpenPopup(_rcSelScreen, items, sel, delegate(int idx)
-            {
-                _pendScreen = idx;
-                Invalidate();
-            });
         }
 
         private void OpenIntervalPopup()
@@ -6851,6 +7772,13 @@ namespace QuotaWidget
         }
 
         // ---- 供应商增删改 ----
+        private void AddCustomProvider()
+        {
+            using (var dialog = new CustomApiDialog(null, P, _scale, _pendInterval))
+                if (dialog.ShowDialog(this) == DialogResult.OK && dialog.Result != null)
+                { _editList.Add(dialog.Result); LayoutAll(); Invalidate(); }
+        }
+
         private void AddProvider()
         {
             using (var dlg = new ProviderEditDialog(null, P, _scale))
@@ -6867,10 +7795,18 @@ namespace QuotaWidget
         private void EditCard(int idx)
         {
             if (idx < 0 || idx >= _editList.Count) return;
+            if (_editList[idx].Type == "custom")
+            {
+                using (var custom = new CustomApiDialog(_editList[idx], P, _scale, _pendInterval))
+                    if (custom.ShowDialog(this) == DialogResult.OK && custom.Result != null)
+                    { _editList[idx] = custom.Result; LayoutAll(); Invalidate(); }
+                return;
+            }
             using (var dlg = new ProviderEditDialog(_editList[idx], P, _scale))
             {
                 if (dlg.ShowDialog(this) == DialogResult.OK && dlg.Result != null)
                 {
+                    dlg.Result.RuntimeId = _editList[idx].RuntimeId;
                     _editList[idx] = dlg.Result;
                     LayoutAll();
                     Invalidate();
@@ -7018,8 +7954,6 @@ namespace QuotaWidget
             bool oldTopMost = _ctx.Cfg.TopMost;
             bool oldAutoStart = _ctx.Cfg.AutoStart;
             string oldTheme = _ctx.Cfg.Theme;
-            string oldDisplayMode = _ctx.Cfg.DisplayMode;
-            int oldAppBarScreen = _ctx.Cfg.AppBarScreen;
             string oldFloatLayout = _ctx.Cfg.FloatLayout;
 
             // 拷贝而非直接赋值：保存失败时窗口保持打开，用户继续增删/移动供应商会突变
@@ -7031,8 +7965,6 @@ namespace QuotaWidget
             _ctx.Cfg.TopMost = _pendTopMost;
             _ctx.Cfg.AutoStart = _pendAutoStart;
             _ctx.Cfg.Theme = _pendDark ? "dark" : "light";
-            _ctx.Cfg.DisplayMode = _pendMode == 1 ? "topbar" : "float";
-            _ctx.Cfg.AppBarScreen = _pendScreen;
             _ctx.Cfg.FloatLayout = _pendIsland ? "island" : "card";
             // 保存失败（磁盘满/文件被杀软锁定等）不静默关闭窗口：
             // 否则用户以为已保存，重启后 API Key 全部丢失且无任何自救提示
@@ -7045,13 +7977,11 @@ namespace QuotaWidget
                 _ctx.Cfg.TopMost = oldTopMost;
                 _ctx.Cfg.AutoStart = oldAutoStart;
                 _ctx.Cfg.Theme = oldTheme;
-                _ctx.Cfg.DisplayMode = oldDisplayMode;
-                _ctx.Cfg.AppBarScreen = oldAppBarScreen;
                 _ctx.Cfg.FloatLayout = oldFloatLayout;
                 StyledMsg.Show(this, "保存失败", "配置保存失败（config.json 写入失败，可能磁盘已满或被其他程序占用）。\n窗口保持打开，请先记录本次填写的 API Key，再重试保存。", P, _scale);
                 return;
             }
-            _ctx.ApplyConfig();
+            _ctx.ApplyConfig(oldProviders, oldRefreshSec);
             Close();
         }
 
@@ -7120,34 +8050,31 @@ namespace QuotaWidget
         private void TestAll()
         {
             if (_testing) return;
-            if (_editList.Count == 0)
+            var snapshot = new List<ProviderConfig>();
+            foreach (var pr in _editList)
+                if (pr.CanQuery) snapshot.Add(pr.Clone());
+            if (snapshot.Count == 0)
             {
-                StyledMsg.Show(this, "测试连接", "请先添加供应商", P, _scale);
+                StyledMsg.Show(this, "测试连接", "请先添加或开启已配置的供应商", P, _scale);
                 return;
             }
             _testing = true;
             _hover = null;
             UpdateHoverCursor();
             Invalidate();
-            var snapshot = new List<ProviderConfig>(_editList);
             ThreadPool.QueueUserWorkItem(delegate
             {
                 var sb = new StringBuilder();
                 foreach (var pr in snapshot)
                 {
-                    if (!pr.HasKey && !pr.CanUseLocalCreds) continue;   // 未配置 key 且无本地凭证：跳过（密文解不开的由 RequireKey 报可读错误）
                     try
                     {
-                        ProviderStatus st;
-                        if (pr.Type == "mx") st = QuotaService.FetchMiniMax(pr);
-                        else if (pr.Type == "kimi") st = QuotaService.FetchKimi(pr);
-                        else if (pr.Type == "ds") st = QuotaService.FetchDeepSeek(pr);
-                        else if (pr.Type == "claude") st = QuotaService.FetchClaude(pr, true);   // 主动测试绕过节流
-                        else if (pr.Type == "codex") st = QuotaService.FetchCodex(pr);
-                        else st = QuotaService.FetchGlm(pr);
-                        sb.AppendLine("【" + pr.DisplayName + "】连接成功 ✓  " + st.Pools.Count + " 个额度池");
-                        foreach (var q in st.Pools)
-                            sb.AppendLine("   · " + q.Label + "：" + (q.IsMoney ? q.Currency + St.FmtMoney(q.Remaining) : "已用 " + q.Percent + "%"));
+                        foreach (var st in QuotaService.FetchProvider(pr, true))
+                        {
+                            sb.AppendLine("【" + st.DisplayName + "】" + (st.Error == null ? "连接成功 ✓  " + st.Pools.Count + " 个额度池" : "失败 ✗  " + st.Error));
+                            foreach (var q in st.Pools)
+                                sb.AppendLine("   · " + q.Label + "：" + (q.IsMoney ? q.Currency + St.FmtMoney(q.Remaining) : "已用 " + q.Percent + "%"));
+                        }
                     }
                     catch (Exception ex) { sb.AppendLine("【" + pr.DisplayName + "】失败 ✗  " + ex.Message); }
                 }
@@ -7182,7 +8109,7 @@ namespace QuotaWidget
         [STAThread]
         private static void Main()
         {
-            // 单实例保护：置顶栏模式会修改系统工作区，多实例会导致工作区记录混乱
+            // 单实例保护：避免重复托盘图标、刷新请求与配置写入冲突
             bool createdNew;
             var mutex = new Mutex(true, "Global\\QuotaWidget_SingleInstance", out createdNew);
             if (!createdNew)
