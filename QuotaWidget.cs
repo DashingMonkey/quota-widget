@@ -22,7 +22,7 @@ namespace QuotaWidget
     // ============================= 应用信息 =============================
     internal static class AppInfo
     {
-        public const string Version = "1.1.9";
+        public const string Version = "1.2.0";
 
         // 更新检查双源：Gitee 主源（国内可达性最好、海外也能访问），GitHub 备源，两边同 tag 发版。
         // Gitee API v5 仿 GitHub API 设计，核心字段（tag_name 等）两边一致，解析代码一套通吃
