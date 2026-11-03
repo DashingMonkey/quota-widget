@@ -1,16 +1,20 @@
-﻿// QuotaWidget - AI 额度工具 (GLM Coding Plan / MiniMax Token Plan / Kimi Code Plan / DeepSeek 余额)
+// QuotaWidget - AI 额度工具 (GLM Coding Plan + 钱包余额 / MiniMax Token Plan / Kimi Code Plan / DeepSeek 余额 / 小米 MiMo)
 // 编译: csc.exe /nologo /utf8output /target:winexe /optimize+ /win32icon:QuotaWidget.ico /out:QuotaWidget.exe QuotaWidget.cs /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
 using System.Net;
+using System.Net.Sockets;
+using System.Net.WebSockets;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -82,7 +86,7 @@ namespace QuotaWidget
     // ============================= 数据模型 =============================
     internal class ProviderConfig
     {
-        public string Type { get; set; }     // "glm" / "mx" / "kimi" / "ds" / "claude" / "codex"
+        public string Type { get; set; }     // "glm" / "mx" / "kimi" / "ds" / "claude" / "codex" / "mimo" / "qwen" / "bailian"
         public string Region { get; set; }   // "cn" / "intl"
         // 旧明文字段：仅用于读取旧 config.json 完成迁移，序列化时忽略（迁移后恒为空）
         [ScriptIgnore]
@@ -96,6 +100,23 @@ namespace QuotaWidget
         public bool ShowName { get; set; }
         public bool Enabled { get; set; } // 关闭后保留配置，跳过查询与展示；旧配置默认启用。
         public int RefreshSec { get; set; } // 0=跟随通用设置；其他值为供应商独立间隔。
+        // 仅 GLM 使用：查询内容 "quota"(默认，Coding Plan 套餐额度) / "wallet"(标准 API 钱包余额)。
+        // 官方已将套餐 Key 与标准 API Key 分开管理，同一个 Key 不再同时属于两种产品
+        public string GlmMode { get; set; }
+        // 仅 GLM 钱包模式使用：币种 "CNY"/"USD"。账户余额不随接口域名换算，
+        // 国内账户用人民币、国际账户用美元，需与账户实际币种一致
+        public string GlmCurrency { get; set; }
+        // 仅 GLM Coding Plan 使用：团队版查询需要 ?type=2 与组织/项目上下文头；
+        // 个人版保持 "personal"（默认），不带这两个头，也不带 type 参数
+        public string GlmPlanType { get; set; }
+        public string GlmOrganization { get; set; }
+        public string GlmProject { get; set; }
+        // 仅小米 MiMo 使用：查询内容 "plan"(默认，Token Plan 套餐额度) / "balance"(账号余额)。
+        // 官方只有网页控制台接口，凭证是登录 Cookie（仍加密保存在 KeyEnc 里），不是 API Key
+        public string MimoMode { get; set; }
+        // 控制台 Cookie 型供应商（MiMo / 千问 / 百炼）共用：拿到 Cookie 的本机时间（ISO 8601）。
+        // 只用于显示「登录于 …」，不据此作废——是否还有效只由接口返回决定
+        public string MimoLoginAt { get; set; }
         public CustomApiConfig Custom { get; set; }
         internal Guid RuntimeId = Guid.NewGuid(); // 编辑、排序后仍能找到同一接口的查询状态，不写入配置。
         internal DateTime NextRefreshUtc;
@@ -105,16 +126,33 @@ namespace QuotaWidget
 
         public int EffectiveRefreshSec(int globalSeconds) { return Math.Max(15, Math.Min(86400, RefreshSec > 0 ? RefreshSec : globalSeconds)); }
         public bool IsRefreshDue(DateTime now) { return now >= NextRefreshUtc; }
+        // 旧配置没有该字段，按默认值"套餐额度"处理；未知值（含旧版临时写入的 "both"）也回退到套餐
+        [ScriptIgnore]
+        public string EffectiveGlmMode { get { return GlmMode == "wallet" ? "wallet" : "quota"; } }
+        // 钱包币种：未配置时默认人民币（旧配置），美元需显式选择
+        [ScriptIgnore]
+        public string EffectiveGlmCurrency { get { return GlmCurrency == "USD" ? "USD" : "CNY"; } }
+        // 套餐类型：旧配置未记录时按个人版处理
+        [ScriptIgnore]
+        public string EffectiveGlmPlanType { get { return GlmPlanType == "team" ? "team" : "personal"; } }
+        // MiMo 查询内容：旧配置未记录时按 Token Plan 套餐处理
+        [ScriptIgnore]
+        public string EffectiveMimoMode { get { return MimoMode == "balance" ? "balance" : "plan"; } }
+        [ScriptIgnore]
+        public bool HasGlmTeamContext { get { return !string.IsNullOrWhiteSpace(GlmOrganization) && !string.IsNullOrWhiteSpace(GlmProject); } }
         [ScriptIgnore]
         public string IconType { get { return Type == "custom" ? (Custom == null || string.IsNullOrEmpty(Custom.IconType) ? "custom" : Custom.IconType) : Type; } }
 
-        // 各接口默认显示名（与设置对话框 TypeItems 顺序一致）；编辑对话框与旧配置迁移共用
-        internal static readonly string[] TypeDefaultNames = { "GLM", "GLM", "MiniMax", "MiniMax", "Kimi", "DeepSeek", "Claude", "Codex", "自定义接口" };
+        // 各接口默认显示名（与设置对话框 TypeItems 顺序一致，末尾"自定义接口"不在下拉里）；编辑对话框与旧配置迁移共用
+        internal static readonly string[] TypeDefaultNames = { "GLM", "GLM", "MiniMax", "MiniMax", "Kimi", "DeepSeek", "Claude", "Codex", "MiMo", "千问", "百炼", "自定义接口" };
 
         /// type+region → 接口下拉项索引（编辑对话框预填/保存与旧配置迁移共用）
         internal static int TypeIndex(string type, string region)
         {
-            if (type == "custom") return 8;
+            if (type == "custom") return 11;
+            if (type == "bailian") return 10;
+            if (type == "qwen") return 9;
+            if (type == "mimo") return 8;
             if (type == "codex") return 7;
             if (type == "claude") return 6;
             if (type == "ds") return 5;
@@ -131,6 +169,9 @@ namespace QuotaWidget
             if (type == "ds") return "DeepSeek";
             if (type == "claude") return "Claude Pro/Max";
             if (type == "codex") return "Codex (ChatGPT 套餐)";
+            if (type == "mimo") return "小米 MiMo";
+            if (type == "qwen") return "千问 Token Plan";
+            if (type == "bailian") return "百炼 Token Plan";
             if (type == "custom") return "自定义接口";
             return type;
         }
@@ -145,7 +186,7 @@ namespace QuotaWidget
         private string _plainCache;
         private bool _plainLoaded;
 
-        public ProviderConfig() { Type = "glm"; Region = "cn"; Key = ""; KeyEnc = ""; Name = "GLM"; Enabled = true; }
+        public ProviderConfig() { Type = "glm"; Region = "cn"; Key = ""; KeyEnc = ""; Name = "GLM"; Enabled = true; GlmMode = "quota"; GlmPlanType = "personal"; MimoMode = "plan"; }
 
         /// 是否配置了 key（旧明文字段或密文任一存在）
         [ScriptIgnore]
@@ -177,12 +218,26 @@ namespace QuotaWidget
             Key = "";
         }
 
-        public ProviderConfig Clone() { return new ProviderConfig { RuntimeId = RuntimeId, Type = Type, Region = Region, Key = Key, KeyEnc = KeyEnc, Name = Name, ShowName = ShowName, Enabled = Enabled, RefreshSec = RefreshSec, Custom = Custom == null ? null : Custom.Clone() }; }
+        public ProviderConfig Clone() { return new ProviderConfig { RuntimeId = RuntimeId, Type = Type, Region = Region, Key = Key, KeyEnc = KeyEnc, Name = Name, ShowName = ShowName, Enabled = Enabled, RefreshSec = RefreshSec, GlmMode = GlmMode, GlmCurrency = GlmCurrency, GlmPlanType = GlmPlanType, GlmOrganization = GlmOrganization, GlmProject = GlmProject, MimoMode = MimoMode, MimoLoginAt = MimoLoginAt, Custom = Custom == null ? null : Custom.Clone() }; }
 
         internal bool HasSameQuery(ProviderConfig other)
         {
             if (other == null || Type != other.Type || Region != other.Region) return false;
             if ((KeyEnc != other.KeyEnc || Key != other.Key) && GetKey() != other.GetKey()) return false;
+            // 查询内容、钱包币种、团队上下文变化后不能复用旧额度
+            if (Type == "glm")
+            {
+                if (EffectiveGlmMode != other.EffectiveGlmMode) return false;
+                if (EffectiveGlmMode == "wallet" && EffectiveGlmCurrency != other.EffectiveGlmCurrency) return false;
+                if (EffectiveGlmMode == "quota")
+                {
+                    if (EffectiveGlmPlanType != other.EffectiveGlmPlanType) return false;
+                    if (EffectiveGlmPlanType == "team" &&
+                        (GlmOrganization != other.GlmOrganization || GlmProject != other.GlmProject)) return false;
+                }
+            }
+            // MiMo 套餐与余额是两个接口，切换后不能套用旧结果
+            if (Type == "mimo" && EffectiveMimoMode != other.EffectiveMimoMode) return false;
             if (Type != "custom") return true;
             if (Custom == null || other.Custom == null) return Custom == other.Custom;
             if (Custom.HttpMethod != other.Custom.HttpMethod || (Custom.HttpMethod == "POST" && Custom.GetBody() != other.Custom.GetBody())) return false;
@@ -927,6 +982,35 @@ namespace QuotaWidget
             double r; return double.TryParse(v.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out r) ? r : 0;
         }
         public static bool HasKey(Dictionary<string, object> d, string k) { return d.ContainsKey(k) && d[k] != null; }
+        public static Dictionary<string, object> Dict(object o) { return o as Dictionary<string, object>; }
+        public static bool HasAny(Dictionary<string, object> d, string[] keys)
+        {
+            foreach (var k in keys) if (HasKey(d, k)) return true;
+            return false;
+        }
+        // 深度优先找第一个「含指定键之一」的对象：控制台网关的信封层级会变（data / DataV2 / data.data），
+        // 与其猜层数，不如按业务字段出现的位置定位，改版时也只影响一处
+        public static Dictionary<string, object> FindFirstWithAny(object node, string[] keys)
+        {
+            var d = node as Dictionary<string, object>;
+            if (d != null)
+            {
+                if (HasAny(d, keys)) return d;
+                foreach (var v in d.Values)
+                {
+                    var hit = FindFirstWithAny(v, keys);
+                    if (hit != null) return hit;
+                }
+                return null;
+            }
+            foreach (var item in Each(node))
+            {
+                var hit = FindFirstWithAny(item, keys);
+                if (hit != null) return hit;
+            }
+            return null;
+        }
+
         public static IEnumerable<object> Each(object o)
         {
             if (o is ArrayList) { foreach (var i in (ArrayList)o) yield return i; }
@@ -952,6 +1036,8 @@ namespace QuotaWidget
             else if (p.Type == "ds") st = FetchDeepSeek(p);
             else if (p.Type == "claude") st = FetchClaude(p, force);
             else if (p.Type == "codex") st = FetchCodex(p);
+            else if (p.Type == "mimo") st = FetchMimo(p);
+            else if (p.Type == "qwen" || p.Type == "bailian") st = FetchAliyunConsole(p);
             else st = FetchGlm(p);
             return new List<ProviderStatus> { st };
         }
@@ -1054,6 +1140,13 @@ namespace QuotaWidget
 
         private static string HttpGet(string url, string authorization, string ua, string extraName, string extraValue)
         {
+            var headers = new Dictionary<string, string>();
+            if (!string.IsNullOrEmpty(extraName) && !string.IsNullOrEmpty(extraValue)) headers[extraName] = extraValue;
+            return HttpGet(url, authorization, ua, headers);
+        }
+
+        private static string HttpGet(string url, string authorization, string ua, IDictionary<string, string> extraHeaders)
+        {
             var req = (HttpWebRequest)WebRequest.Create(url);
             req.Method = "GET";
             req.Timeout = 15000;
@@ -1061,9 +1154,69 @@ namespace QuotaWidget
             req.UserAgent = string.IsNullOrEmpty(ua) ? "QuotaWidget/" + AppInfo.Version : ua;
             req.Accept = "application/json";
             if (authorization != null) req.Headers["Authorization"] = authorization;
-            if (!string.IsNullOrEmpty(extraName) && !string.IsNullOrEmpty(extraValue)) req.Headers[extraName] = extraValue;
+            if (extraHeaders != null)
+                foreach (var header in extraHeaders)
+                {
+                    if (string.IsNullOrEmpty(header.Value)) continue;
+                    // Referer / User-Agent 是受限头，走 Headers 索引器会抛 ArgumentException，只能经属性赋值
+                    if (string.Equals(header.Key, "Referer", StringComparison.OrdinalIgnoreCase)) req.Referer = header.Value;
+                    else if (string.Equals(header.Key, "User-Agent", StringComparison.OrdinalIgnoreCase)) req.UserAgent = header.Value;
+                    else req.Headers[header.Key] = header.Value;
+                }
             try
             {
+                using (var resp = (HttpWebResponse)req.GetResponse())
+                using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                    return sr.ReadToEnd();
+            }
+            catch (WebException we)
+            {
+                string body = "";
+                int status = 0;
+                try
+                {
+                    if (we.Response != null)
+                    {
+                        status = (int)((HttpWebResponse)we.Response).StatusCode;
+                        using (var sr = new StreamReader(we.Response.GetResponseStream(), Encoding.UTF8))
+                            body = sr.ReadToEnd();
+                    }
+                }
+                catch { }
+                if (!string.IsNullOrEmpty(body) && body.Length > 300) body = body.Substring(0, 300);
+                throw new HttpException(status, DescribeHttpError(status, body, we.Message));
+            }
+        }
+
+        // 表单 POST：千问 / 百炼的控制台「数据网关」是 POST form + params 内嵌 JSON，
+        // HttpGet 覆盖不到这个形态。网关把业务错误也放在 HTTP 200 的 JSON 里，所以状态码只用于
+        // 网络层判断；3xx 不跟随（会被重定向到登录页，跟过去只会拿到 HTML）。
+        private static string HttpPostForm(string url, string ua, IDictionary<string, string> extraHeaders, string form, int timeoutMs,
+            CancellationToken cancellation = default(CancellationToken))
+        {
+            cancellation.ThrowIfCancellationRequested();
+            var req = (HttpWebRequest)WebRequest.Create(url);
+            req.Method = "POST";
+            req.Timeout = timeoutMs;
+            req.ReadWriteTimeout = timeoutMs;
+            req.UserAgent = string.IsNullOrEmpty(ua) ? "QuotaWidget/" + AppInfo.Version : ua;
+            req.Accept = "application/json";
+            req.ContentType = "application/x-www-form-urlencoded";
+            req.AllowAutoRedirect = false;
+            if (extraHeaders != null)
+                foreach (var header in extraHeaders)
+                {
+                    if (string.IsNullOrEmpty(header.Value)) continue;
+                    if (string.Equals(header.Key, "Referer", StringComparison.OrdinalIgnoreCase)) req.Referer = header.Value;
+                    else if (string.Equals(header.Key, "User-Agent", StringComparison.OrdinalIgnoreCase)) req.UserAgent = header.Value;
+                    else req.Headers[header.Key] = header.Value;
+                }
+            byte[] payload = Encoding.UTF8.GetBytes(form ?? "");
+            req.ContentLength = payload.Length;
+            using (cancellation.Register(req.Abort))
+            try
+            {
+                using (var s = req.GetRequestStream()) s.Write(payload, 0, payload.Length);
                 using (var resp = (HttpWebResponse)req.GetResponse())
                 using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
                     return sr.ReadToEnd();
@@ -1113,8 +1266,9 @@ namespace QuotaWidget
         }
 
         // ---------- GLM ----------
-        // 200+success=false+code 1000/1001 = 鉴权失败（Key 无效/被删/填错，或鉴权格式被拒），
-        // 回退循环与最终错误分类共用此判据，避免两处判定不一致
+        // 200+success=false+code 1000/1001 = 鉴权失败（Key 无效/被删/填错，或鉴权格式被拒）；
+        // 财务接口也可能用 code 401 表达同一含义。回退循环与最终错误分类共用此判据，
+        // 避免两处判定不一致
         private static bool IsAuthFailure(Dictionary<string, object> root)
         {
             bool success = false;
@@ -1122,7 +1276,8 @@ namespace QuotaWidget
             if (root.TryGetValue("success", out sv) && sv is bool) success = (bool)sv;
             if (success) return false;
             int code = (int)Math.Round(J.D(root, "code"));
-            return code == 1000 || code == 1001;
+            // 1000–1004 都是智谱系的鉴权失败码；401 是 Z.ai 在 HTTP 200 里返回的拒绝码
+            return (code >= 1000 && code <= 1004) || code == 401;
         }
 
         // 解出明文 key；密文解不开（换电脑/换 Windows 账户）时抛出可读异常，
@@ -1154,24 +1309,23 @@ namespace QuotaWidget
             }
         }
 
-        public static ProviderStatus FetchGlm(ProviderConfig p)
+        // 额度接口与钱包接口共用鉴权回退：官方文档要求额度接口使用裸 Key（Bearer 会被拒），
+        // 财务接口则接受 Bearer，因此由调用方指定先试哪种格式。失败（401/403 或 200+鉴权失败 JSON）
+        // 或空响应时回退另一种格式。
+        // 2026-08 起智谱监控接口故障：对有效 Key 返回 200+空 body，空体经
+        // JavaScriptSerializer 反序列化得 null，后续 root.TryGetValue 会抛
+        // NullReferenceException（"未将对象引用设置到对象的实例"），必须在此拦截
+        private static string RequestGlmJson(string url, string key, string emptyMessage, IDictionary<string, string> headers, bool rawFirst)
         {
-            string baseUrl = p.Region == "intl" ? "https://api.z.ai" : "https://open.bigmodel.cn";
-            string url = baseUrl + "/api/monitor/usage/quota/limit";
-            string key = RequireKey(p);
-            // 鉴权格式：先 Bearer 前缀（现行官方口径，与智谱控制台/主流工具一致），
-            // 失败（401/403 或 200+鉴权失败 JSON）或空响应时回退旧式裸 Key（历史上 GLM 曾要求无 Bearer 前缀）。
-            // 2026-08 起智谱监控接口故障：对有效 Key 返回 200+空 body，空体经
-            // JavaScriptSerializer 反序列化得 null，后续 root.TryGetValue 会抛
-            // NullReferenceException（"未将对象引用设置到对象的实例"），必须在此拦截
             string json = null;            // 有效（非空、非鉴权失败）响应体
             Exception firstErr = null;     // 首个鉴权相关失败（401/403 或 200+鉴权失败 JSON）；双失败时抛出，保留真实根因
             var ser = new JavaScriptSerializer();
-            foreach (var auth in new[] { "Bearer " + key, key })
+            var auths = rawFirst ? new[] { key, "Bearer " + key } : new[] { "Bearer " + key, key };
+            foreach (var auth in auths)
             {
                 try
                 {
-                    string body = HttpGet(url, auth);
+                    string body = HttpGet(url, auth, null, headers);
                     if (string.IsNullOrWhiteSpace(body)) continue;   // 200 空体：服务端故障特征
                     // 服务端可能用 200+success=false+code 1000/1001 表达"鉴权失败/格式被拒"而非 HTTP 4xx：
                     // 该形态视为本轮失败，继续回退下一种鉴权格式，避免仅兼容裸 Key 的合法 Key 被误判为无效
@@ -1199,9 +1353,15 @@ namespace QuotaWidget
                 // 两种格式都未取得有效响应：有真实鉴权错误优先抛出；
                 // 否则说明只收到空体 —— 显式告知服务端故障，而非让空体触发 NRE
                 if (firstErr != null) throw firstErr;
-                throw new Exception("智谱接口返回空响应（服务端故障中，非 Key 或网络问题），请稍后重试");
+                throw new Exception(emptyMessage);
             }
+            return json;
+        }
 
+        // 解析 Coding Plan 额度响应（GET /api/monitor/usage/quota/limit）
+        internal static ProviderStatus ParseGlmQuota(ProviderConfig p, string json)
+        {
+            var ser = new JavaScriptSerializer();
             var root = ser.Deserialize<Dictionary<string, object>>(json);
             if (root == null) throw new Exception("智谱接口返回无法解析的响应: " + json.Substring(0, Math.Min(120, json.Length)));
             bool success = false;
@@ -1219,6 +1379,7 @@ namespace QuotaWidget
             st.Level = J.S(data, "level").ToUpper();
 
             object limitsObj;
+            int limitCount = 0;
             if (data.TryGetValue("limits", out limitsObj))
             {
                 foreach (var item in J.Each(limitsObj))
@@ -1258,10 +1419,730 @@ namespace QuotaWidget
                     }
                     if (is5h && st.Primary5h == null) st.Primary5h = pool;
                     st.Pools.Add(pool);
+                    limitCount++;
                 }
             }
+            if (limitCount == 0)
+                throw new Exception(p.EffectiveGlmPlanType == "team"
+                    ? "额度接口返回空数据：请检查团队组织 ID / 项目 ID 是否正确"
+                    : "额度接口未返回任何额度数据");
             PromoteExhaustedWeekly(st);
             st.UpdatedAt = DateTime.Now;
+            return st;
+        }
+
+        // 现金钱包（GET /api/biz/account/query-customer-account-report，与 Coding Plan 额度接口共用
+        // API Key）。availableBalance 是可用余额；rechargeAmount / giveAmount / totalSpendAmount
+        // 都是累计值（充值总额 / 赠送总额 / 消费总额），故分别标注"累计…"，不当作余额。
+        // 余额为 0 也保留，用于确认钱包已用尽；字段缺失或为 0 的累计行直接省略，避免明细过长。
+        // currency 由账户币种决定（不随接口域名换算），传 "¥" 或 "$"。
+        internal static List<QuotaPool> ParseGlmWallet(string json, string currency)
+        {
+            var ser = new JavaScriptSerializer();
+            var root = ser.Deserialize<Dictionary<string, object>>(json);
+            if (root == null) throw new Exception("钱包接口返回无法解析的响应");
+            bool success = true;
+            object sv;
+            if (root.TryGetValue("success", out sv) && sv is bool) success = (bool)sv;
+            if (!success)
+            {
+                int code = (int)Math.Round(J.D(root, "code"));
+                string msg = J.S(root, "msg");
+                if (IsAuthFailure(root)) throw new Exception("GLM API Key 无效或已失效（" + msg + "）");
+                throw new Exception("钱包接口返回失败" + (string.IsNullOrEmpty(msg) ? "（code " + code + "）" : ": " + msg));
+            }
+            object dataObj;
+            if (!root.TryGetValue("data", out dataObj)) throw new Exception("钱包接口返回缺少 data 字段");
+            var data = dataObj as Dictionary<string, object>;
+            if (data == null) throw new Exception("钱包接口返回缺少 data 字段");
+
+            double available = J.HasKey(data, "availableBalance") ? J.D(data, "availableBalance") : J.D(data, "balance");
+            var pools = new List<QuotaPool>();
+            pools.Add(new QuotaPool
+            {
+                Label = "钱包余额",
+                IsMoney = true,
+                Currency = currency,
+                Remaining = available,
+                Total = available,
+                // 余额为 0 时用红环表达"无可扣余额"；有余额时保持绿色满环（与 DeepSeek 余额一致）
+                Percent = available > 0 ? 0 : 100
+            });
+            double recharge = J.D(data, "rechargeAmount");
+            if (recharge > 0)
+                pools.Add(new QuotaPool { Label = "累计充值", IsMoney = true, Currency = currency, Remaining = recharge, Total = recharge, Percent = 0 });
+            double gift = J.D(data, "giveAmount");
+            if (gift > 0)
+                pools.Add(new QuotaPool { Label = "累计赠送", IsMoney = true, Currency = currency, Remaining = gift, Total = gift, Percent = 0 });
+            double spent = J.D(data, "totalSpendAmount");
+            if (spent > 0)
+                pools.Add(new QuotaPool { Label = "累计消费", IsMoney = true, Currency = currency, Remaining = spent, Total = spent, Percent = 0 });
+            return pools;
+        }
+
+        // 钱包查询结果 → 状态：主显第一个金额池（钱包余额），详情按 钱包余额 / 累计… 排列
+        internal static ProviderStatus GlmWalletStatus(ProviderConfig p, List<QuotaPool> wallet)
+        {
+            var st = new ProviderStatus { Name = p.Name, Type = "glm", Region = p.Region, ShowName = p.ShowName, UpdatedAt = DateTime.Now };
+            st.Pools.AddRange(wallet);
+            st.Primary5h = wallet.Count > 0 ? wallet[0] : null;
+            return st;
+        }
+
+        // 钱包按币种选择站点：人民币走国内站，美元走国际站（与 QuotaTray 等项目的
+        // zhipu_api=CNY / zai_api=USD 划分一致）。套餐额度仍按用户选择的接口区域。
+        // 这样国内账户即使把接口切到国际版，也不会拿人民币金额去请求国际站再套 $。
+        internal static string GlmBaseUrl(ProviderConfig p)
+        {
+            if (p.EffectiveGlmMode == "wallet")
+                return p.EffectiveGlmCurrency == "USD" ? "https://api.z.ai" : "https://open.bigmodel.cn";
+            return p.Region == "intl" ? "https://api.z.ai" : "https://open.bigmodel.cn";
+        }
+
+        // 套餐额度按官方新版协议组装：个人版无参数；团队版需要 ?type=2 与组织/项目上下文头。
+        // 缺少上下文时明确报错，避免接口返回空 data 被误显示成 0 额度。
+        internal static string GlmQuotaUrl(ProviderConfig p)
+        {
+            string url = GlmBaseUrl(p) + "/api/monitor/usage/quota/limit";
+            return p.EffectiveGlmPlanType == "team" ? url + "?type=2" : url;
+        }
+
+        internal static Dictionary<string, string> GlmQuotaHeaders(ProviderConfig p)
+        {
+            var headers = new Dictionary<string, string>();
+            if (p.EffectiveGlmPlanType != "team") return headers;
+            if (!p.HasGlmTeamContext)
+                throw new Exception("GLM 团队套餐需要填写组织 ID 和项目 ID（bigmodel-organization / bigmodel-project）");
+            headers["bigmodel-organization"] = p.GlmOrganization.Trim();
+            headers["bigmodel-project"] = p.GlmProject.Trim();
+            return headers;
+        }
+
+        // 查询内容二选一：Coding Plan 套餐额度 / 标准 API 钱包余额。
+        // 官方已把套餐 Key 与标准 API Key 分开管理，同一个 Key 不再同时属于两种产品，
+        // 因此按 Key 所属产品只请求对应接口，不再同时查两条。
+        public static ProviderStatus FetchGlm(ProviderConfig p)
+        {
+            string baseUrl = GlmBaseUrl(p);
+            string key = RequireKey(p);
+            if (p.EffectiveGlmMode == "wallet")
+                return GlmWalletStatus(p, ParseGlmWallet(
+                    RequestGlmJson(baseUrl + "/api/biz/account/query-customer-account-report", key, "智谱钱包接口返回空响应", null, false),
+                    p.EffectiveGlmCurrency == "USD" ? "$" : "¥"));
+            // 官方文档要求额度接口用裸 Key（Bearer 会被拒），所以先试裸 Key
+            return ParseGlmQuota(p, RequestGlmJson(
+                GlmQuotaUrl(p), key, "智谱接口返回空响应（服务端故障中，非 Key 或网络问题），请稍后重试", GlmQuotaHeaders(p), true));
+        }
+
+        // ---------- 小米 MiMo ----------
+        // 官方只开放了网页控制台的私有接口（platform.xiaomimimo.com/api/v1）：
+        //   GET /balance         账号余额（data.balance 是字符串，data.currency 明确给币种）
+        //   GET /tokenPlan/usage Token Plan 额度（data.monthUsage.items[] 每项 used/limit/percent）
+        //   GET /tokenPlan/detail 套餐详情（currentPeriodEnd 是 UTC 的 "yyyy-MM-dd HH:mm:ss"）
+        // 鉴权是控制台登录 Cookie（api-platform_serviceToken + userId），API Key 调不通：
+        // 带着推理 Key 请求同样返回 HTTP 401 + {"code":401,"loginUrl":...}。
+        internal const string MimoApiBase = "https://platform.xiaomimimo.com/api/v1";
+        internal const string MimoConsoleUrl = "https://platform.xiaomimimo.com/console/balance";
+        internal const string MimoExpiredMessage = "MiMo 登录已过期，请重新点击「自动获取」获取 Cookie";
+        // 控制台是普通网页，接口按浏览器上下文校验：UA/Origin/Referer 全部按浏览器补齐
+        private const string MimoUserAgent = ConsoleUserAgent;
+
+        // 官方会话 Cookie 自签发起 24 小时有效；这里只做展示，不参与请求判断
+        // 只显示「什么时候拿到的」：官方会话 Cookie 的官方说法是自签发起 24 小时有效，
+        // 但也有账户靠小米账号登录态长期免登录，实测可能远长于 24 小时。
+        // 所以这里不做倒计时、也不按时间主动作废，过期与否只由接口是否返回 401 决定。
+        internal static string MimoLoginText(string loginAt)
+        {
+            if (string.IsNullOrEmpty(loginAt)) return "";
+            DateTime parsed;
+            if (!DateTime.TryParse(loginAt, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out parsed)) return "";
+            return "登录于 " + parsed.ToLocalTime().ToString("MM-dd HH:mm");
+        }
+        internal static string MimoUrl(ProviderConfig p)
+        {
+            return MimoApiBase + (p.EffectiveMimoMode == "balance" ? "/balance" : "/tokenPlan/usage");
+        }
+
+        // 用户可能整段粘贴 "Cookie: a=b; c=d"（DevTools 复制出来的就是这种），也可能只粘键值对
+        internal static string MimoCookie(string raw)
+        {
+            return ConsoleCookie(raw);
+        }
+
+        // 两个必需 Cookie 缺一不可：缺了请求会落到登录页或返回 401 loginUrl
+        internal static bool IsMimoCookie(string cookie)
+        {
+            return !string.IsNullOrEmpty(cookie)
+                && cookie.IndexOf("api-platform_serviceToken", StringComparison.OrdinalIgnoreCase) >= 0
+                && cookie.IndexOf("userId", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        internal static string MimoCurrencySymbol(string code)
+        {
+            string c = (code ?? "").Trim();
+            if (c.Length == 0) return "¥";
+            string u = c.ToUpperInvariant();
+            if (u == "USD" || u == "$" || u == "US$") return "$";
+            if (u == "CNY" || u == "RMB" || u == "￥" || u == "¥") return "¥";
+            return c + " ";
+        }
+
+        // MiMo 的成功信封是 code == 0（不是 success:true）；code 401 也会以 HTTP 200 返回
+        private static Dictionary<string, object> MimoData(string json, string what)
+        {
+            var ser = new JavaScriptSerializer();
+            Dictionary<string, object> root = null;
+            try { root = ser.Deserialize<Dictionary<string, object>>(json); }
+            catch { }
+            if (root == null)
+                throw new Exception("MiMo " + what + "接口返回无法解析的响应" +
+                    (string.IsNullOrEmpty(json) ? "" : ": " + json.Substring(0, Math.Min(120, json.Length))));
+            int code = (int)Math.Round(J.D(root, "code"));
+            if (code == 401 || code == 403) throw new Exception(MimoExpiredMessage);
+            if (code != 0)
+            {
+                string msg = J.S(root, "message");
+                if (string.IsNullOrEmpty(msg)) msg = J.S(root, "msg");
+                throw new Exception("接口返回失败" + (string.IsNullOrEmpty(msg) ? "（code " + code + "）" : ": " + msg));
+            }
+            var data = root.ContainsKey("data") ? root["data"] as Dictionary<string, object> : null;
+            if (data == null) throw new Exception("MiMo " + what + "接口返回缺少 data 字段");
+            return data;
+        }
+
+        private static string RequestMimoJson(string url, string cookie, string what)
+        {
+            var headers = new Dictionary<string, string>();
+            headers["Cookie"] = cookie;
+            headers["Origin"] = "https://platform.xiaomimimo.com";
+            headers["Referer"] = MimoConsoleUrl;
+            string body;
+            try { body = HttpGet(url, null, MimoUserAgent, headers); }
+            catch (HttpException he)
+            {
+                // 401/403：Cookie 过期或被拒；其余（超时/5xx）保持原始描述
+                if (he.StatusCode == 401 || he.StatusCode == 403) throw new Exception(MimoExpiredMessage);
+                throw;
+            }
+            if (string.IsNullOrWhiteSpace(body)) throw new Exception("MiMo " + what + "接口返回空响应");
+            return body;
+        }
+
+        // 从 items[] 里挑额度项：优先指定名称，其次第一条 limit > 0 的记录
+        private static Dictionary<string, object> MimoUsageItem(object itemsObj, string preferred)
+        {
+            Dictionary<string, object> fallback = null;
+            foreach (var raw in J.Each(itemsObj))
+            {
+                var item = raw as Dictionary<string, object>;
+                if (item == null) continue;
+                if (fallback == null && J.D(item, "limit") > 0) fallback = item;
+                string name = J.S(item, "name");
+                if (name == preferred) return item;
+            }
+            return fallback;
+        }
+
+        internal static List<QuotaPool> ParseMimoBalance(string json)
+        {
+            var data = MimoData(json, "余额");
+            string symbol = MimoCurrencySymbol(J.S(data, "currency"));
+            double balance = J.D(data, "balance");
+            var pools = new List<QuotaPool>();
+            pools.Add(new QuotaPool
+            {
+                Label = "账户余额",
+                IsMoney = true,
+                Currency = symbol,
+                Remaining = balance,
+                Total = balance,
+                // 与 GLM / DeepSeek 一致：有余额画满环，0 余额画红环
+                Percent = balance > 0 ? 0 : 100
+            });
+            double cash = J.D(data, "cashBalance");
+            if (cash > 0)
+                pools.Add(new QuotaPool { Label = "现金余额", IsMoney = true, Currency = symbol, Remaining = cash, Total = cash, Percent = 0 });
+            double gift = J.D(data, "giftBalance");
+            if (gift > 0)
+                pools.Add(new QuotaPool { Label = "赠送余额", IsMoney = true, Currency = symbol, Remaining = gift, Total = gift, Percent = 0 });
+            return pools;
+        }
+
+        // 套餐额度以 Credits 计（Lite = 41 亿），直接显示原始值会撑爆详情行，
+        // 因此按量级折算成"亿/万"并写进标签，百分比仍用接口给出的口径
+        internal static List<QuotaPool> ParseMimoPlan(string json, string detailJson)
+        {
+            var data = MimoData(json, "Token Plan");
+            object monthObj;
+            var month = data.TryGetValue("monthUsage", out monthObj) ? monthObj as Dictionary<string, object> : null;
+            object itemsObj = null;
+            if (month != null) month.TryGetValue("items", out itemsObj);
+            string label = "本月额度";
+            var plan = MimoUsageItem(itemsObj, "month_total_token");
+            if (plan == null)
+            {
+                // 没有 monthUsage（或 items 为空）时回退到 usage.items：部分账号只回本期用量
+                label = "本期额度";
+                object usageObj;
+                var usage = data.TryGetValue("usage", out usageObj) ? usageObj as Dictionary<string, object> : null;
+                itemsObj = null;
+                if (usage != null) usage.TryGetValue("items", out itemsObj);
+                plan = MimoUsageItem(itemsObj, "plan_total_token");
+            }
+            if (plan == null) throw new Exception("该账号未开通 Token Plan");
+
+            double used = J.D(plan, "used"), limit = J.D(plan, "limit");
+            if (limit <= 0) throw new Exception("该账号未开通 Token Plan");
+            double percent = J.D(plan, "percent");
+            // 百分比以 used/limit 为准：接口 percent 可能是 0-1 的小数或未返回
+            double pct = used / limit * 100;
+            if (pct <= 0 && percent > 0) pct = percent <= 1 ? percent * 100 : percent;
+
+            double scale = 1;
+            string unit = "Credits";
+            if (limit >= 1e8) { scale = 1e8; unit = "亿 Credits"; }
+            else if (limit >= 1e4) { scale = 1e4; unit = "万 Credits"; }
+
+            var pool = new QuotaPool
+            {
+                Label = label + "（" + unit + "）",
+                Total = limit / scale,
+                Used = used / scale,
+                Remaining = Math.Max(0, limit - used) / scale,
+                Percent = (int)Math.Round(Math.Max(0, Math.Min(100, pct)))
+            };
+            var reset = MimoPeriodEnd(detailJson);
+            if (reset.HasValue) pool.ResetLocal = reset.Value;
+
+            var pools = new List<QuotaPool> { pool };
+
+            // 补偿额度（官方活动补发）单独一行，和主额度分开看
+            foreach (var raw in J.Each(itemsObj))
+            {
+                var item = raw as Dictionary<string, object>;
+                if (item == null || J.S(item, "name") != "compensation_total_token") continue;
+                double cUsed = J.D(item, "used"), cLimit = J.D(item, "limit");
+                if (cLimit <= 0) continue;
+                pools.Add(new QuotaPool
+                {
+                    Label = "补偿额度（" + unit + "）",
+                    Total = cLimit / scale,
+                    Used = cUsed / scale,
+                    Remaining = Math.Max(0, cLimit - cUsed) / scale,
+                    Percent = (int)Math.Round(Math.Max(0, Math.Min(100, cUsed / cLimit * 100))),
+                    ResetLocal = reset
+                });
+            }
+            return pools;
+        }
+
+        internal static DateTime? MimoPeriodEnd(string detailJson)
+        {
+            if (string.IsNullOrWhiteSpace(detailJson)) return null;
+            try
+            {
+                var ser = new JavaScriptSerializer();
+                var root = ser.Deserialize<Dictionary<string, object>>(detailJson);
+                if (root == null) return null;
+                var data = root.ContainsKey("data") ? root["data"] as Dictionary<string, object> : null;
+                if (data == null) return null;
+                string text = J.S(data, "currentPeriodEnd");
+                if (string.IsNullOrEmpty(text)) return null;
+                // 官方按 UTC 输出 "yyyy-MM-dd HH:mm:ss"，不能按本地时间解析
+                DateTime utc;
+                if (DateTime.TryParseExact(text, "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture,
+                    DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out utc))
+                    return utc.ToLocalTime();
+                return ParseTimeFlexible(text);
+            }
+            catch { return null; }
+        }
+
+        internal static ProviderStatus MimoStatus(ProviderConfig p, List<QuotaPool> pools)
+        {
+            var st = new ProviderStatus { Name = p.Name, Type = "mimo", Region = p.Region, ShowName = p.ShowName, UpdatedAt = DateTime.Now };
+            st.Pools.AddRange(pools);
+            st.Primary5h = pools.Count > 0 ? pools[0] : null;
+            return st;
+        }
+
+        // 查询内容二选一：Token Plan 套餐额度 / 账号余额。两者共用同一份控制台 Cookie
+        public static ProviderStatus FetchMimo(ProviderConfig p)
+        {
+            string cookie = MimoCookie(RequireKey(p));
+            if (!IsMimoCookie(cookie))
+                throw new Exception("MiMo 需要控制台登录 Cookie（含 api-platform_serviceToken 与 userId），请点击「自动获取」");
+            if (p.EffectiveMimoMode == "balance")
+                return MimoStatus(p, ParseMimoBalance(RequestMimoJson(MimoApiBase + "/balance", cookie, "余额")));
+            string usage = RequestMimoJson(MimoApiBase + "/tokenPlan/usage", cookie, "Token Plan");
+            string detail = null;
+            try { detail = RequestMimoJson(MimoApiBase + "/tokenPlan/detail", cookie, "Token Plan 详情"); }
+            catch (Exception) { }   // 详情只提供重置时间，失败不影响额度展示
+            return MimoStatus(p, ParseMimoPlan(usage, detail));
+        }
+
+        // ---------- 阿里云控制台：千问 / 百炼 Token Plan ----------
+        // 两家控制台是同一套「数据网关」，只有域名与 consoleSite 不同：
+        //   GET  {infoUrl}  → data.secToken（CSRF 令牌，登录后自动取；手配只作兜底）
+        //   POST {gateway}?action=BroadScopeAspnGateway&product=sfm_bailian&api=<inner>&_v=undefined
+        //        表单 product / action / region / language / params(JSON) [/ sec_token]
+        //        inner = zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/{usage|quota-config|subscription}
+        // 本机实测（2026-11-03，未登录）：只传 Api 时回 data.errorCode="Bad Request"，
+        // 补上 cornerstoneParam 后回 "BailianGateway.Login.NotLogined" —— 请求骨架正确，缺的只有登录态；
+        // 两家返回同一个错误码，因此共用一份实现，只切换站点常量。
+        // 字段口径（per1MonthPercentage / quota-config[specCode].monthly / subscription.specCode 等）
+        // 参考 dsh-token-plan-quota（MIT）的逆向核对结果，其在真实账号上验证过。
+        internal const string AliyunGatewayAction = "BroadScopeAspnGateway";
+        internal const string AliyunGatewayProduct = "sfm_bailian";
+        internal const string AliyunApiPrefix = "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2";
+        internal const string AliyunRegion = "cn-beijing";
+
+        internal const string QwenConsoleOrigin = "https://platform-home.qianwenai.com";
+        internal const string QwenConsoleUrl = "https://platform-home.qianwenai.com/analytics/token-plan/individual";
+        // platform-home 是工作台子应用；独立打开会空白，浏览器必须走官网外层入口。
+        internal const string QwenLoginUrl = "https://platform.qianwenai.com/home/analytics/token-plan";
+        internal const string QwenGatewayUrl = "https://cs-data.qianwenai.com/data/api.json";
+        internal const string QwenInfoUrl = "https://platform-home.qianwenai.com/tool/user/info.json";
+        internal const string QwenConsoleSite = "QIANWENAI";
+
+        internal const string BailianConsoleOrigin = "https://bailian.console.aliyun.com";
+        internal const string BailianConsoleUrl = "https://bailian.console.aliyun.com/";
+        internal const string BailianGatewayUrl = "https://bailian-cs.console.aliyun.com/data/api.json";
+        internal const string BailianInfoUrl = "https://bailian.console.aliyun.com/tool/user/info.json";
+        internal const string BailianConsoleSite = "BAILIAN_ALIYUN";
+
+        internal static bool IsBailian(string type) { return type == "bailian"; }
+        internal static string AliyunBrand(string type) { return IsBailian(type) ? "百炼" : "千问"; }
+        internal static string AliyunConsoleOrigin(string type) { return IsBailian(type) ? BailianConsoleOrigin : QwenConsoleOrigin; }
+        internal static string AliyunConsoleUrl(string type) { return IsBailian(type) ? BailianConsoleUrl : QwenConsoleUrl; }
+        internal static string AliyunGatewayUrl(string type) { return IsBailian(type) ? BailianGatewayUrl : QwenGatewayUrl; }
+        internal static string AliyunInfoUrl(string type) { return IsBailian(type) ? BailianInfoUrl : QwenInfoUrl; }
+        internal static string AliyunConsoleSite(string type) { return IsBailian(type) ? BailianConsoleSite : QwenConsoleSite; }
+
+        // 控制台数据网关会挑自定义 UA 的毛病（报 PostonlyOrTokenError），必须用浏览器 UA
+        internal const string ConsoleUserAgent =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
+
+        // 粘贴痕迹清理：DevTools 整行复制会带 "Cookie: " 前缀，X11/终端粘贴还可能夹换行；
+        // 换行留在头里会让请求直接失败，所以在入口统一抹掉
+        internal static string ConsoleCookie(string raw)
+        {
+            string s = (raw ?? "").Trim();
+            if (s.StartsWith("Cookie:", StringComparison.OrdinalIgnoreCase)) s = s.Substring(7).Trim();
+            return s.Replace("\r", "").Replace("\n", "");
+        }
+
+        // 阿里云控制台的登录态是 passport 的 login_aliyunid* 系列 Cookie（HttpOnly，域为 .aliyun.com /
+        // .qianwenai.com）。这里只做结构预检，真正是否还有效由网关返回决定
+        internal static bool IsAliyunCookie(string cookie)
+        {
+            if (string.IsNullOrEmpty(cookie)) return false;
+            return cookie.IndexOf("login_aliyunid", StringComparison.OrdinalIgnoreCase) >= 0
+                || cookie.IndexOf("aliyun_site", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        internal static string AliyunExpiredMessage(string type)
+        {
+            return AliyunBrand(type) + " 登录已过期，请重新点击「自动获取」获取 Cookie";
+        }
+
+        // 网关失败文案：errorCode 是机器可读的分类，errorMsg 往往只是重复它，
+        // 所以把两者拼在一起，避免只看到 "Bad Request" 不知道问题在哪
+        private static string AliyunFailText(string errorCode, string errorMsg)
+        {
+            bool login = errorCode.IndexOf("NotLogined", StringComparison.OrdinalIgnoreCase) >= 0
+                || errorCode.IndexOf("NotAuthorised", StringComparison.OrdinalIgnoreCase) >= 0
+                || errorCode.IndexOf("ConsoleNeedLogin", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (login) return null;   // 交给调用方按站点拼「登录已过期」
+            string detail = string.IsNullOrWhiteSpace(errorMsg) || errorMsg == errorCode ? "" : "：" + errorMsg;
+            return "控制台返回失败（" + errorCode + "）" + detail;
+        }
+
+        // 网关信封只做两层判断：登录态错误 / 其它业务错误。成功时把业务数据体交给调用方按字段定位
+        private static Dictionary<string, object> AliyunEnvelope(string json, string type, string what)
+        {
+            var ser = new JavaScriptSerializer();
+            Dictionary<string, object> root = null;
+            try { root = ser.Deserialize<Dictionary<string, object>>(json); }
+            catch { }
+            if (root == null)
+                throw new Exception(AliyunBrand(type) + " " + what + "接口返回无法解析的响应" +
+                    (string.IsNullOrEmpty(json) ? "" : "：" + json.Substring(0, Math.Min(120, json.Length))));
+
+            var data = root.ContainsKey("data") ? J.Dict(root["data"]) : null;
+            string errorCode = data == null ? "" : J.S(data, "errorCode");
+            if (string.IsNullOrEmpty(errorCode)) errorCode = J.S(root, "errorCode");
+            string errorMsg = data == null ? "" : J.S(data, "errorMsg");
+            if (string.IsNullOrEmpty(errorMsg)) errorMsg = J.S(root, "errorMsg");
+            if (!string.IsNullOrEmpty(errorCode))
+            {
+                string text = AliyunFailText(errorCode, errorMsg);
+                if (text == null) throw new Exception(AliyunExpiredMessage(type));
+                throw new Exception(text);
+            }
+
+            string code = J.S(root, "code");
+            object okObj;
+            bool successResponse = root.TryGetValue("successResponse", out okObj) && okObj is bool && (bool)okObj;
+            if (code != "" && code != "200" && !successResponse)
+            {
+                string msg = J.S(root, "message");
+                if (string.IsNullOrEmpty(msg)) msg = J.S(root, "msg");
+                throw new Exception("控制台返回失败（" + code + "）" + (string.IsNullOrEmpty(msg) ? "" : "：" + msg));
+            }
+            if (data != null)
+            {
+                object flag;
+                if (data.TryGetValue("success", out flag) && flag is bool && !(bool)flag)
+                {
+                    string msg = J.S(data, "message");
+                    if (string.IsNullOrEmpty(msg)) msg = J.S(data, "errorMsg");
+                    throw new Exception("控制台返回失败" + (string.IsNullOrEmpty(msg) ? "" : "：" + msg));
+                }
+            }
+            return root;
+        }
+
+        internal static Dictionary<string, object> AliyunData(string json, string type, string what, string[] markers)
+        {
+            var root = AliyunEnvelope(json, type, what);
+            var found = J.FindFirstWithAny(root, markers);
+            if (found == null)
+                throw new Exception(AliyunBrand(type) + " " + what + "接口返回里没有预期字段（接口可能改版）");
+            return found;
+        }
+
+        // 档位额度与订阅信息只用来补"分母"和套餐名，拿不到也要照常报官方比例，所以单独容忍失败
+        private static Dictionary<string, object> AliyunOptionalData(string json, string type, string what, string[] markers)
+        {
+            if (string.IsNullOrEmpty(json)) return null;
+            try { return AliyunData(json, type, what, markers); }
+            catch { return null; }
+        }
+
+        private static readonly string[] AliyunUsageMarkers =
+            { "per1MonthPercentage", "per1WeekPercentage", "per5HourPercentage" };
+        private static readonly string[] AliyunQuotaMarkers =
+            { "addon_quota", "lite", "standard", "pro", "essential" };
+        private static readonly string[] AliyunSubscriptionMarkers =
+            { "specCode", "SpecCode", "remainingDays", "endTime" };
+
+        // sec_token 是网关的 CSRF 令牌：登录后由 /tool/user/info.json 下发，不需要用户手抄
+        internal static string AliyunSecToken(string type, string cookie)
+        {
+            try
+            {
+                var headers = new Dictionary<string, string>();
+                headers["Cookie"] = cookie;
+                headers["Origin"] = AliyunConsoleOrigin(type);
+                headers["Referer"] = AliyunConsoleUrl(type);
+                string body = HttpGet(AliyunInfoUrl(type), null, ConsoleUserAgent, headers);
+                var root = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(body);
+                if (root == null) return null;
+                var data = root.ContainsKey("data") ? J.Dict(root["data"]) : null;
+                string token = data == null ? "" : J.S(data, "secToken");
+                if (string.IsNullOrEmpty(token)) token = J.S(root, "secToken");
+                return string.IsNullOrEmpty(token) ? null : token;
+            }
+            catch { return null; }   // 拿不到就退回"只用 Cookie"，网关仍可能接受
+        }
+
+        internal static string AliyunGatewayRequest(string type, string cookie, string secToken, string apiName,
+            CancellationToken cancellation = default(CancellationToken))
+        {
+            string apiPath = AliyunApiPrefix + "/" + apiName;
+            var cornerstone = new Dictionary<string, object>
+            {
+                { "feTraceId", Guid.NewGuid().ToString() },
+                { "feURL", AliyunConsoleUrl(type) },
+                { "protocol", "V2" },
+                { "console", "ONE_CONSOLE" },
+                { "productCode", "p_efm" },
+                { "switchUserType", 3 },
+                { "domain", AliyunConsoleOrigin(type).Replace("https://", "").Replace("http://", "") },
+                { "consoleSite", AliyunConsoleSite(type) },
+                { "userNickName", "" },
+                { "userPrincipalName", "" },
+                { "xsp_lang", "zh-CN" }
+            };
+            // 匿名设备号：控制台前端会把它一并带上，缺了可能被风控当成脚本
+            string anonymous = CookieValue(cookie, "cna");
+            if (!string.IsNullOrEmpty(anonymous)) cornerstone["X-Anonymous-Id"] = anonymous;
+
+            var parameters = new Dictionary<string, object>
+            {
+                { "Api", apiPath },
+                { "V", "1.0" },
+                { "Data", new Dictionary<string, object> { { "cornerstoneParam", cornerstone } } }
+            };
+            string paramsJson = new JavaScriptSerializer().Serialize(parameters);
+
+            var form = new StringBuilder();
+            form.Append("product=").Append(Uri.EscapeDataString(AliyunGatewayProduct));
+            form.Append("&action=").Append(Uri.EscapeDataString(AliyunGatewayAction));
+            form.Append("&region=").Append(Uri.EscapeDataString(AliyunRegion));
+            form.Append("&language=zh-CN");
+            form.Append("&params=").Append(Uri.EscapeDataString(paramsJson));
+            if (!string.IsNullOrEmpty(secToken)) form.Append("&sec_token=").Append(Uri.EscapeDataString(secToken));
+
+            string url = AliyunGatewayUrl(type)
+                + "?action=" + AliyunGatewayAction
+                + "&product=" + AliyunGatewayProduct
+                + "&api=" + Uri.EscapeDataString(apiPath)
+                + "&_v=undefined";
+            var headers = new Dictionary<string, string>();
+            headers["Cookie"] = cookie;
+            headers["Origin"] = AliyunConsoleOrigin(type);
+            headers["Referer"] = AliyunConsoleUrl(type);
+            return HttpPostForm(url, ConsoleUserAgent, headers, form.ToString(), 15000, cancellation);
+        }
+
+        private static string AliyunOptionalRequest(string type, string cookie, string secToken, string apiName)
+        {
+            try { return AliyunGatewayRequest(type, cookie, secToken, apiName); }
+            catch { return null; }
+        }
+
+        // 从 Cookie 串里取单个键（cna 等）；找不到返回 ""
+        internal static string CookieValue(string cookie, string name)
+        {
+            if (string.IsNullOrEmpty(cookie)) return "";
+            foreach (var part in cookie.Split(';'))
+            {
+                int eq = part.IndexOf('=');
+                if (eq <= 0) continue;
+                if (part.Substring(0, eq).Trim() != name) continue;
+                return part.Substring(eq + 1).Trim();
+            }
+            return "";
+        }
+
+        // 接口给的是「已用」比例，且是 0–1 的小数（0.1186 = 11.86%）；>1.5 视为已经是百分数，
+        // 不做 0–100 的启发式猜测（两家语义不同，猜错就是把额度显示反）
+        private static double? AliyunRatio(Dictionary<string, object> usage, string key)
+        {
+            if (usage == null || !J.HasKey(usage, key)) return null;
+            double v = J.D(usage, key);
+            if (double.IsNaN(v) || double.IsInfinity(v)) return null;
+            double ratio = v > 1.5 ? v / 100.0 : v;
+            return Math.Max(0, Math.Min(1, ratio));
+        }
+
+        private static void AddAliyunWindow(List<QuotaPool> pools, Dictionary<string, object> usage,
+            Dictionary<string, object> quota, string ratioKey, string resetKey, string[] totalKeys,
+            string label)
+        {
+            double? ratio = AliyunRatio(usage, ratioKey);
+            if (!ratio.HasValue) return;   // 这个账期没有读数就不是一条计量
+            double total = 0;
+            if (quota != null)
+                foreach (var k in totalKeys)
+                    if (J.D(quota, k) > 0) { total = J.D(quota, k); break; }
+            int usedPct = (int)Math.Round(ratio.Value * 100);
+            var pool = new QuotaPool
+            {
+                Label = label,
+                Percent = Math.Max(0, Math.Min(100, usedPct))
+            };
+            if (total > 0)
+            {
+                pool.Total = total;
+                pool.Used = total * ratio.Value;
+                pool.Remaining = Math.Max(0, total - total * ratio.Value);
+            }
+            else
+            {
+                // 只有官方比例、没有分母：只报比例，不派生绝对余量
+                pool.PercentOnly = true;
+                pool.Total = 100;
+                pool.Used = usedPct;
+                pool.Remaining = Math.Max(0, 100 - usedPct);
+            }
+            if (usage != null && J.HasKey(usage, resetKey))
+            {
+                var reset = ParseTimeFlexible(usage[resetKey]);
+                if (reset.HasValue) pool.ResetLocal = reset;
+            }
+            pools.Add(pool);
+        }
+
+        internal static List<QuotaPool> ParseAliyunPlan(string usageJson, string quotaJson, string subscriptionJson,
+            string type = "qwen")
+        {
+            // 两家的字段完全一致，type 只影响失败文案里的品牌名。
+            // 信封错误（登录失效 / 网关业务失败）必须先抛，不能被"没开通"吞掉；
+            // 但"字段里没有 per1* 读数"是正常情况（没订阅），所以这里不做 markers 强制校验
+            var root = AliyunEnvelope(usageJson, type, "Token Plan");
+            var usage = J.FindFirstWithAny(root, AliyunUsageMarkers);
+            var quotaRoot = AliyunOptionalData(quotaJson, type, "档位额度", AliyunQuotaMarkers);
+            var subscription = AliyunOptionalData(subscriptionJson, type, "订阅", AliyunSubscriptionMarkers);
+
+            string specCode = subscription == null ? "" : J.S(subscription, "specCode");
+            if (string.IsNullOrEmpty(specCode) && subscription != null) specCode = J.S(subscription, "SpecCode");
+            var quota = quotaRoot;
+            if (quotaRoot != null)
+            {
+                var specQuota = string.IsNullOrEmpty(specCode)
+                    ? null
+                    : J.Dict(quotaRoot.ContainsKey(specCode) ? quotaRoot[specCode] : null);
+                if (specQuota == null && string.IsNullOrEmpty(specCode))
+                {
+                    // 订阅接口没回 specCode：档位表里恰好只有一个可识别档位时才取它。
+                    // 两个以上绝不猜——猜错就是把别的档位的额度当成你的
+                    string only = null;
+                    int count = 0;
+                    foreach (var key in new[] { "lite", "standard", "pro", "essential" })
+                    {
+                        if (J.Dict(quotaRoot.ContainsKey(key) ? quotaRoot[key] : null) == null) continue;
+                        count++;
+                        only = key;
+                    }
+                    if (count == 1) specQuota = J.Dict(quotaRoot[only]);
+                }
+                if (specQuota != null) quota = specQuota;
+            }
+
+            var pools = new List<QuotaPool>();
+            // 顺序即主次：当前账期必须排最前，否则悬浮窗报一个窗口、详情报另一个
+            AddAliyunWindow(pools, usage, quota, "per1MonthPercentage", "per1MonthResetTime",
+                new[] { "monthly" }, "本月额度");
+            AddAliyunWindow(pools, usage, quota, "per1WeekPercentage", "per1WeekResetTime",
+                new[] { "weekly" }, "7 天额度");
+            AddAliyunWindow(pools, usage, quota, "per5HourPercentage", "per5HourResetTime",
+                new[] { "fiveHour", "five_hour" }, "5 小时额度");
+            if (pools.Count == 0)
+                throw new Exception("该账号未开通 Token Plan");
+
+            // 档位只作为备注挂到主计量上，不当成第二个窗口（配置值不是额度）
+            if (!string.IsNullOrEmpty(specCode)) pools[0].Note = specCode;
+            return pools;
+        }
+
+        internal static ProviderStatus FetchAliyunConsole(ProviderConfig p)
+        {
+            string type = p.Type;
+            string brand = AliyunBrand(type);
+            string cookie = ConsoleCookie(RequireKey(p));
+            if (!IsAliyunCookie(cookie))
+                throw new Exception(brand + " 需要控制台登录 Cookie（含 login_aliyunid），请点击「自动获取」");
+            string secToken = AliyunSecToken(type, cookie);
+            string usage;
+            try { usage = AliyunGatewayRequest(type, cookie, secToken, "usage"); }
+            catch (HttpException he)
+            {
+                if (he.StatusCode >= 300 && he.StatusCode < 400) throw new Exception(AliyunExpiredMessage(type));
+                throw;
+            }
+            string quota = AliyunOptionalRequest(type, cookie, secToken, "quota-config");
+            string subscription = AliyunOptionalRequest(type, cookie, secToken, "subscription");
+            return AliyunStatus(p, ParseAliyunPlan(usage, quota, subscription, type));
+        }
+
+        internal static ProviderStatus AliyunStatus(ProviderConfig p, List<QuotaPool> pools)
+        {
+            var st = new ProviderStatus { Name = p.Name, Type = p.Type, Region = p.Region, ShowName = p.ShowName, UpdatedAt = DateTime.Now };
+            st.Pools.AddRange(pools);
+            st.Primary5h = pools.Count > 0 ? pools[0] : null;
             return st;
         }
 
@@ -2047,9 +2928,8 @@ namespace QuotaWidget
             return 96;
         }
 
-        // 悬浮窗 / 明细面板配色。对比度与设置页（contrast-proposal 方案 A）同方向：
-        // 边框 / 分割线提到可见强度，浅色明细面板提纯白与悬浮窗底拉开，深色反向加深底层。
-        public static Color Bg { get { return Theme == 1 ? Color.FromArgb(20, 20, 25) : Color.FromArgb(237, 238, 242); } }
+        // 悬浮窗背景与详情面板共用主题色，其余颜色由各自的调色板管理。
+        public static Color Bg { get { return SettingsPal.For(Theme == 1).Win; } }
         public static Color Card { get { return Theme == 1 ? Color.FromArgb(20, 20, 25) : Color.FromArgb(255, 255, 255); } }
         public static Color Text { get { return Theme == 1 ? Color.FromArgb(232, 234, 240) : Color.FromArgb(51, 65, 85); } }
         public static Color Dim { get { return Theme == 1 ? Color.FromArgb(158, 166, 186) : Color.FromArgb(100, 116, 139); } }
@@ -2067,6 +2947,9 @@ namespace QuotaWidget
             if (type == "ds") return t == 1 ? Color.FromArgb(96, 165, 250) : Color.FromArgb(24, 119, 242);
             if (type == "claude") return t == 1 ? Color.FromArgb(232, 149, 111) : Color.FromArgb(201, 100, 66);   // Claude 珊瑚色
             if (type == "codex") return t == 1 ? Color.FromArgb(52, 211, 153) : Color.FromArgb(16, 163, 127);    // OpenAI 绿
+            if (type == "mimo") return t == 1 ? Color.FromArgb(251, 146, 60) : Color.FromArgb(234, 88, 12);     // 小米橙
+            if (type == "qwen") return t == 1 ? Color.FromArgb(192, 132, 252) : Color.FromArgb(124, 58, 237);   // 千问紫
+            if (type == "bailian") return t == 1 ? Color.FromArgb(45, 212, 191) : Color.FromArgb(13, 148, 136); // 百炼青
             return t == 1 ? Color.FromArgb(129, 140, 248) : Color.FromArgb(92, 105, 224);
         }
         public static Color GlmAccent { get { return Acc("glm", Theme); } }
@@ -2200,7 +3083,8 @@ namespace QuotaWidget
 
         public static string FmtNum(double n)
         {
-            return n.ToString("#,0", CultureInfo.InvariantCulture);
+            // 最多两位小数：MiMo 套餐按亿折算后会出现 10.25 这类值，整数额度（GLM/Kimi 计数）显示不变
+            return n.ToString("#,0.##", CultureInfo.InvariantCulture);
         }
 
         // 金额格式化：保留两位小数 + 千分位
@@ -2257,8 +3141,13 @@ namespace QuotaWidget
 
         public static void DrawBar(Graphics g, Rectangle r, int pct, Color fill)
         {
+            DrawBar(g, r, pct, fill, BarBg);
+        }
+
+        public static void DrawBar(Graphics g, Rectangle r, int pct, Color fill, Color background)
+        {
             pct = Math.Max(0, Math.Min(100, pct));
-            using (var bgBrush = new SolidBrush(BarBg))
+            using (var bgBrush = new SolidBrush(background))
             using (var fgBrush = new SolidBrush(fill))
             {
                 using (var bgPath = RoundRect(r, r.Height / 2)) g.FillPath(bgBrush, bgPath);
@@ -2416,13 +3305,13 @@ namespace QuotaWidget
     }
 
     // ============================= 品牌图标 =============================
-    // 内嵌 64px 透明底 PNG（LobeHub Icons 官方 SVG 经 Edge 无头渲染转换；
-    // GLM 换用官方 zai.svg 的 Z.ai 标志，currentColor 单色造型，24 网格矢量转 64px）。
+    // 内嵌透明底 PNG（既有图标为 64px；千问 / 百炼从官网页头 SVG 提取图形，以 128px 内嵌）。
+    // 千问 / 百炼矢量原件、黑白变体及来源见 assets/brands/；运行时仍为单文件、零依赖。
     // 样式随主题自动切换：浅色用品牌彩色源（Codex、GLM/Z.ai 等无彩单色源随主题染色），
-    // 深色统一白色——有深色彩变体的用变体（Kimi 白 K+蓝点），其余单色源染白。
+    // 深色优先用专用变体（Kimi 白 K+蓝点、百炼灰白分面），其余单色源染白。
     internal static class BrandIcons
     {
-        class Def { public string Mono, Color, ColorDark; }   // ColorDark：彩色版深色变体（可选，如 Kimi 白 K）
+        class Def { public string Mono, Color, ColorDark; }   // ColorDark：保留明暗/配色的深色变体
         static readonly Dictionary<string, Def> _defs = new Dictionary<string, Def>
         {
             { "glm",    new Def { Mono = IC_ZAI } },
@@ -2431,6 +3320,9 @@ namespace QuotaWidget
             { "ds",     new Def { Mono = IC_DEEPSEEK, Color = IC_DEEPSEEK_COLOR } },
             { "claude", new Def { Mono = IC_CLAUDE,   Color = IC_CLAUDE_COLOR } },
             { "codex",  new Def { Mono = IC_CODEX } },
+            { "mimo",   new Def { Mono = IC_MIMO } },
+            { "qwen",   new Def { Mono = IC_QWEN, Color = IC_QWEN_COLOR } },
+            { "bailian",new Def { Mono = IC_BAILIAN, Color = IC_BAILIAN_COLOR, ColorDark = IC_BAILIAN_DARK } },
         };
         static readonly Dictionary<string, Bitmap> _cache = new Dictionary<string, Bitmap>();
 
@@ -2463,12 +3355,15 @@ namespace QuotaWidget
             var img = Get(type, dark) as Bitmap;
             if (img == null) return;
             if (type == "custom") { g.DrawImage(img, x, y, size, size); return; }
-            Def d = _defs[type];
-            bool usedColor = dark ? !string.IsNullOrEmpty(d.ColorDark) : !string.IsNullOrEmpty(d.Color);
-            if (usedColor)
+            Def d;
+            if (_defs.TryGetValue(type, out d))
             {
-                g.DrawImage(img, x, y, size, size);   // 品牌彩源原样（含渐变/多色）
-                return;
+                bool usedColor = dark ? !string.IsNullOrEmpty(d.ColorDark) : !string.IsNullOrEmpty(d.Color);
+                if (usedColor)
+                {
+                    g.DrawImage(img, x, y, size, size);   // 品牌彩源原样（含渐变/多色）
+                    return;
+                }
             }
             // 单色源随主题染色：深色白、浅色近黑（近黑近白，边缘更柔和）
             var c = Color.FromArgb((int)(0xFF000000u | (uint)(dark ? 0xF2F2F4 : 0x18181B)));
@@ -2479,6 +3374,415 @@ namespace QuotaWidget
                 g.DrawImage(img, new Rectangle(x, y, size, size), 0, 0, img.Width, img.Height, GraphicsUnit.Pixel, attrs);
             }
         }
+
+        // qwen: official wordmark symbol; SVG sources and attribution in assets/brands/.
+        const string IC_QWEN =
+            "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAQAElEQVR4AeydBawGORHHH3DoocEJ7u5w6MGhB8HdXYJLCO4uwTVw" +
+            "uLsHDnc5IEEvuLu7JNj/d/eat2+/drftN+3ufl9fZl53u+102p2tzEz7HXOn/W11CzQB2OrXv7PTBKAJwJa3wJZXv/UATQC2vAW2" +
+            "vPqb1gOcRe/zFsJ7Cy8hbDDSApsiAGdTPT8s/L7wtcJnC48Q/kh4PWGDXgu426ULwPFUkScIjxReSdiHMyri7cL3C88sbNBrgSUL" +
+            "wCGqy3eEDxUeRzgEV9fDHwgfIWzQaYGlCsDNVIePCE8vTIHHKvGrhQ12W2CJAkC3f9gu/znBrZTpGsIGaoElCgBj/YHifR241jqZ" +
+            "NynvEgXg1AYvgOWiAZnlk1iiAFjwfKzlvzqbGlg0pg0njUqVFugX0gSg3yJbdt8EYMteeL+6TQD6LbJl900AtuyF96vbBKDfIlt2" +
+            "v0QB+I/BO/qfAQ1rEoeK4JOE7xY+UYj9QkFZWKIAWKzhj1G2WZOoX0ypvyh8n/DBQrSUD1GIBfPTCs8rLAZLFIBijVGZ8KlU3iuF" +
+            "XxAiBApW4DKK+YrwGcITCrMhlHGJAvDfUGUS4qceAjBhY56+jXge640OUJr7CTF9IxC6tIMlCoBd7etTuq6K/J4QJ5YTKEyB0ygx" +
+            "Xk+XVmgGSxSA2l/vudXaDxS+Tfgi4e2EJxamwHmU+APCdwjPKswFTOHMD3Lzr+RbogDUmgTykp+rFvu68CnC6wvvKny58FtC/AoU" +
+            "DMJJ9PRZwq8Kryq0ANPVwRIFwKIRx2jcVgkYc++p0CdwdMd4FoVm6bQrwvJd5b+PkHFcgQng/nYiE0oiAqMKFgUlJ4EnV0swzr5C" +
+            "IbN0BYPApOwbSvFwoYODdfFlIcPFKRSWALNhcIkCYFb53puhy/+U4vA4UpAEj1Nqhos3Kvy48ALCRcCSBABN2QfVqi8UloBbiygT" +
+            "PgVZwHBxk6ycBTONkV6CAFxKleDLRFN2FV0zE1ZgDlc0p1iOoFkvOGcBOKfa763CzwovK7QEn/LlZJYFFKT1D9H+m9AE5ioAzMJZ" +
+            "at3ApJarRMy+oFXSxWMwFpkVMkcBuKZqxyxcQYNeC6A+Ri3ci86/naMA3Cu/Ohud8xeq3dWEPxeawRwF4MJmtQsT8s0BwqmnffJP" +
+            "FY/t4BwKUSwpsIM5CkARs6ddk1WlhF6BF4+iyWzi163BHAWgy9+2Xn9JFWf5yybYn+o6GWIz5AoAa/EHqZCPCv8sxGnheQqRVgVr" +
+            "gYWqd4yBua4CfinGWQFdXOHnhcUhRwA4ceOb4uzJQpQnGCYuqOt7CNGLP1MhcQqyIIen1ILmNgdgbc/WdU46eVVqZdZJn9LY2LEP" +
+            "V2GcuHEmhT44tiLvK+SoljsrzAELp8+xcufUAzDOo/R6lJj+u7AqxAoAtvCviTOWIQpGASvYi5UKO/jlFKbAb1MSLzgtjqBVxvmh" +
+            "NooRgMuLAN4wqS5MyraDVeyTukDKY0/zwHNGWTYWfqaa4UzCKWZVxnmVF4QYAWBsDxKIfICV7CdKyzg3JkgseZhLKPlGAeP8o1Wj" +
+            "sws5yUzB9BAjABc1ZJNDmnCKvPkAzd/r2UFCXKYVbATgPcQE7zGqDYodBfOAGAE4rjGruFO9TjSx8l1EoQ9QeuB8Waqb9E0CfXE+" +
+            "3lLiPqfE1AH3b1S5ui0LqdRjBCAmTWq5pGcChMLjpboJuV+5iRKnfzKEKKkJ/NpD5TeeuNyoHysjvRwu3NRBt/OEmJdbUjHDevwO" +
+            "ahocMO+vMASv1wO3VGIs1e1a8B5Pbpa4nuikKHhjmDuXcr1BGAIE/kKhhzXjYwSgBj/44z1dBaE/uLZCHzB2MolkLF1HWULeN3sK" +
+            "YM6BjsPzKCoKuvD2eKWGVwUrgIaPPX+/0hMcR9H8mZp3RTcJYgSghmLGMc3pXe/SDUvBkFqZsdSpSz+jtLHAS2GFQd5QHhxQUMiQ" +
+            "NpSmH4+7Gi8WuvDWf879afUPAWMfYNevnxPP2PfH8HZ7pakOMQLAurU2Y2yi+LYKfY7wpEIfMH/AVYyxlgb0pXFxKKUQLsyqLi4U" +
+            "0sug9XxZKMFuPAdR31jX6EngRZcrwJKXpR8rHyaCKwl2I9CRUB42FdTru9HlgxgBYAlTnhN/CTiHMCywycKfYmeHsdbND/7aS/QW" +
+            "3bPuJj/drW6jgC/5jkrJWN4fFv6ieHoSDp+Gvm69gJcxL54e5fjeFKuR2FQwsLGZZPVpgZgYAeDrYTtUgeKjSOKsySYLVNGhr4Mu" +
+            "my+XL+mWokoDIhR8obwERWUBvRDDAu7i0KS3OZ0oDfUkzPzp6pkTsORV8mRgOxmbTpIzpmaIEQBoMlNn4wPXU+H5VTBfB2rlkDHq" +
+            "T0qDjoGhg5WFbk0AB1Vo0tv0exlXAMKHho95CXMCF58b3jQlY27aWAGAPr/CgW6fU7q5nwpRK/9QhbMbhzFWl5MCPND7MA9BX2HF" +
+            "DDuKrWgF6aQIAETYKXtlXXCMCd2jLicDxmG+crr5qZhguMFPj7W/NQ8IljXNFXqpAuAIvFcXTJCYpP1B11MB4/GbVDg/EaOgKjxf" +
+            "pb1GyBJPwTIhVwBcbXEDY8nEpMXFTREyPPE11ir7Tiro7sLFw7oCQAP8Uf/QZqEF6y+Z9Kga4EBZqzDLsb4Wz95yLATAEWa9zpKJ" +
+            "pRqeQC6+VsgEtVZZIS2lZfn/tiQWomUpAK4M9sdj6GDpiELFxZcO8UcsXYajX6LdHG0Xoml018XCkhVBeYQWjiVSsQpsMGGMRqPV" +
+            "WzdBSQGAN7xcUYUO6cFJ13C1BfCTKK7rKC0ArlrtV7pcS8SH2A/QdaBnwNIYnzMhZS0BQE2awFZW0ppm65ploWdguzyWwitktcxA" +
+            "ploC4DtqbYCtrEeoh7MyZmSawkSOpfBj4vWdQpbcCtaHWgKwPqfjFPhKxlPZpJjSRH4dVYFhAUeSkK+EksRBLQHA9y+Oo7xUT1M2" +
+            "HCoUVIEXqBTM5AomA5Rv6F44nSybiVoCUMLlmkrj5IGNnrN8ua+JOJmwwwceapbbLQtfCcz0mKvpGbrPoq5rCQDeslEMJSRikwVj" +
+            "ITb6hGymSbH/w8OQg4hpgY5YL8T5hbkBvpTn6z0bvK0lAJhtBxlJeIinzRmUHl879Ay6nBTggeUaLmJYJqdkBl9KTPZYKjnDYZSX" +
+            "WgKA1XDdXoCdROyyYU0cOjWD07kx1GAd5KsYbYDIBJi+oYnBKXSEDapbvHg4apaXEEm6SDIslR8S5VGfgloCwGZPDEXiKRlYcvFS" +
+            "8ZEL7bJB2h8pyggG3TL+AYyL+P+vIwjk5bBKDsSAJhtUOKWLsihTRa4AbmsYpthUO6WvBB7TzFNWGOxG1BIAykS3zddBY3I/hvQY" +
+            "eNpgT6DhQ+nxA8A7iTlB/+u8kTIhCDiVnlLXsYC/PrN88vYFl9NPKIsyKTtEk5UC8wO641Ca0vGcuThYRk0BgBG+DnzdsBTytRLn" +
+            "Q8Z5Gm9slw3n9eOVw5zAR8fF8SWgKIr5tQ3Gc9KOnXBCmZTNxpDQjz7RA7BMo84cdO34qRWyF2KwrNoC4JjBUohN/QGK6G7UxNUM" +
+            "j1rG+ZApGdUoAoLrNcOCSEQB4yG/xzekxMHjGANMqHv3FURXy9DEzh9486Wh1+N0Fc5X4rRPX5oScaMm8qkEgMriy89+QLpbDock" +
+            "xNk0tMuGl4JlET9/Nl1AIwdZu/uMUzcUMTyOFWQBFk94G5ofsFTDhY4T1lg9ZBVkmWlKAejWA0NHtyfoPuOasZalJEs/rGTErYMI" +
+            "Wj9/aFNqP93QPbzFzA+eKiIMccnaS+UzhbkIQKhSnCFwhB4y1lpaFPkKRXYfhLrvfYkib2LmB2gQ2X7GkMcSN5K0bbK5CgAvmx0+" +
+            "NAxrf9ta7+zUqrebHzDnYQ7iqwdDHnMZhhCEwpcmN46V1GDeWg0xyETnIY3EJIxdNuj4O48WfclxN5yWxhIyVBEmpwwLli50R4YK" +
+            "c/FzEgBm/kyiWIY5/kqFx/AQ9sV5kmVHcdgWq54hAkwMmehaqZWxkg6VV60rHGKC7o9lFPb83N20Q/R9z3zWSV+cL+86cb7Jp4+e" +
+            "UysfooejX7HS9IGuH+sgQ2j/2b77KXsAxnk0fChzQoqUfcxuwI1v8jlULTyAsO7dTYlQKikYBX5ci53UUT8tM4UAHKgqoOFjWYdx" +
+            "RbfVwdfd12iLXNc4VNlo9diiHtowgvYSRRPqXxxFohq1RqW7jLDsQRP2MEWi2FEwG6gxBGRXVhk5+4BDKjA0cXSvoo4Cjutn3oC6" +
+            "GUXTUZGx/2oJAMshTsU6TIylGGWUvBr4eoVqhScUhFoZrSX8gpjAWTmgWU0gc3TS0gLASR44SWAwYbvY0aW2/7NpgVICwDiP4QVz" +
+            "6pQHOMymoXcZYSf17uU8ghICcLCqxnoe06v1OcMibQK+8b7kiaiO6dFlmUtYK7QWALaGszsYy16tOiylHJZxOLjMil9rAcBaN6sK" +
+            "Bphh8tR/ZN0WXfpM0A5VBF5ECuYDlpWmUZntz6d28+CEwyRRzGDVnAdHHS4sBQB/vAM6tOd8SXfc5896DsBQeEkVwiSYOZEu06F0" +
+            "DksBKM2rJX1+yMGSnqNFV487NgdCMx/Cbc09m2W4RAHATwDdQm6DcuTsS3Izj+TDH5/NGezQGUk6j8dLEgA0ifwEHe5hqJRx205t" +
+            "RU45ZZkaOu41ld7i01sKgCWtbsPyUy53UQT2dCyHutzhBeLqjaWMs3mJG0I8bXAk5ZTTkDLGgn8mwkN8zO6ZRaVdpTBK+BQs7nlq" +
+            "iNWLAyjxkqHL9tHGVs7KA48bn1MpJ3mwo4etXfgVpvKw8ektBYAXhH+bRaMxkeLrZg885/OP0cQnn5eMUYTZN4ivAadq8FO2COcY" +
+            "DYtVAG0wVs6snlsKABVbd58+pmI8WZhIpSpN6NoxizL7BtlPSA8BXw0DLWAtAGz9YpLFjyIFivRG4wvHZgk8ZqI8WbxUNiiyVlWs" +
+            "BQC+8X5lVy3eK4zBxIWQLhNfQLxd2CwRSlcj3qIttnoS2H1JjLl4rzBzD6lAmS/g88+vZfkmcF167bpQC1hI/RBrHBp9kBJwcALK" +
+            "ESZnhOzBY0cMQqDHs4A2CSz4GtDcOfUoIQc3FCwui7TFx9CGgKymb5kmawELqZ+M+Vbw+i3QBGD9Nlw0hSYAM3t9tdlpAlC7xWdW" +
+            "XhOAmb2Q2uw0Adhr8TGt5V7K8JWFLiFMvcCTJgB7jfq7vcvsK3wXsjNPkbEJwF6ro6Hcu0u/wmz9ifRs0+ZoArDX/vgU4MK9F5N2" +
+            "xQknCEFarolTNwHY/wJw4canYH/s8B0nnvJbPlP+auowhwNPmwCsNg5eRZxPjAPp6tO9mH/pkoMuOPF07a5ftCaBJgD+ZmcjBw6k" +
+            "HDbNiWX9VIcrApc19vqxF0C3y4QmAMPvjaPicW7h4GhOAAU5uIl9fgjJcO4FPG0CMP6S+MI52YSNryAHN43nWkiKJgALeVGl2GwC" +
+            "UKplF0K3CcBCXlQpZT6vnAAAABZJREFUNpsAlGrZhdBtAjDxi5q6+P8DAAD//+frU9gAAAAGSURBVAMARkUxHzUZKeMAAAAASUVO" +
+            "RK5CYII=";
+
+        // bailian: official wordmark symbol; SVG sources and attribution in assets/brands/.
+        const string IC_BAILIAN =
+            "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAK00lEQVR4AeydB6wuRRXHP7uJxog9xooNsMdegoogalQUERVbQAHF" +
+            "hmIFa0RUVKyoICoWQEUsqBFQFAvYu1HBhljQiC1WbPj7vbzNe+++e+/3fbOzuzO75+Z/7pltM7Pn/L8tszNnLj6Lv0lbIAgwaffP" +
+            "ZkGAIMDELTDx048rQBBg4haY+OlP9Qpwbfy+C/KkjWLadSxOC1MiwK1x7RHIRch5yGnIGzaKade57TmsuwoyajQnNwUCbMPJHoqc" +
+            "hTwNmYeXsYP77ocePcZOgMfiwTORQ5DLIoviRux4FHIK4u0BNU6MlQA74a6PI8cg2yOp2JUDvT28Cb0tMjqMjQA66Ui8dDpyXyQX" +
+            "nkBG3haeiR4VxkKAi+GVZyBe7g9Ad4Grk+nhiETYHT0KjIEAD8YTOv6V6GsgXeNOFHASchxyS6Rq1EyA22D545EPIDoF1Sv2orQv" +
+            "IS9BLodUiRoJcCUs/VLEX/3D0UPCN4vnUYGvII9BisfKCtZGgMdxAjr+YPRlkFKwAxU5FvkochekGtRCgJ2x6CeQtyLbIaXiflTs" +
+            "C8hrkD6eRyimHUonwA04Pd/BP4m+N1ILDqSiX0X81oAqF6USwHr5zu3l3nfwci24ds2uxSa/NZyBfhFSJDR0aRXbgwr5ru07t+/e" +
+            "LFaNu1H7FyK/QR6EFIWSCHBbLHMCciJyB2RskMwf5KRsWr4xugiUQIArY4nDEC/3D0OPHX5cOpuTfBXiayRqOAxNgH05dS/3z0Vf" +
+            "GpkSDuJkL0AejXSOtQoYigD+CvzUejQVK+ZySF36hi2I76RQfwQ7ontH3wS4IWf4ZsT7oJ9aSQawgE3Zn0W/Bbku0hv6IsAlOKNn" +
+            "Id7nH48OrG6B/Vl9LuLtwS+cJLtFHwTYk1PwEvcK9NWQwHwL+ID4bXZ7CNIpuiTA7aj5e5H3IbdHAstZ4Obs/n5E+3X2WtwFAexR" +
+            "a8dKL/cP5QQC7SzgFdTPzp30d8hNAO9hXu7tWn2pducdR6+wgD2evsi6rN8XchFgbyp2KuJTrD1qSQY6sMD1yLP5vvAA0nMxb4cc" +
+            "BPA+9XYKuhcS6McCfl/4CEX5w0Oloy0B7Dvf+ZNq+umN/sgXtD3DNgTYh8InMXqG8ywV3hLu3qZyqQS4BYW+DQkMa4FzKN7+Bqg0" +
+            "pBLgUWnFxVGZLWCH1FZZphDA17sgQCuztz7Y7wa7kYt9J1DpSCGAzbl2bkgvNY5MtYDfCZ7Mwd73T0a3RgoBrtq61MhgWQv8jwP8" +
+            "PnBn9BuRuVh0hxQCXHHRzGO/LBawnUXH20n2/Cw5bpZJCgE2OzySHVrA9n+/A/g95ctdlRME6Mqy6fn6K/fXbieR1g9586oRBJhn" +
+            "oX63287vp1/v972UHAToxcxzC7Fd3/b9p7DnL5DeEATozdSrFvQt1tor+IHozyG9IwjQu8k3FPgH/tuKZ+i6d5MeDEGA/k1vV3hH" +
+            "QRnjIHvpy2YYBFjWYun722Hmnhxur6mfoYtAEKB7N/yAIoxX6PD2T5MuCkGA7tzxd7I2fpCfzu0xxWJ5CAJ045N3ka0RxOyx8x/S" +
+            "xSIIkNc1ds6wb6QBo36cN+tucgsC5LHrT8nGh7t7oA1ng6oDQYB2fvovh78cMUqYr3ck60IQIN1fDtm6GYcb2+BC9KBILTwIsLzl" +
+            "HJ1jIGqjmfxw+cPLOiIIsLg/fs2uT0TsnGHMQpL1IwiwmA8dmGkkE2MWLnZEJXsFAdZ3lIGoHaZtcIu/rb9rnVuDAKv77eusvj/i" +
+            "sLfvoUeLIMCWrv09i3bK8Gvdx0iPHkGATS42wLOxie2WtWntyFNBgNnsw7PZ7Faz2ezpyJ+RqtC2skGAthas/PggwGxmfzz75r16" +
+            "NptdHpkUggCb3O0twJ46WWPwbMo+e8rxgYahd+RQ8mDdIMCWfjHCmQ+BzgFkc++WW8tY8g3lPVTlM4hh6H1Vtf+BZGDVcggCrG4v" +
+            "Yxw686hxDn0zWH2vftc6KNcWSb9FPGKVoiWDEUNW2bT2qiDA2rZxi+Py7Nhh3EOXhxInvf4ahRsq7pLotRAEWMsyLdcb9/BX5OGs" +
+            "ZajeIAH9xR9BiddBsiOuAIub9Jrs6qxln0d3PTWc7RLOLuIt6I6UtxVyrQgCLG/Ju3KIU8P54LUN6ZxwBhEDQHyTTHuZXygIgKUT" +
+            "4atXM8QrMYstDvP+7sBQ+xxssaHLhSBAe+va99/2g90Ts3KySUPD+4Tva2hiNmmHBQHS7LbyKJ++T2Ll6ch2yCJw9hR7FjndrINH" +
+            "Fjkm+z5BgLwm3YnsHApmYxLJNfFatvwIcbgYajgEAbqxvc3J/yLrlbOeOl3OX1n/VKQIBAG6c4MBNe1DaI8i2+2/S1FOmOVMYSTL" +
+            "QBCgez/clCJst3cMAcl2yH10ECC3RSvLLwhQmcNyVzcIkNuileUXBKjMYbmrGwTIbdHK8gsCVOaw3NUNAuS2aGX5BQEqcVhX1Uwh" +
+            "gJ9Au6pP5NvOAkv7JoUAv2tXxzi6Qwss7ZsUAlzACfwWCZRlAX2ib5aqVQoB/k0JgwY4pvzA1hbQJ/pm6y3rrEkhgNlZmDqkHAsk" +
+            "+SSVAN/hvIfuK08VAhst8GK0PkEth1QCWMrB/PsUEhjWAo5gShoWZrXbEMDjd+HfAUigIwvMyfbZbLdTKSoNbQlgqfZy6aUPu4WF" +
+            "bLDA9/m/F3I40go5CGAFjLJxBRJHIoHuLNCEoHdk0gk5islFAOvyF/7ZGXJ79IeQQF4L+JRvkEpD0P8pV9Y5CdDUyfCpDpLYmRWO" +
+            "s0cFWljA2cR243hnF3MACcl86IIATe0cJOEkiMbOd2Rtsz70Yhb4ObvZfdz5BE8m3Qm6JEBTYQdRbsuCr42owAIWcDi49/nXL7Bv" +
+            "q136IIAVdJCEDUfXZyEeFDHCGnB4mY4/iO29XDX7IgDnswHn8t8HRYdYx4MixtgIQ9P6WrcHy2chs76kbwI053UmCR8U90RP+UHR" +
+            "r3feGn26z/Jahz2XwlAEaCp5IgkfFA9E93LJo5xScBQV0fHeGr1Fstg/hiZAc8avI2FkLsfIkxw1TuHsnFnMgaKOEGZxOJRCAC1w" +
+            "Pv+My28cvONIjw22j+zLSd0HKWZmsZIIgF02wAeiR5Ky8cOATCSrxj+o/aGIl/tj0EWhRAI0BrLxY0cWjJH3S3SNMKKnjn8+lf8j" +
+            "UhxKJkBjLKNp+G48L+pGs38J2iuXX0gNJGUg6hLqtGodaiCAFT+Pf87k4cycJc/kYT19o/HK5RdSqr0c+t67FgI0djmDhHP57IP2" +
+            "mziqGDjjiFcq32iKqdS8itRGgOZ83kFCY/tw9U/SQ8IWTVs2DTdf3bNKrQTQ4X4T9+HKh6zjXdGzfIPyjNpti6YtmyzWh5oJ0Fjb" +
+            "sKo6wnZ0Ays367vSzix2CJkPRTyKzocxEKCxRvMlzcYkR8k063Pqo8nMW89h6AuR6jEmAuiMi/hnc7JOsrMqi1lwKrnsiuyPnI2M" +
+            "BmMjQOOYn5Cwu7pt7jqPxSTo7P040oiep6FHh7ESoHGUbe46z1/uMh9efLPwMu993jkCmvw600NlPHYCNHb13q0zfXgzlm+zfqU+" +
+            "hxWGbW/2XXq8PcdXhakQQKfY+cJf9Q4s2KJoDxyd7UPj3qxzlrCboJ0/0DcLkuPHlAiwuTdtUbQHjs72ofFYNhq6HTUtTJUA0/Ly" +
+            "OmcbBFjHOFPYFASYgpfXOccgwDrGmcKmIMDAXh66+P8DAAD//xvHY7wAAAAGSURBVAMAafhXEKPWKngAAAAASUVORK5CYII=";
+
+        const string IC_QWEN_COLOR =
+            "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAQAElEQVR4Aex9CZhdVZX1Wve9qoRJwAkZhEBCwtjaMgiiEFREFAds" +
+            "RQURsFtRRAY1zIQEBBtBBIRuxO4GQZrBVpr2txv9VeRvQQTSIhIkk4RRxLadIaTee+dfa99735RXqSS8VFJNne+su/beZ599hnv2" +
+            "va/qpSDDeHle78D4AXhe335g/ACMH4Dn+Q48z5c//gQYPwDP8x14ni//f9UTYMPd09brvTYd8oLXpmNfsE/a7Xl+b1do+f8rDsCG" +
+            "r0mT139N+l5jAL/Qgq4FcTES7tpwn/TwBtPTO1doJ55nTuVytV+lOAZ5epq4/h7pnHpKDwDp9WDSIpLufRNbEummDfdt3LLR9DRJ" +
+            "jeO1awfG7AFY/9Vp3/WfxQL9IHsqMw4KIAlqRczamFpxhv1RSQ9ttF86Q9p4bdsBbVebNkZE3fz3IUvfV8ZvocyHGOYUTwCJegb4" +
+            "aht8AKSk4HTWRm+qXyN1vBY7MPYOgB77zPAPIFUFZ7vlgvVEAC1rZcFErjeZH9j4gHQAxkvsgLYpeMxc1n0Gr1emr5dnd9K8m+/7" +
+            "kHVRtd0eatONt4R2ZuNAOY1X7cCYOwCVCjYhiTy7zchlrSRsYvgJwMIeLFkMt4kJbo3xEjvgLQlhzFyo2xjvemV5MFQk6xqZXjIt" +
+            "yB4suZMrsoxX7cDYOwCaNEk420FCxwGWqZXQmV9w0051sE3MNpb1eVm7F60t6Tat/bre7Pqcr+zWNZ+tZee/W2zJdVugGx+Wgv0T" +
+            "Q/4Tga3jGHsHQA9vtmU6fWO1CjO7OG6+2qOtyYT9xm99vgPaslwYW9flZXixEop7ouyr9vHqN+XY2oVMR5ZdT4DQdbNL9qoYOhBs" +
+            "WUCAUHeMl3wHtJ25MFaujZhonsV+4+fvc+m+uf5MEKy3f8HNd75/YghbQh4jAj3vL2PuAMSElcKR2U0GrMONusmWW2DeJoMq/JTI" +
+            "9DkCa1mZNGPozZNOqn9265Nr39zm5Pq5k04d2n80pugtG41x+jdG3LxlMx4shjB3oPBtewIUnmsFbfmppbtsPaN+D8j/0DeXJ2tS" +
+            "B+o3nacQvGWb02q3Tznl2R1kW2117B0AbYWz2NluJmXQKswsWTbrEEOCqogCQD01QKzxMvnT6aWTZtS/kmWVu7WWXUjCcyMBkkLw" +
+            "a1K18tMpM+sX7jArrY/nUIbrqi0brmlttdc1MWW1rnrTA0SU/LOARGV6Lssn2syCPh8os3yV05qtW32qfmoN9Yc0/w/qM4pnDHHM" +
+            "LeYui9eVzxdV8QnPpvqCybOGXoM+l7F3APRlADVrJQm8SYblFgjLUKabGSxbB2ONlEmfrr1DN38RM5yjua3LmBM0X+qiKqOqdMsF" +
+            "irUyw8uY8XtTzhraE30sCt/HaKMZSnuGnlC2h71g55V1cfibV2LVmx2RttvsyPqJm32o9o3NP1y/fPMP14544SfSC1ZmqVsdn7bf" +
+            "8pO176SEf1Wmb6PMR3MunluR8WrL7WEDch+gjSfqYJ+CPpaV2Io+jvocQlU8YyEypWRtmPXYKAmqICkAyppgbVywdRAjlhceml6g" +
+            "G/9FZI37keE89TtInY4CeeW6Q415W3ys9gHpy63bnJQ23PKE+kWoNO7LyP0UQ91ZzIlARsCVhKqQMwgYYSvXWDLR158OFBZjqtRR" +
+            "j/nGu9KSsidksTctzy5lvzJd705f5ZXr0SaLDMutLzuydviEgcYCxTtGqAjIx3C3BEV7mS7XbHF07fYtj0rLfko/M2VbHlc/qra0" +
+            "sZBMx2ncquciRmS5OrcYCFk33T6KLR15kc19bItRw5oGp52XNgixD5cxdwAq0P3QxkR2BBOWfTF3Z1noyrQWA8zQs2z+wfSizY5o" +
+            "fC8Dr5LPS0G5CWyHY0l39pJ8TRpozH35J+qnyzPqy48b2nvLPzTuVf/LhRc7Bos+JYMK4CpWzdXQAWaC5SYztzmGbeLKMz5B6EtR" +
+            "yL7EGb0gFT0BqOGaUH6EXLD2JrJVDNvNBZxF8kJuR0fxI7+RNX6oLHx9tLtvL7iX7Y5ZMnD2y4+rfXHL42s3kLxNP8/vHFnd7lP6" +
+            "msunVZMVNOxiV8vtbLmJWEFTe67CmDkAL3xLevML35r+L5FdSm2Qkd8owjJZsDJEIvIMBWi9G36uorNMHGx8UL7bkbIL5m5AdmjH" +
+            "wu6Y0tUHDBuPIXkwbW8HibCxZICUzBZDsiEzGLHUJrYtxpMc9mCivk60YEXKSD4KOZLLmm3f8C1p140PUGYi/QeQ3qgMnbhMhjuT" +
+            "lG1q81UTdpa0kGd+m85lN1A++wiIFmokqIgtebxmm0awzbDNsNwO24ywaW4hF+xY8XRQ7Hy+5Tglh7dG8XxlkxRxxG4xJmT9+zpj" +
+            "rT0AL35LmvrCN6evZyndTWIvATkYDGcZAQazk20T7AOWPi3OeqyazDamfCGYKZ+ciW52XGayG2oMWWw72Bont0t3m+1iVXSgOY79" +
+            "BMe0rWQ7Wxbn8fjMfTP4Z/SpaKg+RepjmI3elA6vN9I8Zci7oI3rhDIjbAU7M6yLw8/cju620MOhc8ZsIPq7vR12td7OcNH4JmV2" +
+            "ZGiTbVRbex+3WW+yfEIXu1oWx9PB40iOmGb3EWsvdFVl+paufatr3QHY+M3pLaykq3TgQc2O2pwS+Q0icr3gyA7tR8E0dwAIG1sM" +
+            "xUVXITPQPm2AZDiWmO2cqbN1se25D2GZbLHtjkHKRoCkAICAIRV0DOklu0/IbfFDJyF+uJKqn0Afi4bvY7R+hEopFphngwJSbz3m" +
+            "7E2LzJDN7KxQqxpTB2wz7KMGVbUrhm3NuLK21+TXqnzcJ/fJ+1jP/VLkZnnN7fIprcWc4v1uW1NXb8uKnc/XuuAqm+PkUXy1scWW" +
+            "muMRv6xktTc+cCKftFe/sNYdAJ3yV1Ib0wJh2RczM+tCO1tuAsh9WhxZxZbODNLQUagPBpSVjiNGwdaRAWY2mSAJyAcs2toYbrMu" +
+            "Vs3V0O0rWHasYKIVV22OGW2FnVwi0zkTUNl27icnLkSfi4bqc8TnHm59UEGaUB6EXLCya9kMVZvtAfUVR4w27uxjny6UnwFs9nht" +
+            "fW1yprZY4zmr233a+7jNepPVM3Sxq+V2ttyEYlt2X+CGeqps+/MZA6f384Ofw5dY+w5ABaA2yIAYElRFFNSmdLDu7DPT+vLAVp/w" +
+            "lQ4DnYXUVthuEtMxS5YtxhOH3W0lNImwNRkgKbQYBAyZQceQbrYN1jtA+XBOI0t7zDux+r6FJ/ExrEJZ0S4aekVd2/ymp4nr7Z5O" +
+            "Wn+PdOv6ezT+sP6ejZ+uv1f90hfsnbZt81pFUW89uqsyocmSlW35OzSX84zMZfVwqzrletkW9mYMNcsrNt3ve6ttSLaVvvYTUoEy" +
+            "XskddmWqdb/7zfGkkc3j5PPVIBG3ZHs5kucqm8awZsjyeEo4fN6MbLcFMwZ/7NbVjZU+AOvunt653jN4UCf4b7XI6ci4ATP+BZl9" +
+            "XJOfq0PwhRfvlVb5ywqSUIXiBiu2mOjgIvvsA6Joa3HTTkK1CRAwMr3v0VWonQhfxXZ/igMylmy7++c60GQqsKtYFR1oxpW/fSKu" +
+            "5JLtnPEZEGdtsKQydf7J1auhb5AwSkXTW7GRJu6RJinrb9HcbtKct/KJD/gE+8TnPKCTfPzSalq04fR0FPSt2IpFb/Oivu7TRkVs" +
+            "s+JGVolR6LBcorT1Ys/L9i400FCytY1ZivaLuDYULo5hW5OLttLX7LYOlk/oYlfL4uY6JMca9KWBRvnnBn3jB86cM4tPR9MoXlbo" +
+            "AGywezqo0sBc3fj9Sa1GFWKSyLOgxVBE2V6CLF2+0Q9x78ZvTK9dmfUQ+A11IekhoFjBcMYQuW65icJWtvVg2NYGPQGkobPIQiPi" +
+            "qqlgj5+PTVgmW2x7Hls2AiQFAAQMqaD3Q3rJ7hNyls1JqbHnglOrh67u9zyWUzS95bSqaeLu6XUNpG8oI9fN32k6sz7xbVnht5oR" +
+            "p1p9SpZtZ/X9z433q9/wwgPSFtE0wkVjfEdjyUu9NY6uIecxNbbGtc3IbWqWzRtuW9Jmh72dJYddHG1+37tbO7QTZfTcJ9dKWfOS" +
+            "t2yaU9iaLLNlxbaPPOC5wEU2+9rmudkkPNYgPjD/5Gy3BaeOznteYw5btexh26KhQnycJMgCzgzLTQZoWZGCCcQpJ3K7WPrBqZEe" +
+            "1SE4a7O3pXWxnDI0mJ2mwebmsZjHiPiljNzGFiu+urR0uk1AgVIPVixkme8J2ovNLNcghVRnsWNQbLVkhAIRBXMbHIPSm0wwZD7N" +
+            "CmcNLa1su/CU6rXquMwcsAaKpjbSqOlVoHyKU+4TXWZozmpzBprM9l2G1Si7suCMJfU0f+O3pvfJ0rP+4Wv8n8p6fLXGuSrGdawC" +
+            "6h+S2tBsU1zrqeCwWx4OcNHv/U094fsieL0ezXG62W22N1mBQhe7Wi5Y80okvlplZcr8UyqzF8/mEjetLRj5AJD5t89ahSoY2cBg" +
+            "kIAihK2Lm3ZqqW4TUwxi84zpuhe9vXHnSw9Mr1DrMvVX1/DPv/565chU4W7M+GMBwyLiEiQQPmII7AHb83kt+wSQPVHzo9fXDgUK" +
+            "W5M1juWIT0iUAQBVDccoWLY7K2jsPv+06mE/P42/xCiUlR1C0x2pS3s2SFY25JmYy3lvy5GHarUl123RJtiApE0JQVkTckqvrmfp" +
+            "Jy96Z/0fNzkovTTaui7/fT3veeqGbA+wcYhiPSrIw7FzxDwirvR2lhxjiN3Hsn3zudi38ZQCdVS5/tq+hn0Ny/B84T62CHK0zbGW" +
+            "885/RN3ev+D06p7zTh+8p2OgtUwZ8QCQBCk4K4KByAj1DCag7JEPZBcouE2MAhS3QFiG42USyQ/VkRa8+K/qM/CRpB8jsUz51XXV" +
+            "69aZkE1lhpnq+2f3BQGSgjkHCBgyowmPIzvbGMC/Cx2VGb7TjNvmm8dxACgmBXMbskLO+c+s4IxavTJt/szq9RimTD4/vXTq55f2" +
+            "fPoN02W1mTXtEWLrKMeJVxb4xOfeyogQxAwBzrKQCh3mnij6RFz3kJ7hBXL93Et+mx548cG1t9najcVXccmTX62cXavpICB9NY+v" +
+            "vuqYy+rRS0bh0+KrH720eoO8O+riC6tXKeP1047NXX3KuTZZPuVYEovxv1qtVLZdcPrAZ4Z7z293wdJdpp0/dMsAa7/KwHu3v7D2" +
+            "5HZfGPq0Q6wpZCMNzIxDJCEGSUA9Qi6ZQOhtHD6hq81cAGKQrkLBRbYh5ykZs3976fsa33nJIannr5X1Wnjil1dXDiOyXUneQQIQ" +
+            "zN2wvYgLUh++Mpyum384hikPf776V/I7U+tZIob7goBltjEkG7bpl4o/TGzsunDm8O/57b+QNp12fu0aILub5P6OK5YK/xfPzt/h" +
+            "4trD219cOwypmUYYraLbONJQ6XG9+ZQ/ygpdc2/Lyhfp+ZSl0y0lqy102ZQ14SP2pqkFsBx988hhk97G+zE15m9yaP2SjY5IG6FH" +
+            "+eVXOOeJK7O9FOv9LPT+hAAAEABJREFUivtIPoYdFTPGTpBdSDXx5dVqNunRSyrnYISy+PzKWahkkzSXL+uG1NUXGkOQRfNW1JAB" +
+            "LNaU37vgzOrrFs0cnIMeZZdZad2p5w3NagzVF6n3BwRGLHVMiiUd1iVvySxdveNltXt3+uLQdIxiyUYaS5/Er1FGgPJknqXITzBk" +
+            "I0izIIZ8IA5bkwnrvpjzGLJFrIItN6FYlikmPzGx1li46WG1D2OY8sQ/Vq8frGXTFHsmiD/l8eWsGBn59YTKjo9eWvnYQxfzV7Ku" +
+            "UH3oXP7qofOqH0G1sqOW9G+KjRIZ8UeCpy2aXd164ezqjcMFnHpe7fA/rVtfRFJPFKwjBtTZgSy3AJmoCyDhL1IFt+50+dLjMEpF" +
+            "61v+SH+6jVdoelfmXjr/UvKTa0upSw57wZabKHxYcJx++YlhH3MB5W5IXfFflMgrXnZ4fe7Ljkg9s8OfDx6/onL2hJRtoYw6FBmO" +
+            "Qz2b+shl2bsfv4zzPdqq4KHPcN6ic6vvaKCyHcDjFPf9g1lls4WzK+dimDLl3KE9p503dDeR9JkCL9N85JnQwSz0YCDavBfW4cKL" +
+            "drqi/38J7MjdGPEAuMPvb+OHsoxfjOxSDzMKpiduWcySLQtxg+WgCpICQGUBCaDg0C0PBwLhQ+ygX+DdutmH6jds+tdpK/Qov7iC" +
+            "v3/s76v//NhllUse+xIX9HBZJVMchLMrlyyaVb3+gVn8U68gU85LW0z729q1lQrv0EJ3jfXFfmgBXhuJfB1i5pAfQNXQC1YfSEfC" +
+            "e7ESZVVdPdwK9f3d93ls1sBOOrvfiwyNXtK0AIupYJ/mXC7bzIJWpHedr3LP9TxOnve+lnrJti0bCweTjQc3/XD97M0+svxfK2ug" +
+            "1V4303t+23OGzsoatUc130MEjdm2vshqWQvO90ft1g1522bK9yckgNgeo1BW+AB4Lv9zK+f+/rvZG3WSD0SG+ZokDB/YFgjLiFOv" +
+            "5mDZ2tmyYB+w9Glx065AqigB+RrSJ6r76VnWWLD5x2rvwRoq0z5bO3T9wfpCVngGSWhfQLZYCkBV27q4adcdUDPYzpKzDMv9zgR9" +
+            "Khpq5SP99tv81u9uyaaB/ASI3wpowacbiFOtRTubl8liyKdE4RP9bWvXnSHWhwOwmVxu3OLo+sUY5TL1nNplKUG/j0ibemhnrznW" +
+            "HevQGjW5WNfyWJ3y/ZHgdYpcG76MAlbpAJTz+u1/8NI0yG2UsRfRkw8QlsmClaoSIZ/cbr0DAK1zeIbbesD2Iu6xWxxdOxSjVKZ+" +
+            "tvY3yHA0tXv03M0kWDBso3XBXABiECApFBx9ABQcMSQrhIyrv2qo5zbI7/6Vv/ufb/KEWoOTQdzkjIdPPPL3nq4aQNkgPdrEthm5" +
+            "rmbZ1FdXWdnSo926EFkiti1kebuPdffQBg77DWO09/OS0iEeN19Vfi3XXHL+RFCb9iJkcd6miVgW2S4PSe1Ve9Curmb5OR+Acn6/" +
+            "/xZ/8Zubs3cxy6aTvI86wmIEW24CuU03M9rEcJu41GlZiBssLvXgwre9DzIgI3fGaJWM25IENS5pFsSaBCAmc50020RdVK1HH8nt" +
+            "bLkJwnGRoYZRKBq2v6P890287dff4CuRGkeCeMKZUsJnOz/xutLjtrgjq902HNzNbd1PAGLQTaOErDObvQ4h5iR2hjehGYVcsEj7" +
+            "4iuajLyopyPkCtPDubB6r9nqCc/0629UrxpY4kzB2cz4jKCTzWVB5LY29sbQehdsV2Yg2jK22KswMDqFHsvji0kClsUs2bKQTxAi" +
+            "CgWrTyhiUnZzDwDZLViB8lxdNPRzDTF8/ye+yaefurEyM6FxVIqzXZ7xnG1LdH/p7SxZFkDsp4d97Fvqthm2GZaF6ILRKdo3Dyc4" +
+            "u7U2v881B/jJELLtBlQKtl09ZMiv4e++YWm3AWT6h1dcPTR7ly+l1frjoBaC1V5IHkDdzDxDNJwyBdZlVEUJyGaErpnlTHRzZJxi" +
+            "5PHUXsiKPCo15pNfAKpKVgVJIdfBnNlch3XBehvgPtbbGNKFdVnBzPr6tQWvvG7pEUhOA/S9eKi+B+0OyIz6Hb2tOuXamDj5ZmdG" +
+            "sNqGY2UI3NbOco8YZsdQm54EdaujAd2KIWd6Do3oOXiOvVjN8tdV1T6ismo3kK8NiFhQcQxRm76Zul35l9cP3fuXNw7t46Z+YlQO" +
+            "gDagogMOHQRQq+lm2NYDtsPZ7bZ29qytix3LPlmGxRiloqEfJwmPTYoLQAwCJIWCPUcCKJjmXnAf23uwg9F/fQX84FVfG7p5l5uW" +
+            "TFbEvlQN2Zc4Iwehc1Z5KraEdpasQ4LSFrKyutQRRX3F5TVi2KeA+vjbN3mMQmXjGr/PYw7K2JDFbVkbk7A9sjy08lKuoGwpWP0t" +
+            "uU8Zt8luE/L46e2pkS181TeWXvjKm1LPfytRjrQiPCoHgBlI3WQqdYItCyjQbit9UPqKkQFhbzJBEnAbASnnP3x+9Z8wSuXnnxz8" +
+            "uwy8gqSGhkBdVK1nZqGdLTdB0DJbjC6dVJugwAqUy2TBpS9xQoW1X+x689Jj8ByKwj2H3ivYlTrKylB5J0DKcgEV+zizS5ZJIeKa" +
+            "s+MIwJMk3v/wBZUTi8ZRowdOqB6ldXxAeDIy03N1lnoGltvZsuAZGxKhfohS9MkzXxbry4NcYjyxflLYWPTF3b65dN6u/2fJ2yWv" +
+            "dB2dA0A8oxsFKmPpzRHM3YhN0YzCXvhGH9lgXZzrhHj20AbZ5MUXDP+vb1d6N1aywwPHVq9dZ7A6GRnOJfmsAGqOICGbiLC+XLDw" +
+            "aWN1VJXdtjbIiDJuxHRbPt5UMrt5938f+u5utzy748osw91Xxn+VfHW6F4DuqvNvFiShtPnpEG9G2ZsZrieAbUaX7eqhSvbyxRdU" +
+            "Zj0xi6P+17ToKnOO4tMPHD1wWqMxNA1o3Bjr0txzN2vlCizb2mJL2hsZJTnr3c8shF0M2SxHlNDlLlt+DatE9ddVvm+Qy/2v/vbS" +
+            "y6bfmiaGaYTL6ByAlMV/3TNuuG6yDi7yEwwxQXYyItsJmllwhjtTVtn1kQurhz/+OT6GHmWbk9KG25xaO2TyGfVjtzkzTe3hskqm" +
+            "aRctmbbDRUuP3f7i2vt2uCyt3yvIz49Z5+H7Pzb4XhD+T80+QO2sgZg/RF5HzlCbDHA7KXsB2wyyZWv6qA8pu9j9wy5ZJoRMwHb3" +
+            "B3H0M0ND312RQ6AQ6ria65Nf4dzExgGaGJaBTzOholNcsjSd5rjqffc4s3TIwxdW93zk8+z5r28nnZkmTjplaCaq9ce0Cdeq78VM" +
+            "9XlTzqx9bZszl6zyQdju80umbveFoa9nqDyYyIv1zr0O9doTO146NHPSlb0zbO5RA7fe/3h1ZyJ9PBG/ifV6JUpNk9YT1MFuGw72" +
+            "dls7Wy4ReyZlWd5rSb12tFqWW0flAHgGv/zHgVuYZa8n8aAAA550ZDnAdvas4vsDnJFtWJmy+PPV6zBMmXxq7X3ZUGNelnE2yfXp" +
+            "mC28O8uqc7c9q/b3U85NLxkmxDLmnS5Km2x3Ye1LrFQfIPkuAYYuQIYNxLPXe6b+4E6X1967TGcbZrNx398M/h0mVLfVvC6j1uP+" +
+            "w7HiqXIZyACNJyI6+mqvwu64QshE4dNiZOkAjFDcfQSX/jU/fgVvfXzTbMfEdKTy/VFo0srWYoD8faarmtLVRDb54S9Uhv0rm8kn" +
+            "L91lm5NrtzeA65RNWzpWUqaoMyzDJY9fle2jqNcXb3vO0Gk2Lw/bXTg0s1avLVbMj2huFTEc1xxwZ42jtq001+t3vHzohzt/eeku" +
+            "NnfjZ4fytz89onpMo9HYXk+D72oeeSxIymMgYkpujqG2kMXRBhf5izSerSHp0lHzPjIplq5wXz2FtsEIZVQPQMxF2fH45f6mMJuq" +
+            "Uz0D5FNxgnWqmfFbRGW3Ry6uHv7wRez517RbnZo23frk2tUNZvcg42uom9wBrSj0JhO0nGFdkp+Z+ln/hQ56lu0vrN0AcDYzTiTV" +
+            "LyCLGMyZjmW5xXup5Z6dvlz7yvZfSpuiR/nZkRMevO+DA/4/hrxT/ReRBEnoEiApsUDEJVCw/HPZehfsAyqE7Y5RsG0InQMYoajL" +
+            "CB6rqXnxVVzy6KWVCx67rLJJA9krBwazTR65ODvwkUs4Bz3KJL/nT6rPZKO+EMRhAnzKcwaaDBVtiq4IG7pL+sDUv60t82icdkHt" +
+            "3cqwg/OYCS0GchkIhkqP+Pp88MGBgdqCnf9p6PRJV/b+fHDvodWbK38c2F7zOjkRf4x4zth2KHzY29nycOieS8SSs7l4Xkgbtq6x" +
+            "A9A+o8e/yJ8uuoBPtdva5W1OrB3KJY0FWYbZelA4k0EtnGQwKG9BKpwxtOyViZ0lYZOeM6H2A9Wjo7KCt1LBSbfnsCMIkBQKVpxQ" +
+            "xKTs5gIg1mOGszdkff4rr6kdih5FPzYO/eT9A+c1BqtT1P0q6uQIMHRBzJeE4kgtWPMKe0aEvRgvZKLwLZnqJ5n0BSMVhRrJZc21" +
+            "Tzpx6R6TZgzd1WD869stlKFQ5iAyROtLOuXKVenIi2x6N8M2++bGXMvttkpn6vFuTJvZx7Ed1xxwEI1jsl29JebX8Ndo1hxZDarS" +
+            "mF6eUuOrr7hGnw+u7f354L538an/OnjwSKS0m/r+WEBzPMWEim2KFpIuqtZs9ciWZdLcQirYc4w40oPlsryaLa9xTbVNOTFtMWlG" +
+            "7Vqicgcz7kbqzrqKVYsTjpy1grA1maBlZU0wCVgWs8UVdBU3k8xjikGAJOhYlNzOlgvIqfBhk6G2wr5XBbxH3+dfucs3U89/2KFD" +
+            "MOe/3j24h55uHyT5pMdzf3OArbFtL+KKiLxdTEAGV4FNSBjxF2WeKtaWstmstO6kGfXZtVT3H50cohOs1Wh2cZrb2XIBEeiLsiI4" +
+            "8kGGgt3XWsGKaU3oqvrIHG2OYd+S5RZPHXE5jkUjRrCfFfcZhuVyROPPQ/+5183D/wc07zlo8JpUqU7WND7jME2oc8jDsmbhNo/f" +
+            "ZNsEpJ9H3+Vc1pIDkLj1p2qHDf6pMV9zncmMbX9NC5AUWgwChsygVkDpJcNZbls3yyn3IUiiu8iUqQFQE0moCuJMJgIoOGJY7oY6" +
+            "RFsPViBVvurpZ2ufVqRh65y38em73zHhjHqlPknj3RjxNI5k9QdCZ4ttdwNt00VVaihyEmfZ5zBCcfgRXFZv86RPL331Vp9q3K33" +
+            "/NVg2lzQgDq9PtF+F2odYRP7/aYWQDJcgrveie7jNrF9y9aIIZs59fhvRMm34bboGmP7iZL3Dlvzktvyq43qaVIfS56jeiKPJYvs" +
+            "lm1Xdi/z4RM9yk/eus7Dd7918L0Ncl/FesAu7m92rGW4bQz5Q/vzTJYab79jr4EfYYSyxg7A5p/Qe/5T9etTyu7Uyd6Fupl01ooR" +
+            "CkQUzG3QjKO5yfKx7L4FOzPIwh4sWQz5OCBJdJe8iaBjEJ1sWxMs2loMt7Glk5IFj2WQhZ6xx4dPDFvuOWDgB3fdObiz4hdcSiMA" +
+            "AAqpSURBVH+MGf+bxTigukRMgGQHQHy7Uanv8MPXTfwmVqAo5Ap49dFlk0+n9bb6ZP0z1YH6AmXRezVhRXemiCJDxXGi29lyAVHe" +
+            "RwKFZapi2eYYTZYt9DZ2WxtSpm0OHxnLuCXL5KrenqFFtOZgq/Ku2Ve65R7QvapgZctsNu560+DlNQxMUddLNG5NQDwJPL9iHO3l" +
+            "Yv3q9513vG7Cm+/cc53FWMEyigcgcdLxtSMm1hsLtBGnMeNEASTRychtbDEkGxRTMy7ZNt02hM32AEOHUjrsJEIW0zYxDHQWNclM" +
+            "UDEkAGKSsL5csPBpY/cnZV8GnWOujDZnP/7+zjcOHqcvxnZmxm+Qjg8NxT8Q2ZkT6oPb37HXhJuxkkXLXMkeq+C+5fFDe211fOMn" +
+            "+jR9pU7upjqtyiRliq7SdZXMwkoNIBliv/fUAstwkU25Jv/yaqM9chQRZMx1ezm+2bHMpS6njtqQZh/3DD/pOTuqpbzFUjRpFra4" +
+            "T9g8Z9kivuSwi91m2VHMed9Vv/5o3wkP/mj6wF/9aPog79hH2Htww9v3HjjrB/tyyapEXa0HYOuPp622PK52I5n9EMQrEGkGUEzd" +
+            "zCaHIrtYFR3QDENvMkHLjmEm4bgkQdvYYtvB9riEmqGfudFd1DXa6JhtsDFs6lgy1N5hd5tgm0F6nALyJSUX3D3umtY1rf5Pwe/5" +
+            "LY+tn1uvNuaBeI+zIDIDyhl6vC52ptjeZPmELna1LNYTxFfBVTFM7iNuZlfoamuyGi07RpNl667eCfu02RUFmj+iuK+FXmzbcOjs" +
+            "8zuraxO87L7O5+XHDe09caixSFlyijJmAp1aAklYJlsM2b3BpGwESAoACBhSQc2Q0kt2n5DVt4PlFLo4fMS0j7kAxFAs6Pfv6C5E" +
+            "I5o9Xi+okbb3YMVT5TKQAejogxF/LOue1urWNb3+DbHFMUPTkXib3nebRNbDOZQjz1DJzhTbm6zxLVM9xPIAJMMlWNEk51cJ7msS" +
+            "2ze3S1JfRUD5pGkfL2S3G1ApWeKytYyomNFYsPpYilgauxwn2G1CyGrr9HEQ98TvG0xnWlub0NcDUMk4i846Q5kCsW9m2AiUDFqR" +
+            "LlbNVZsMzShsTSZoWbFKhnUW9mDJYsjHwchcJ835OGDOEYPW0FHkmkWbYgTLUDK6x3ObgAKkApYofDv6ZPqAluFNc9424cGOQdcC" +
+            "RdPt1yx07jPuBWVAwBlhmY6vDGhnt1lvsnxCF7tabmfLTSiWZfdtsmyhF2y5CTmFXLAIZXzLJbQT6u0Z55bSx31l0ep0VbW+PMgF" +
+            "bm8y/6VRr+90z9sG77JpbYOW3Z8pTTsR/vd4VUYGEU1mITcZIGVjiyHZkBnUjCjdbFtkkm1NENEW4+QxYJm2C+YCEIO5T4i6RF/w" +
+            "t+gqaoLblgGJsLHFsNwDtsPzdFvG2yXuds87Bt4z56CJi7qGW2F1dTtqjv0cIs8hv0WN8kkQMn0VqPEkQ+yscg/LsiJn+cA9oyUk" +
+            "a4ZbDMtNOJby1rHCJj1kcWcmqlU2R01s3KnAHVU/YfhXAbLZQ+SYoqQ+6ok8ltqsC2EXu81yMa8l8vhuSthfN/61d71j7f5/BUCl" +
+            "vwdAmeibSLGSAE2m7rarWBUd0AxCbzJBy45hJgHLYub8zwqg3y0QtoMASaGTwUKPGJJb/LNUG/gyuopC5J8BJEC+EFNMUmIOCTDI" +
+            "XCfFpY+5go//10GD+805aOA7GCNF0+7nTHX+6Xhd7EyxvcnyCV3salmsLPRVcFUMk/uIlWX3KtteO+/E6qGVdSt/rZt0hXTAfe0z" +
+            "HENebhPrfn2/OlDd+4GPs+d/7lUuyDMd6OCIr/n0YqjYLhqLtW8HYIhQBhGkkGcqZAGoalsb22bIjDzL5KOZUD7uEzbHkA3kr7MK" +
+            "PjL/xOqr5p04cDtUfAMf/GT1qEq1saP63EFSboQugmroBSsGySelHfazjwy84d4j2fuXMZRH7osYn0TJjktK74LtaOuDMVg0/f7M" +
+            "+hfn4Q/KtZRnTkKLgZCpVmWKWqQjL7LJqrdtebU5PCSkWgPpIrIy+cEZ1S+D6ixre5177IQHfn78wF56eR+hMZ4S8ubSlakuw8VL" +
+            "nq1Mu/+j1a9KHr5qLkmtetL4ijyWLI4lhF0cMy0494GK/HTFyn/X515rFH07ANBuKEHmCBK1m65SVHXvCpNtGjFsTSYi04qMpxgZ" +
+            "vpul6o4LTh44Yd5J/CNGKA8eV/3KYK06jcBZyHAbiduQ8bqExl/c/9GB4xceSx3O5Qfx9wOMORFkDgkwyFwnxYUPCnafkKVjDJa+" +
+            "TlsZeyKoXXCGdLBtBUTh086WczzUIN4+/+Tqfg+eSv/zsNy6Atd7T+Dv5h4zcOYDRw9Mv/9jA9PnfrR6yNyPToh/TbMC3VsuMXdl" +
+            "9HBsT7e1s+Uxir4egIc/N3CrHgR7k/wVdQBIQhUgYFh2xpRsm7NHeDojT5p/anWbhSdXV+hfsqDfRXPM52aBIJeFjNBcRUTpG5wR" +
+            "tlf6uJv9Xt5w8fo+5Yc+O/Cf2WA2NSFdItSVSwCRl2BZpcWVcPNVjYHK1vNOrYz4DxjVbTVWT0Vwdgvd7/x8vmqPGeRsWymFeQxe" +
+            "+n4AvAcLZ/EPD50zcFyqVF6VZbiLuvGRKcGE5SzL5lSyxm4LTqseuWgGn3K/NQlWCDAHSYkFtEOk5DZ2tnsNAapbtAHP8w+B2oCu" +
+            "+tBs3rdwdvXVynP/27/vKFv8TaH54PmnVXZ98JTBnn8H2BVmlFTNTpmvVxg6ABXbRWE3t4OFUnKhjhXS2V39U9UhuHHhzOr+wvSF" +
+            "Zwzsv/D06tdW/6grOYKzvAt6DCCy3XbtFElE1hfv/FzWOG4TJI25OkanvTr2uXgC6HEV739xK+PVpiGX9853mw+L3MZUHT8Axe0i" +
+            "ld2GdoQkfDNJwlkesu1dsB1E+JASMPaKljT2Jr1aZuy/Fup+15f68gYs73vJy/NdC9vGD0B5U5zBhnaEJJz5ZMHNd36pA9EevoVM" +
+            "QN9Z4LmW0e6vJYz2kGvreHrPNzNesqbp93opSVW1Zmt8IyBdVX1sbX1ekG0M1fEDUNysTFlOEvSOCOYAETaK83c+kdvbmACoy/P7" +
+            "yyCM6ZLYqPfMYt3XWNiwrPx3m58EDeiLyfAeMxed9TEz19U60Qz8DUlEdutp4GzPZQ2bobCLKVgX28eZT8kkkVWyX2OMFS1ljM14" +
+            "NU1X30LqN5T5+91v+O5hypbmU0IZHz7mAP7IrPL/wjaGLuMHoLhZc94x+BV9DvgXakdKQDKc3WKSCDsJ2yBWFTGALB1++2s54r9d" +
+            "wFpWtLS1bEZrcDp3HTjwHqR0ZscUWGhNbr3zEbb0GMB9fvS6CTdhDJbxA9B10+4+cMJZdTSmKNu/LyCyXLvUYoYti/8/QPrMhDS4" +
+            "7R37DDznR3/XNEZN1dJGbawxM9Cct0xc9OP9B9+g9/27gfSoch6S/e0Akt/3SN9GvbHjHftMOGNV/y4fa0kZPwDLuRE/3m/C19cZ" +
+            "GJyq7P+w3GZnTLOBbN8f7TvhzXe8Ye39ax/NdYXr+AEYYauc4Xe+YfAf7nzDhFl37Dth1p37DvxghC5jqnn8AIyp29X/yY4fgP7v" +
+            "6ZiKOH4AxtTt6v9kxw9A//d0TEUcPwBr+Hat6eH/PwAAAP//gCpxsQAAAAZJREFUAwCgcQvE0cevbgAAAABJRU5ErkJggg==";
+
+        const string IC_BAILIAN_COLOR =
+            "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAQAElEQVR4AexdCXwURdb/1wRIgESuEJAzkMACwYRMjkmAcOwiICvg" +
+            "LteHfp+uLhB1XVeFRVER8VhRf+quNyi7XuyHgrrK71N/68cdDiUSghyBkIQrIZOEHOSaq7v2dUirxCSTmenu6c7Qv6qp6equV+/V" +
+            "+3e9qlc1PSZcPQK6Ba4CIKDVD1wFwFUABHgLBLj4V3uAqwAI8BYIcPEDsgdYOoMPXjaNT1k6ld9P6T3LpvJfLr+BDwhELAQMAJZf" +
+            "z/uRsjcvncY5BJzmwNdgeJHSVzjDVkHEOena0un8gz/ewHu3dzDI8rV7AJAyg0mxDwsmnCRlz5EFbzHluKWTiFwCy32rJvEOaOdH" +
+            "uwbAsun8N504jpEOn6bYlWJbQzcCy0s1wTh2/w18YlsLGfG+dgkAsu0jyK7v4ByfgGOoD4oZZhKxg3qQT6Vxgw90dFu0XQHgwSm8" +
+            "2wPT+Ctk24+QXVfyyb2Jxg05BKwnH5/Ju+hWm14w1i4AsGoVN9Hg7W5XEPIYcA+1QxBFpUMIAevRagdyHpjKFyhN3F/0DA8AyUbX" +
+            "7MdhcLxGjdiLotphIGPY+MB0nnH/NB6jdmVq0zcsACSbTCP1zZKNpkbSXBGMYxw1Xjbx8DoBoSfxYMhAMhiLb8kGS7YYAnJopO5+" +
+            "WqeueEHEw13UiLmSCVpFpkjd6nyn3pQC8d40S7/n9LTdXG3HSckWE5chFPUSeoJMkGSK/nw9H6cXptrChyEAQCP7OJqK7aenbQMp" +
+            "v39bBPPTPTGiCRnE60ajuJZ1DYClM3k4NeZ6GtkfJIVaKBolLHCJOEHAXSl5IvXMtG4BQKPsB+BAHjXeHRR1yyfx1mwg0Hah+AS5" +
+            "lU+8/ih/8KO1vFuzN/o5U3cNS4qfRU99Po2yX6C2uYaiYYPJhIrIeHQKH4Q1ZLpOffQWX8I5uah0JJFuAECDp2Gk+H+T4j+j9hlC" +
+            "0dCh5wAUmGeiR5+huLZRkHAaKK7d9BayNq/lujFnfgfA8lk8jBZtnqfB00lqqOspGjp07Ymc2GlwDLNgSFDza4lxIsP+Tev4Pz9e" +
+            "y2Vw+E1mvwKAnvg7RTvyOMcyv7WAQhWHhCIrdipKR0/GiM6h6OSOLM1oFgoMuTQ2eOSLl3mwu/t9vd5Seb8AgJwm40n5WcTUG9QQ" +
+            "ht58wUwoi7bgVNw0xHcOg6eydKWxwVPSsvOHa/lN1B6aB00BIM2NaWq0gWzhbpJ0DEVDhx79cTxhJnr1GoBonwRhGMoYPv1oHd+x" +
+            "+U0+zCdaHhbWBACrJvEQUvxKadsVTY1uhsGP0HB8G/9r1AxPwUiy8ySSYgJNpLHQMeoNXvpsPQ9TjGorhFQHAPnt51YH4wS10hOt" +
+            "8GGISx2DkTN6Es7FTERypxCEqsR0B+oN7rMLyNu0li9Se9qoGgBohSyG5vQZZOM2kfIHqdRYmpAlO38+0ozvzTdiRNdeGKhJpUBv" +
+            "8hi8pfa0UXEAkOJ70gDvDSKcTXN6Qy2MNKNYoecAZCbORt8+Q3BdM9e1yGqYNn64jn+gxrSR9KScDNTd308EC4jinRTV2JVDZLUJ" +
+            "1MWfHv1LVNN8PpE8es3P6LVhpaEW6kVvkaaN5D9YoeS0kfTVQN+nj2XT+SR66nOou3+RCF1D0bDB1AFno5NxmgZ5kV17oDv0dXTl" +
+            "wF8apo1v85ltYc3dPT4DgBT/KufYThX9gqKhQ58oHE2ajUG9BiISej4YTRtFfE5OpId8ZdMnACybxr8kBv5A0dAhtCeOjJkORI6B" +
+            "5lvLfGo4hmf+8Q/u08YYrwFAT/5S6o6o2XwSwa+Fyc4fve56WGMmY3RwV7+y4nXlITb09bowFfQOAEPzum06f252vSiUEg3DBZpn" +
+            "l9PTnkN2PqbLNehjOAF+ZLhk4V3s9I+nnn/zCgAdmXBrkc2Wti4/P2Rnaelez6v1TwlSfF34YGQlzEJPsvcj/MOFcrUy4AFfqXkF" +
+            "AHJQPN5Ycdihqsqxr+fl5Z6ouXS2MU+XCY3oD5AjxxmViHhy3+qSxzYzxRs8q+PmLWEb2lymhRu9AgA4rtgH7+TisK+KrYPeO3vm" +
+            "uzKH42ILdfklm6Z1hcPHoZDm9EkdOqGbX5hQrtIKmnH9CT0QQ8pXpOf1GADBQ/JbnO5VOBwJG86e6fVFcfFBp0hDROUE95gSYyjv" +
+            "PxLf07Suf4++0PNO4rbIJpBX9TWYEL0gnb08fz4T3BVq63WPASCYHOHuiOfWVJvXFpwqyywvz3F3rwrXbeS+3Z84C6EDRvnNfauc" +
+            "WAxbTRyj56Wze+YvYuXKEb5MyWMAXC7m/lPgCN9TfnHEuoKC4/k1tYXuS/h+R0gYvo2b3uC+TaGu3+2uHN9rVJVCLjdh1vzFbMrc" +
+            "dKbag6QaAOSmqRdcI7cUF/X/37Nn9lc5nBVyvpIp64CTw8fiZNxUJId09XhXjpKsKEGrirr7ZRUcMQsWsS1KEGyNhuoAkCsvcThS" +
+            "3jl7useX1uJdcp7PKcPpIWOwPXk2hvW4FsN9pudfAiI41rk4oqm7fyE9nTm1YEczAMjCnKyunvDKqVNnDlSWfyPneZN2i8BuUnx4" +
+            "RBQmU3lG0chhDykidn46S785nZVpKQjVq2V1l+siqA/eW3bR8tbp/O/O19Wfu5zbts+OnZF93RScG5GGNBak2q6ctjHj+10FNFea" +
+            "O38JGz93CTvqOznPKfgFADKbdS4h4eOi8wM3FZ7fV+MSKuX85tKOHbGblH7QPANxXbpBq105zbGiRF4NAx4OtWHkgiXsYyUIekvD" +
+            "rwCQmS6qr09dfzo/mNzKmXLeDynD+aFm/Ms8C6nU7Zt/yDfmF3rg8U4HAVHkyHlmxr3MrrQYntIzeVpAxfs7k1s58fX8/IJjly41" +
+            "LHD06IfPyM537j0E0p75DjD28Y0oIp66+9t/excr0YsoegJAQ5s4RWHI1yXWyC954ZEoC7eQndfivT8Ndav0UUjd/UJSfMp/3cmy" +
+            "VarDa7K6A4AsyYVaR+WKbUV9vymsy6B+s1bON1BaR7yuqu1I07olbCN912XQLQCk1nLResKHR8vHr95eZD9/ySFNGwkL0hVdR1qv" +
+            "wYYgms/TU//E7bczm5651TUA5Ia75BR7vri/xPLagZJjtU7xhJyvw/Q78tun0sj+v+eksws65O9nLBkCADLXeRWOmJXbi36x5WTV" +
+            "PkFEsZyvg7SIMdw2bzGSyG8v9VQ6YKltLBgKALJI209Xp67YVtg3q7he+pFpvZzvh9QGhqc7cwybt5i9xxh58f3AhC9VGhIAksDS" +
+            "+OD9wxfTnsqwVhTXOL+V8jSNDJuCTBhBq3WPzkxn0oBP0+qbVubtuWEBIAtcXufs99xea/KbmaVZNoFLL5WSL6mVZtMy7XhS/Pw5" +
+            "i9gZtSrRiq7hASA31Mlye/wj2wqjvsqrzqDJQ5mcr2Bqpe5+0bzFiKdl2j0K0vUrqXYDAKkVpfnXv/Oqxj+8rbDHsTKbND5wSPk+" +
+            "RgfNPZ+zhSBq/mK2nhnQzrcmf7sCgCyoQ+BBbx8sS1uzp7joYp3r5+sL8o3u03+ZghoWbB689VZmRGeUWwnbJQBkqUtqXZFPZxQn" +
+            "/v1Q2QEChSf2WlqanUSOnN/M/T3Ll+m1x7RdA0BW2JESWxKZhcE0fdwtgre2La0MHHcfLUQsKX+nXL49pwEBAEmBNDAEOZDSVm4r" +
+            "6pRXbsugPBdFOTg5x19J+dHz09kbq1czEQFyBAwAZH3Wu3jX1zLLxj+/tziv0u76nvK/MImIWZDO7iflV9G5oYKvzAYcAOQGO9fZ" +
+            "7rr7lycq5990GHN/e0jODrg04ADg6ilWWx+pOlS8uirG1VtII43PAEwnUZL9Ekpzwug8oEJAAaByYe3e4qcqw5z9heZeUnkfuD0f" +
+            "1kN3GgIBJVljCLRbYM3+DKWHvX73YkAAwD7CuafwrxU5NWn2sW6UGw7G3oD18FGUZk1yc69/LhdnR6Dk8HrqtbKIgRvBMAucbyAw" +
+            "PE3nHod2DQCxp3jKurIqo/Te6nG8E2/7+wAYHwVu2k6NuhkXsiI9blU1CuTmBqPk0EMw4RTApT/RaFrLw6jI6t400915uwQADxGd" +
+            "ZfdU7yp6qrK/81phvLtGaOX6HASZclCS/RcUZ/vvJTIlhxagW10OwJ4BEEax+WA3tfjL7eYLUD/S0gWj5lfPsO0sfKGq2jbKOYFk" +
+            "6EzR1xBMBFbAxHIJCLdRd8voXJtgPRJHdWYATNpTGAl3BxM93jndbnoAZ6TzQNGzFQerbqybCMaveIGFu3Zr2/WGP3d4hwZcmTRG" +
+            "SG1bGS/vku08E6Q/yxrXHBWl8gwPAGdfsci6qirTurw6SQzjWvxwxEwA20tP5kaUHuynlCIa6PzczquuH9UraBBMhQ8hjIMGdwet" +
+            "j1VGOPsIiSpU4Y7kAvCgXJQeWomCAp/e1ddQkTV7Dtn543Bn56HsYTgAcLJyFQvrDl9YU15vH+E0U3NQDn36J3QBZ0+gy6UTkAZq" +
+            "3vBgbbTzDJup+BCKmgZDAaDe7MgpeqGipDbNFgvGlBjgKdPYDIMgDdRKsndBUijacGho51vjxhAAEMPEcuuKqsyLi2pG8I48ojWB" +
+            "/HwtDUw41OCoKcoMb5YXP9j5ZvlozNQ9ACrn1W0vWlPZyTnQL3a+sZk8Tfgd6NCxgNy0f76ipJ/s/BU8NDnRLQAckWL3wr9V5tZM" +
+            "tk0Gg1p/z9KkORQ9DSW+n0NJ9ikUZN5E6W46V9nOB3m8j0F/AAhGrvCQ80jtS7WjeUdxmKIq0ZoY52WoEgpRIXyMQlsYHNzn7WWt" +
+            "iyB4rE+PC7TOgA9XGer5HNe3rh31w/hs12gfKOmjqF3YhQv2YFQ3eCRN4CCvnn0wrPZd5E1U/H1/3gqtCwDwWHGf63ObS1jmTPZW" +
+            "EN2UE/hBFNtPo5QUL/7Mbx8EJ5+AQocJlS4CAlz+5tu/AAjHQeFV+3lhrT0V4bzlRQ5/t1Jb6heRh0rnUXrqzXBxN3573h01rgm4" +
+            "YDuLejGrLeTVuscvACBnzlnhXmeWa0u9mSeIA9QSThO6HFZ6mv8PRbbBqBE8+8cREUNx0RGPC/Zv4RQ92baumGiaA4BPFfYKu+sH" +
+            "8YWueMWk8Bchu7iTFN8JNa5fEwveeyQFngyr41qUOHZCRDXR0ixoB4BocZ+wqb5SWO1wtytHM+G9rsgpfk6KP4VSx0Rw9PCazpUF" +
+            "O8EhTkSR3YZLTloCJihceV2VM/UBEMq/F5515Lnet6fyAfB4xwr0dIjIRIl9Jz2ts0g90eqwxnvjkjCepo2nYBOPqlPHj1TVA4CJ" +
+            "l/I7XJmur23X8QlC1I9VGvEbL0CVS3rqY+HgEzWRgGM4yhwxNKPYC4FfaFudGjiCqIoyd8zw8XyPa6stVFjs9McyrTv2PLnugl38" +
+            "gqZtoah2zaKCnShqG1x8LA0Su6HcuYPMTX2rlXPu8fjB4x7AXjCi5Zc0DRQPCO/aS4TnbeMQAv2s1rXaai1cFNkxlNrzyc7PIMdN" +
+            "7xbu0iq7C+qESSiyqNWgxwAABcpJREFUlZN52NdipaLTY0+jxwC4XDm/eDlt/OyMHGGV44TrI3sSHy7qebWukeFWEk7z+QrnHhTV" +
+            "j4KdD2/lTu0vcfSnAWIqiuzfwymebMLAcfRL9PhVNV4BgCHocUgHQzVfIHzj2lY/nE8XPN6RKpHQUbShzrUdF2z9USuoug/PZ5lF" +
+            "fh0NRKPJrbyHBqOyW/lNb+h6BQAnZ+/z0eJ21xc2CPc5LFSxV3SonD6Ck++nwdYllLsmU4P6vr1LG6lMcPJxBNiOqHB9RXyv96Za" +
+            "7xSXH1UlrLO9iu7c2O5bjv00rTtKT1IKuW+Nabo4wlDrXI++cV69wcQ7AEhQ6zPmE0pepmjEUEq2NIPm2ik0rfPMfas3aRl/GOYU" +
+            "aZ+BV5x5DwCpuoi4P9HUZDl9FSgaIVSjTtxOg6hQGk378oshzWRttSKO1YhPeabVe9xc9A0AEvE+cc8DfBIBQR6MSLn6i04uKb4K" +
+            "5Q6y89zYU1TgOGC6HgmWx31taN8BIHEQMSYDwYxco+wV6VRXkeMsrbgdJjsvKd7oK4/V9KD9EWbLKJiT/l+JdlYGABIn3WMrEBF7" +
+            "LyBKc+ctUpafI9l5114U2QbRmnusn3lRoHq2ER1c0fTUv6oAsR9IKAcAmWREfC4i4maBsUlgUH0xQ672J6mNHDhbSfEhuOQaS0/M" +
+            "Ty4Z8ut3EMUUmJMXIm6c4n81ozwA5DbuHbsTveNGg7F0yiqlqH5w8t2w2qzkwv0VzYuNPUUFLgD8VpgtiUhMVe0V9OoBQFZ379h1" +
+            "pIwhAFsDtQ4ROWTnD8JqT4MTg9WqRiO6NQBbiaq6oTS9ex8qH+oDQBJAclJExK6AS4gE2EdQ7iho3I4VTXZe+p2gcpS1p8SpyncR" +
+            "5IqCOfkpTJ5so3PVgzYAkMXoZz6DiNgF1CNIv6/PlLO9Su3CVpy3SZsrfduO5VXlChdi+IZWHJNgtvxOtvMK19AiOW0BILPRN24/" +
+            "IuKSSOhbKes8xbYHgR9AiYOWaZ2/okJKbcciUn4JueBsAeItKUhI+c4fHPgHALKkfca8j9prhoHxxyjL3WaHLBrcST+2SIJDHEr3" +
+            "GzlYaXD8B7Lzo5CQrKRJ9LhN/AsAid0hQ2zoPeZJMGcUwP6OpgdDOS3P7kahPYamdxOaXjbYuQMMzyEoJArxya+TnQ/wH4b8VHu9" +
+            "Ey8gIvb34EHSSxx3NlyyiZ/inF1AhTONzrXfjkWVKhi2QjCNRLzlQcTFebVypyAvP5Dyfw/wAyuNX/qMzkZE3CRctM9BmSOW5sL+" +
+            "3o7VyJiXCUM+2flZNMCbgqSkfC+pqFZMfwCQRR2Z/Ak1WjR1mYsp68otaJRhgCCNaR6iJz6K7LweXOPNNpl+ASCzG295G2IQjQ/w" +
+            "tpyl/5RtbODZbHlW77zqHwBSCyYmVlFvsLjBJw7o7h+4JRYbYx7AJkLy2yfSmAaeH1qXMAYA5FaRfOJmyxgw/A7AOYp6CfXgeBRm" +
+            "SzTMybv0wlRb+DAWAGSJ4i3v0hx6OA0QX6Asj1+LQmWUDP9s6O4TLE8rSVQrWsYEgNQ6kq/cnLIMJlMiwHZA+6NxmdZyCwzS3TfX" +
+            "RMYFgCzNmKQs6nYnkzdxKmVpMT7QZJmWZNEkGB8AcjPFp3wNaXzA2f9QVjFFpcNlO6/RMq3SzLdEr/0AQJYwIfmDBpvM8bycpUD6" +
+            "XgNNyc5LpkcBgnoh0f4AILVsYmIdEizLadqYQKf7KHobjtOKZSr1LLcZ2c63Jnz7BIAscWLqQVLeWECcTVlWim0Nl2hMcR+VHUXL" +
+            "tPvbWsiX+/xVtn0DQG5Vc+rncCIGYCsAtLL/gBUB7DFInsf4lL8hAI7AAICkSIvlIszJa2C2DATYFAAPkfNmdUOUvks/tDAn94c5" +
+            "+Unq7svoekAEU0BI2VRIc/JWSH566Zc1UpS+K/RDi6ZV6f08MAGgd61oyN9VAGjY2Hqs6ioA9KgVDXm6CgANG1uPVV0FgJ+14u/q" +
+            "/wMAAP//lnnoxwAAAAZJREFUAwD3MpVqK22ClwAAAABJRU5ErkJggg==";
+
+        const string IC_BAILIAN_DARK =
+            "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAQAElEQVR4AexdCXiTx5mekXzIh2zZGF/4lGwMMUc4DDYYbFMoljlC" +
+            "Fh540mySbrbddtvsNulmm2OTbpu0TZo8aXabtNmwsG0gsDQnSVO62WziAMYy4KM5AF+SbMn3Lcu3Jf37jsP/PGCwrVv/L6NnxuN/" +
+            "/jm+b7535vvm0EhCbn3mdQvcAsC8Fj8htwBwCwDzvAXmOfu3RoBbAJjnLTDP2Z+XI8C5c9WpGs3FrfAPlZdffOD8+aotFRUVSfMR" +
+            "C/MGAGVl1YkaTdVbGk0lJ5HYmgihH8H/ilL6ks3GfcxxAUb2Dv71M2eqFxI///Ds+T0ATp1qCNZoqh6XSm31hHB7ecZnCe8ODLQ1" +
+            "lJdXPVhaWhowSzq/eOXXAIAQ71QoTJch+J9DWmHw9rpISrkXZTL55fLyCwX2ZhJjOr8EQHl55RL0+k8hxHcoJUoXBJNJqeTTiorK" +
+            "d5nd4EI5gs3qVwCorKyMhOBfgtC/RK93W8/lOLIHdkOtRlP5NOoIFaw0nSDMLwDAcZwEvfR7k5NEC8E/gHaQwrvbyVDgE6gDQKg6" +
+            "gP/9wokeAExHazRVn6OX/gYSWQDvaZcMkJ3QaCrLLly4kO3pyjxdvmgBwHSyBtM6pqMx5PtCEButVslnGk3lb8vLy6M9LShPlS86" +
+            "ADAdjEZ/mulk9ER7pnWeajtWLlM1f09pUANTQUwVsUgh++m0iQoAsO6/AR2M+Tx5AowwnYxAEC6aqSANVBFWFzcKgiI7iRAFAM6f" +
+            "r16p0VRWYKg/Br4WwQvSgT6oIloGEJwQy9KyoAGA4T6moqLqsM1mq4bE18OLxNEDWFquq6iofJKtRAqZaMECAD3+hxjutdCr96MB" +
+            "BUsnaJvJhUItPBUVZaozGtsf6evri5wpoS/jBdewGD53Q/g6NMoL8BHwonWU0v6EhLigiIjwZ6XSwMaBAfPfAdBUSAwJBgAVFTWZ" +
+            "EPz/EkLfI4Skw4vaRUTI9VlZmVFRUYqEq4zEUEpeNZuHakwmk2DUmc8BUFZWJod1/zzHWZl1v+1qY4k2CAmR1WZkpE8kJSWmSyQ3" +
+            "dnaohZWESCpMJvPx4eFhHhw+49enAECP/65UKtOiZzzssxZwU8VBQYE1SmVad3p66pIgfOwo9i6LhWuAWvgXqIVgO9K7lGSmzD4B" +
+            "AKzjfPgaEPUKvKgPX1BKe5KS4hszMpSrZLJgB3nhwiglPxscHLo8ODi4B23hdedVALC5MXr9MQyDZ+Fv9zq3bq5QLpdfycrKWBAR" +
+            "EZnhYtFKjqPvYjT4FPZBpotlOZTdKwAoLS2Vocc/ibmxEdR9A17ULiQk5EJWlmooOTlxqeRmit5J7jAaYAtbchn2wYvd3d1yJ4tx" +
+            "KJvHAVBRcXGfTCav4zjylEOUCTBxYGBAbVpaqjE9PWWdVBoQ7iES2TG0B4OCZFqohW/BPqAeqmeqWI8BgG2VYrgv4zj6JmpKgRet" +
+            "o1TSkpgY90VmpmpJaKgs2UuMLETb/aenp41uBwDbGoXgX2FbpWgoUW2MgN7pzgo9Xwk9H69QKJZPf+mNZ44jK8lX08bXPTFtdCsA" +
+            "sIr3EKVBejTMd+HZVikCcToM901KZao5OTlxLdQ8G5Z9zcjdX00bBx+DWnDbtNEtAIDgC2Hk1RJCf0UIEfXyrVQqMSQmJjRhuE+T" +
+            "yWQK8CMgx6aN9BdXp4277CFsrjQuA6C8/OLLhNBSDFVZROSfBQsUl7KyMlMUiog0gbPCpo3vDwwMPuoqnS4BAD3/z5TS77tKhK/z" +
+            "h4aGfImFHBIXF4f9fF9TY3/9aPtnoA5k9ue4MaXTAMCQ/0+E0GIi4g/0/CWVKq0zLS1lGZZyRcnJwMBAvCuEOwWAN954I9Jo7LjD" +
+            "arV1u1K5r/JSSvri4+Nqoeezg4OD43xFhxvq7YqKimpypRynADAxQe8dGxvbpNcbZF1dveWuEODlvCORkZE10PPR0dGKJV6u2wPV" +
+            "0R+6WqhTALDZ6E+uViwfHDRv0OmaG8zmYcPVOEEGsOgvZmVlTC5aFL8Ky7eCpNEBouoo5TZGRoazM5IOZLsxqVMAwBB63Tl4m43L" +
+            "7OzsTjEYWqrGxyd7b6zGdzEQdmtyclIr5vQ5UqlUkMeyHGidfqT9QUREeHZERIRbRl6HAXD06HszTvcmJixrjMbWBR0dPdUABWj1" +
+            "nQNI+2JjF36xZEnmIrk8TLAnie1sISvS/YYQW0ZkpPzXlFL2jKiZnb1vHAYApZaYuQofGhpardMZegYGTFgcmiu129+PRUTIK7Ky" +
+            "MsNjYqJ9snzrZo4+xnC/DIJ/APZLn5vLJg4DwH4CuJienv4lMBSvYA271f58zqeERX9BpVKak5ISczH0BzlfkiByNkDwuyH4rRju" +
+            "PdaRPAiArxoRU8Wl7e3diwyGtorJyUmmw7564ca/EHZ9Ssqieszp1wUHBzp4KseNhLinKBOG+IcjvtLzf3RPkTOX4nEA8FVPTEzk" +
+            "Nje3RnV29pzh41wN0VBNCQlxpdDzmeHh4YtdLc/H+W2UkoPo9RkQ/guU0klv0OM1APDMmM1Dm7Xa5ua+PtN5Ps6ZMCws9CwEHxMV" +
+            "pShCfgovZndOIiErIiLk38Fw3+NNRrwOAMYc1q9T+/r618M+qBodHWXHxFi0XR7Lt59hqDempiZvQi/x1Kkcu2hxPRHVYxNtH/R8" +
+            "vlwuv+R6eY6X4BMA8GTCPljT2tqZ3NLSrrFYrAN8/M1CqVRyNjU1pRrLtyth7HnrVM7NSHFH3BA6weMREWFLFQr52+4o0NkyfAoA" +
+            "nuixsfG8piZjcHd3XyUfx4eUkhbo+ZNZWZl5YWEhq/l4kYYcIfT3GO5VCkXEM5TSceLmj6PFCQIAV4kOMZkG12q1Rv3g4NDUBgeG" +
+            "xfcg+BDoeXZmXgincq6S6kxAz2MJfVVkZPjfgK8uZ0rwRB4hAWCKP46zpnd19aQ1NRm+TEyMW48pnjfu/Zmq2xN/oOPZGshdEHxu" +
+            "VFT4Z56ow5UyBQcAnpne3v6BgwePxF++XFcGfTnMx4soHAGt/wrBs+XbE/hfkE6wAGCtZbVaySefnM3/3e/+exzrB2zaCB3K3gja" +
+            "MxqPBQRImOCfopSOCZlaQQOAb7iRkZHoN988uf6ddz64DIOxjo8XYFiFDZu8yEj5X4eFhbULkL4bSBIFAHiq29o6sg8dOpp17twF" +
+            "DcfZOvh4AYRthND7IiLCc7Bhw0YqIpaPqADAN2pNzed5r756JL6hQce+ZDrKx/sgZMP7z4eHwzMjI8OPYLhnw78PyHC+SlECgLFr" +
+            "sVjIhx9+sunIkT/0Y1XxAovzsn/TZgtYEhkpfyIxkTKDz8vVX1+ds0+iBQDPsNlsTjx+/O11J0/+uWZiYlLLx3sqpJR8hg2bfAh+" +
+            "f1RUSLOn6vFWuaIHAN9QLS2tqw4efE118WJNmc3GeWJDpROC/5ZcHr4KGzbn+HrFHvoNAHhBnD9flQ8gRDU1Gc8ibgLeVTfBcfS5" +
+            "0dFhFQR/mAIFrhYopPx+BwDWuLAPpB988OGmY8febDOZzDfsL7A09niOIyexMokNm/BH4uPjxbgYNSebfgkAnuv+flPa0aN/WHvq" +
+            "1EcXAQpH9PUlbNgUYqfuToVCwe4s5Iv0u9CvAcBLS6drznn11ddSMX3EtJGb7VhaD8eR72E+v0Iul5/m8/tzOC8AwATIQbJYQNp0" +
+            "6NCRoJaWtjLEWeB5x45f/ZvVOpmBXv8K9LyNf+Hv4bwBAC/I8fHJsJMnT+UfP/6Wdmho+AtCuFOE2LIxrXsoOjraxKcTS+gqnfMO" +
+            "AHyDAQiWnp6Bgb4+E+npGeSj51047wAQGhpmLinZ9pfdu9XZcnnYJmiGEkpJvVZreLG2ttsrV7MJCWXzCgA5OavL77hDLceGzQ2X" +
+            "VFJKHwwKGtPp9S3sfiMhyeimtIDO23U64x91upb3tFqj03cvSm5aup9FxsbGntu3b09tRoZywxysxcBYfAUNekmvNxbOkdYnrxsb" +
+            "O2JB22HQya7a3UkIt5tSckynM7BfR3WYJr8GAPbkG3fs+HrZ1762eWNgYIDd9wGgQW+DaijV6Yxv6fV6QdwX1NDQEAxgPiqRTDaC" +
+            "tvtvlDR9HLQ6fKmVXwIAwp4sLMw/Az2/CMu3+Tc2lt0xezkuoFavN/yio6MjzO5cbk6I+g9IpSG1AOYzKHoWOyVgxm9uI99Nnd8B" +
+            "YPny7NP79t1hTkiI3wyOQ+BddcEcRx8bGZlsgN69D0Ov176FBP2+UqczlKH+Exjq5xyJrFaJwyen/QYAMTGKi3v37qpetmxpASH0" +
+            "ugssiHs+CRD+73U6Y2VTU0uee4q8eSm8nofQqwmhN71tlbjpI3oAYMm2befO7ZXbtm3NCQoK9vgXRyilq7HdXI7eecJgMCS6SQ5T" +
+            "xdxEz3tcPh6vYIozD/yRyYLJli2bqyH8WIBgrQeqmKNI7oDFQht0OsOTML5cuquPVQQDb69UKrtCKZlDz7PU7vOiA4AE23Tr1q3+" +
+            "fM+enaNxcbGsxzus99zXfCSUEPoUxwXUMUONOPHBSDKl5yH4t5A9Hd6rTlQASE1Nqt23b3eXSqVcQSl1h4HnrsZOYYaaTmc8wwRq" +
+            "T6He1POz0SMKAAQHy/rU6q2VGzbkLpFKA2JnY8jH7zbBcPuLXm88XFfXdtO7lHyh52drE8EDYM2a20vvvHNHkEKh8IGen63pZn7H" +
+            "ceT+wECrHiPCP1+byld6/loapv8vWABA4Ir9+/+qYfHijCIM92K8CILR/BxGg8aamro9UA1nKSUe1fMBAZzD5xgEBwAYeQ0qVfqX" +
+            "GzasWyaVSrz6C1rTe4erz1g36Onu7mvt6Gh/u7FRL5+YGHf5eNlsNGFW4rA8Hc4wGwEuvhtNSIi7kJeXkxkfH7vMxbJ8nn10dPQM" +
+            "hB7c29vPViQlVqt1JVYSUw2G1jNWq83t9/05y7AgACCXh2uwVWtRKtPWOcuIUPJZLJZqvd7QZDC0bcaC0fR1e+no6NhmrVYv6erq" +
+            "PoMR4tpjaT5hwacACAoKrF6+fGnLihXZefh/emP5pEGcrRTC1nZ09FzSaptXT0xMzrpuDyNR0d8/uLm+vslgNpvZtq6z1bqczycA" +
+            "oJQaUlNTatDrV2O3LsllLnxYAHpxZ1dX758aGnSpJpMp2zFSbMq2tq5VOp3hAkDjyLF1x6qZJbXXAbBwYUw5DLyUpKSEVbPQJYpX" +
+            "IyOjpxsamoL6+wd2gGCnVyQnJyfXQW0ktLS0n7bZbGaU5TXnNQCEhoZqVq9eObB4sWquUzleY97ZitBb34eB12g0thVwnC3K2XKm" +
+            "5QsaHh4pAKDGMHNgx9YdntJNK8+uR48DQCqVsivbtatWLc8LCZE5fGLFLi68lIjjuMrm5pbTer1hNyx5V38wegaquYV9ff359fX6" +
+            "xqGhUY9fHukxAMDQ6U5OTqrMzV27fMGCaNUM3IokmtN3dfW9X1+vWzE2Nl7gDaI5zra4tbUtG2Arn5y0tNtTp1cWgjjOOudXr6Oj" +
+            "o89t2JATnpKySDTLSc822AAABqtJREFUtzM0sAXD8qm6Ol14f3//bqTx+hX0UDfsJ3ki29o6P+U4btbbUCwWx+0Hh0eAe+7ZP+Ml" +
+            "TSEhwRdXrlzetXRp5kas6Alptw6yc8zBGLuMubwOhlkJci6E96ULNZuHCjEC9fX2mjQzERIaGuDwSqPDALha+XW/CySVSthPsNWt" +
+            "Xn17Tnh4qJB3666SP3Ngs3Hazs7ucw0N+tuwmrd45pQ+ebOop6cnDwboF1BF9ddTwF1JTEx0+KoaZwHA/2qYOTEx/nxubs7i2NgY" +
+            "h0+kXs+Az5/GTKah0sZG3aKBgUGPnsNzlVMYoMthjGbAn8OwP7WsjLWV/3CmXKcAEBxsOyqXy0vXr19D0tNT16Nip8pBPkG48fHJ" +
+            "Chhbgx0dnUUwXmWCIGpuIiQYBTZiWTmwu7v3f0JCAg/PneXGFE4Jbv/+/ably297OSAgQNTLt1YrV9HcbLzU1GTIhbElVtUlx4bT" +
+            "YWdvMHEKAAxHKlXyOwh/DS9CR7uxfFuG4T53bGzCweVbwbH7eElJETtn4BRhTgOA1aZUJv8A4Y/grfBicObBwSk9j2ndQL4YCJ6d" +
+            "Ru6nanUhO0U8e7JZ3roEAFYuQPA8x9nYFymnjBEWJ0Q/Pj4BA09vam/vLLJabaKeolJKrlDKbVOri3hj3OkmdxkArGaVKrVMKrWx" +
+            "pdGX2LOQPMdxhtbWjs+bmoxM8KLeeUS7miH4fyguLrytuLjo//DssnMLABgVqamp/RgN/hFWNObOnMd/747VOZsHHd0wjsrr6/Up" +
+            "Q0PDK2ZLK5J3JySSwAwI/mV30us2APBEwThsUCpT2HfWCzFUeXwzg6/3mnBsZGTkYxh4sp6ePuw8iu7+5mtYIQRArrLZbLlqdeFd" +
+            "27dvdPtPzbgdADz16enJp+HZ2b7vIK4b3uMO++pndTpDp9HY/jWbjRP1FBWN1Y4OdG9JSeHaHTu2eOwKeo8BAAxMOaiFg6Ghgelg" +
+            "5tmpCA/8gVFXCz1fDeFvAghSPVCFN4scQr9/UibjlMXFhUc9XbHHAcAYYIsUGA0eI0SaBubeYHHu8AAVtml7/9TYqM+AnmffE3RH" +
+            "sb4qA7qKew16XqVWF/2sqKiI/RaBx2nxCgB4LpTKxGbYBwcopXmIc/oOX+QlTM/X1WkVrh7HYmX52qM9zkskthwI/pu8nvcWTV4F" +
+            "AM9UenpSBVRDDiH0XkJIC7zdzmKxXMSUTsf0PAwkdx3Hsrt+dyYE/Q0Q/oHi4oLc7du3VLmzbHvL8gkAeOKUyqSjlFoyoRZ+jLhZ" +
+            "DztAz9cYjW1ntNrmHCzqKJFetA6C7wTx3w8J4TCfL3gD//vM+RQAjOv09PQxqIWnJRKrilLyXyxumu8bHDSfhZ7PHhkZZd+ymfZa" +
+            "VI8TEP5zUuk49Hzhb6Hn5/cXQ64VXVpaWnt6evLfEkJvJ4RM3dQ9NDT0bn29ztre3rUJcV4/joU63ejox1ardCmmdY9s375dML89" +
+            "4PMRYHoLQy18plQmF7a1te9tbe1cgaVcXx/Hmk6io8869PrdanXB1p07Nzl8ZMvRyhxNLzgA8Azk5697R60uzMDa97cRd90RNDyL" +
+            "wY1yHH0UPKjQ632+ND5TgwkWADzBxcVFhwICJlV4PgQvFneCUgkEX/BLoRMseACwBty2bZsJPenbNqyJ41lwv8ANmnintdloAWi9" +
+            "q7h4s1M/HcsX5K1QFADgG4OtiaNxYSTSbyLOCC8Ux4b7J0Bbxo4dBWeEQpQ9dIgKADxDMKhew1r5YhiILyDOBu8zx3Hk+NXh3qnb" +
+            "un1G+NWKRQkARnsR1spLSooe5jjKvn30KYvzpuc4MrVNW1JSeLdYhvubtY9oAcAzU1JSUIOht0giIV9HnDfsA69s04IXrzjRA4Bv" +
+            "pe3bCz8CEGAfcPcgrgPe3W5Kz0P1eGWb1t3Ez1Se3wCAZ1CtLnrdYgln08bn+ThXQyxRH+H1PFM9rpYnpPx+BwDWuLt2rR1Rqwt/" +
+            "BKGtwfOMX6bEu1kdBH8FhmZecXHhfWLW87Mx6ZcA4BmG0KoBhA2E0DtgtLEdOGLnZ5BS+iAEf1tJSVGFnXlcSuarzH4NAL5RMW18" +
+            "PyjIko1t58cQN9v5gzZKyY8tFk5VXFzw70jr925eAIBJcevWrb1qddGzanVhMiG2rRzW6Qnhfso8+x97DtvwbhF6/dO7dhXNeQkG" +
+            "K9Mf/LwBwLXCUqu3fIzp4y/V6qKfMM/+L3bTFy2urUcM/89LAIhBMN6i8RYAvNXSAq3nFgAEKhhvkXULAN5qaYHWcwsAPhaMr6v/" +
+            "fwAAAP//IJE+vAAAAAZJREFUAwCzcFB5fjZ2hgAAAABJRU5ErkJggg==";
 
         const string IC_ZAI =
             "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMA" +
@@ -2632,6 +3936,21 @@ namespace QuotaWidget
             "+BWoMoIpEPXtrOC7r6h5j//aDBdLHw+d37vG/eQUMJ/kJi6UklQdofSHlLUwqKYFwQg6v1uHEEVOhBOmcsSJU1fMffrGBgh/" +
             "17pxojy+8U19HsPzSaWvVx/YFF2bGBhEvvcZq/5ARkddcp36RBsV6AfEFKTCZ6gdiBMOUfi/pb43Dza1BMQguSK3eI5Cr35U" +
             "Zh0ZJL0JOruXasB4KBngQXiMgcOG8I9TbHy5Rhj3AwAA//9U1hhvAAAABklEQVQDAFqzHWP+HZgfAAAAAElFTkSuQmCC";
+        // 小米 MiMo：官方 wordmark 里的"M"字形（24 网格两段描边，与 zai.svg 同一条渲染管线转 64px）。
+        // 单行 wordmark 在 18px 下无法辨认，故只保留最具识别度的首字母
+        const string IC_MIMO =
+            "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAC80lEQVR4nOyav2sUQRTHv3faCBErkTQWojY2iv+EqIWFoiYa" +
+            "zwSE+Ot/sLGxFZsoYhIlhRgIWIgIVgqKhY0WgoiNoKJYiSThfI+dxeNu9+W93blZk5kPfLnk7czsvO/N7OzsXhuR00bkJAMQ" +
+            "OckARE4yAJGTDEDkWA0YIV0nLZE6+H+YQtYn7tuIpWLLUHYb6RVpb0/sHpo34j5prOf/96SDpN+aypug5wbpcF9sP2k3aRHN" +
+            "ME8a74ttJ30hvVbUx2bo2VUSP+M+zyIscxhMPmcflFiuAQ+EY2zCLMIxh3/GF6HOy2rAknCcR0AIE9ZK3oR1FThOeiocZxPm" +
+            "MZzlte3a1iSvvrhbO7pMOgLZBJ6Xs7CtMGvRdm2OwzNVvqnchMdCGe7obfgxYWjJ541XgU04BtmESdQ3gesOLXmmzlxdIR0l" +
+            "PRLKsAkzqA7XlZL/UBLvQomPi9VJyDdCfJt6B7aR0HJ1poQyfM7LqIkPA3gknIBsgmU6tFzZSaHMojtnV2hDha/lahV6EyQs" +
+            "ya/CAz7Xa60Jt0qOaZJfgMfkGd83LLkJC0KZaQyaoE1+DB6TZyybIWYr6RBpJ+kN6XlBGe5gvj09VdLOtPu8CFvy6qu7FosB" +
+            "vM18SxrtifEafa6gLHf0NOlPyXGGTVh2fZCSvysc7xrjA1imAHditC82Qdoh1DkPeTpcRTYKymCDpaWwZYwPYDHggDHO8DfB" +
+            "Q7fKLpHrdDCEYd+LZQr8KomvQIYT6Li/J6AjSPJMqKfCuQmakTCDQMkz1lWgDpqRwMlfQEBCvxfITSjaIAVPnmnixQibwIle" +
+            "Qfb09jPpEqolX3sZDDkF+rnpVIegy+CGJBmAyEkGIHKSAYicZAAiJxmAyIneAMtm6GdJ/Dua40dJXN0nywh4VhD7RnqH5uBz" +
+            "fy2IP4ESy6/EPiJ7LsjvBLaQXiLbw39Cc/DzyBekPcge2/Pb4mukh9oGfP6KY12SVgFETjIAkZMMQOQkAxA5yQBETjIAkfMX" +
+            "AAD//xiW8p4AAAAGSURBVAMAxtuHICs0LiEAAAAASUVORK5CYII=";
         const string IC_MINIMAX_COLOR =
             "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAKt0lEQVR4nOxaDZBWZRU+573fLrDAAstP2w4byYDE34haNCB/" +
             "jkhjtEEoZqBIhmaWIJCNjg1jpQ3TDxk4TcOkAqaJMJAwRA5sAWYUECYOIpo5QvwvP7urBLvffU/nvb/v/fnu9613P5ZmPczy" +
@@ -2909,18 +4228,19 @@ namespace QuotaWidget
             catch { _menu = null; Floating.SetContextMenuOpen(false); menu.Dispose(); throw; }
         }
 
-        public void ApplyConfig(List<ProviderConfig> previousProviders = null, int previousRefreshSec = 0)
+        public void ApplyConfig(List<ProviderConfig> previousProviders = null, int previousRefreshSec = 0, bool persist = true)
         {
-            Cfg.Save();
-            Config.SetAutoStart(Cfg.AutoStart);
+            if (persist)
+            {
+                Cfg.Save();
+                Config.SetAutoStart(Cfg.AutoStart);
+            }
             if (previousProviders != null) PreserveRefreshSchedule(previousProviders, previousRefreshSec);
             ResetProviderDisplay(); // 保存后立即移除停用项，不等待旧请求完成。
             ApplyFloatingConfig();
             UpdateTrayTip();
             RefreshDue(false);
-            // 保存后变得无可查询供应商（把最后一个供应商删掉并保存）：别让窗口停在"正在获取"，
-            // 把设置页重新推到前面（此时设置窗正在 Close，_settings 会被置为新实例），
-            // 用户才有下一步可走。首次打开时用户尚未点过保存，不会命中这里
+            // 删除最后一个供应商后，若设置页不在显示则重新打开，方便继续配置。
             if (!IsConfigured && !Cfg.AllProvidersDisabled && (_settings == null || _settings.IsDisposed || !_settings.Visible))
             {
                 UpdateTrayTip();
@@ -2991,7 +4311,7 @@ namespace QuotaWidget
             }
         }
 
-        private void ApplyFloatingConfig()
+        internal void ApplyFloatingConfig()
         {
             Floating.ApplyFromConfig();
             if (Cfg.LockPosition) Floating.RestoreFromEdge();
@@ -3307,6 +4627,16 @@ namespace QuotaWidget
             ApplyFromConfig();
         }
 
+        // 滑杆拖动时只更新透明度，不重建布局或重置查询、吸附计时器。
+        public void ApplyOpacity(int percent)
+        {
+            int pct = Math.Max(50, Math.Min(100, percent));
+            LayeredAlpha = (byte)(255 * pct / 100);
+            _detail.LayeredAlpha = LayeredAlpha;
+            UpdateLayered();
+            if (_detail.Visible) _detail.UpdateLayered();
+        }
+
         public void ApplyFromConfig()
         {
             _trayRevealTimer.Stop();
@@ -3323,11 +4653,7 @@ namespace QuotaWidget
 
             // 主题与不透明度应用到两个分层窗口并立即重绘
             St.Theme = cfg.Theme == "dark" ? 1 : 2;
-            int pct = Math.Max(50, Math.Min(100, cfg.OpacityPct));
-            LayeredAlpha = (byte)(255 * pct / 100);
-            _detail.LayeredAlpha = LayeredAlpha;
-            UpdateLayered();
-            if (_detail.Visible) _detail.UpdateLayered();
+            ApplyOpacity(cfg.OpacityPct);
 
             _refreshTimer.Stop();
             _refreshTimer.Interval = 1000; // 每秒检查独立到期时间，未到期的供应商不发请求。
@@ -4191,17 +5517,23 @@ namespace QuotaWidget
         protected override void OnLayeredPaint(Graphics g)
         {
             var fs = St.FontsForScale(_dpi); // [0]=FTitle [1]=FNorm [2]=FSmall [3]=FPct
+            var pal = SettingsPal.For(St.Theme == 1);
             using (var path = St.RoundRect(new Rectangle(0, 0, Width - 1, Height - 1), Si(12)))
             {
-                using (var brush = new SolidBrush(St.Card))
+                using (var brush = new SolidBrush(pal.Win))
                     g.FillPath(brush, path);
-                using (var pen = new Pen(St.Border, 1f))
+                using (var pen = new Pen(pal.Line, 1f))
                     g.DrawPath(pen, path);
             }
 
             int y = Si(14);
-            foreach (var p in _ctx.Providers)
+            for (int i = 0; i < _ctx.Providers.Count; i++)
             {
+                // 分割线居中放入供应商之间的留白，首尾不额外画线。
+                if (i > 0)
+                    using (var pen = new Pen(pal.Line, 1f))
+                        g.DrawLine(pen, Si(16), y - Si(5), Width - Si(16), y - Si(5));
+                var p = _ctx.Providers[i];
                 // 标题行左侧品牌图标：浅色主题用彩色源、深色主题用白色变体，随主题自动切换；
                 // 图标垂直对齐标题行文字中心；未定义图标的类型回退为原来的彩色圆点
                 bool dark = St.Theme == 1;
@@ -4211,7 +5543,7 @@ namespace QuotaWidget
                 else
                     using (var b = new SolidBrush(St.AccentFor(p.Type)))
                         g.FillEllipse(b, Si(16), y + Si(6), Si(9), Si(9));
-                using (var b = new SolidBrush(St.Text))
+                using (var b = new SolidBrush(pal.Text))
                     g.DrawString(p.DisplayName, fs[0], b, Si(36), y + Si(2));
                 string right = string.IsNullOrEmpty(p.Level) ? "" : p.Level;
                 if (!string.IsNullOrEmpty(right))
@@ -4224,10 +5556,11 @@ namespace QuotaWidget
                         int pad = Si(8), ph = Si(17);
                         int pw = (int)Math.Ceiling(ink.Width) + pad * 2;
                         var pill = new Rectangle(Width - Si(16) - pw, y + Si(2), pw, ph);
-                        using (var b = new SolidBrush(St.AccentForFixed(p.Type)))
+                        bool available = p.Type == "ds" && right == "可用";
+                        using (var b = new SolidBrush(available ? pal.GreenBg : pal.Pill))
                         using (var path = St.RoundRect(pill, Si(8)))
                             g.FillPath(b, path);
-                        using (var b = new SolidBrush(Color.White))
+                        using (var b = new SolidBrush(available ? pal.Green : pal.PillText))
                         using (var sf = new StringFormat(StringFormat.GenericTypographic))
                             g.DrawString(right, fs[2], b,
                                 pill.Left + pill.Width / 2f - ink.X - ink.Width / 2f,
@@ -4240,7 +5573,7 @@ namespace QuotaWidget
                 {
                     string msg = p.Error;
                     if (msg.Length > 46) msg = msg.Substring(0, 46) + "…";
-                    using (var b = new SolidBrush(St.Red))
+                    using (var b = new SolidBrush(pal.Danger))
                         g.DrawString("⚠ " + msg, fs[2], b, Si(36), y + Si(4));
                     y += Si(34);
                 }
@@ -4250,37 +5583,38 @@ namespace QuotaWidget
                     {
                         if (pool.IsMoney)
                         {
-                            using (var b = new SolidBrush(St.Text))
+                            using (var b = new SolidBrush(pal.Text))
                                 g.DrawString(pool.Label, fs[1], b, Si(36), y);
                             string moneyTxt = pool.Currency + St.FmtMoney(pool.Remaining);
                             var msz = g.MeasureString(moneyTxt, fs[1]);
-                            using (var b = new SolidBrush(St.Text))
+                            using (var b = new SolidBrush(pal.Text))
                                 g.DrawString(moneyTxt, fs[1], b, Width - msz.Width - Si(18), y);
                             y += Si(22);
                             continue;
                         }
                         int pct = Math.Max(0, Math.Min(100, pool.Percent));
                         int remain = 100 - pct;
-                        Color c = St.RemainColor(remain);
-                        using (var b = new SolidBrush(St.Text))
+                        // 额度进度和百分比固定使用浅色状态色，深色下也保持相同浓度。
+                        Color c = SettingsPal.For(false).RemainColor(remain);
+                        using (var b = new SolidBrush(pal.Text))
                             g.DrawString(pool.Label, fs[1], b, Si(36), y);
                         string pctTxt = remain + "%";
                         var psz = g.MeasureString(pctTxt, fs[1]);
                         using (var b = new SolidBrush(c))
                             g.DrawString(pctTxt, fs[1], b, Width - psz.Width - Si(18), y);
                         y += Si(19);
-                        St.DrawBar(g, new Rectangle(Si(36), y, Width - Si(54), Si(6)), remain, c);
+                        St.DrawBar(g, new Rectangle(Si(36), y, Width - Si(54), Si(6)), remain, c, pal.Track);
                         y += Si(11);
                         string nums = pool.PercentOnly
                             ? "剩余 " + St.FmtNum(pool.Remaining) + "%" + (string.IsNullOrEmpty(pool.Note) ? "" : "　" + pool.Note)
                             : "已用 " + St.FmtNum(pool.Used) + " / " + St.FmtNum(pool.Total) + "　剩余 " + St.FmtNum(pool.Remaining);
-                        using (var b = new SolidBrush(St.Dim))
+                        using (var b = new SolidBrush(pal.Text2))
                             g.DrawString(nums, fs[2], b, Si(36), y);
                         if (pool.ResetLocal.HasValue)
                         {
                             string cd = "重置 " + St.FmtCountdown(pool.ResetLocal);
                             var csz = g.MeasureString(cd, fs[2]);
-                            using (var b = new SolidBrush(St.Dim))
+                            using (var b = new SolidBrush(pal.Text2))
                                 g.DrawString(cd, fs[2], b, Width - csz.Width - Si(18), y);
                         }
                         y += Si(15);
@@ -4772,6 +6106,8 @@ namespace QuotaWidget
         {
             Text = title;
             Pal = pal; Sf = scale; Fs = St.FontsForScale(scale);
+            // 子控件圆角外的底色必须与窗体实际绘制背景一致。
+            BackColor = pal.Win;
             FormBorderStyle = FormBorderStyle.None;
             StartPosition = FormStartPosition.CenterParent;
             ShowInTaskbar = false;
@@ -4818,6 +6154,8 @@ namespace QuotaWidget
             g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
             using (var b = new SolidBrush(Pal.Win))
                 g.FillRectangle(b, ClientRectangle);
+            using (var b = new SolidBrush(Pal.Side))
+                g.FillRectangle(b, 0, 0, Width, TitleH);
 
             var ic = new Rectangle(S(14), (TitleH - S(20)) / 2, S(20), S(20));
             IconFactory.DrawGlyph(g, ic);
@@ -4835,7 +6173,7 @@ namespace QuotaWidget
                 g.DrawLine(pen, cx - d, cy - d, cx + d, cy + d);
                 g.DrawLine(pen, cx + d, cy - d, cx - d, cy + d);
             }
-            using (var pen = new Pen(Pal.Line2))
+            using (var pen = new Pen(Pal.SectionLine))
                 g.DrawLine(pen, 0, TitleH - 1, Width, TitleH - 1);
             using (var pen = new Pen(Pal.Line))
                 g.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
@@ -4882,7 +6220,7 @@ namespace QuotaWidget
             {
                 if (primary)
                 {
-                    using (var b = new SolidBrush(hot ? SettingsPal.Mix(Pal.Primary, Pal.Win, 0.12) : Pal.Primary))
+                    using (var b = new SolidBrush(hot ? Pal.PrimaryHover : Pal.Primary))
                         g.FillPath(b, path);
                 }
                 else
@@ -4899,6 +6237,737 @@ namespace QuotaWidget
     }
 
     // ============================= 添加 / 编辑供应商（设置页同款风格） =============================
+    // GLM Coding Plan 团队版上下文：新版官方协议用 ?type=2 + bigmodel-organization/
+    // bigmodel-project 区分团队额度，个人版不需要。IDs 来自 bigmodel.cn 控制台的请求头。
+    internal class GlmTeamContextDialog : StyledDialogBase
+    {
+        private readonly TextBox _txtOrg, _txtProj;
+        private Rectangle _rcSeg, _rcOrg, _rcProj, _rcOk, _rcCancel;
+        private bool _team;
+        private bool _hotSeg, _hotOk, _hotCancel;
+        public string PlanType { get; private set; }
+        public string Organization { get; private set; }
+        public string Project { get; private set; }
+
+        public GlmTeamContextDialog(string planType, string org, string project, SettingsPal pal, float scale)
+            : base("Coding Plan 套餐上下文", pal, scale, new Size(St.SiF(420, scale), St.SiF(236, scale)))
+        {
+            _team = planType == "team";
+            _txtOrg = new TextBox { BorderStyle = BorderStyle.None, BackColor = pal.Win, ForeColor = pal.Text, Font = Fs[1], Text = org ?? "" };
+            _txtProj = new TextBox { BorderStyle = BorderStyle.None, BackColor = pal.Win, ForeColor = pal.Text, Font = Fs[1], Text = project ?? "" };
+            Controls.Add(_txtOrg);
+            Controls.Add(_txtProj);
+            KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Escape) { e.SuppressKeyPress = true; Close(); }
+                else if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; OnOk(); }
+            };
+            ApplyLayout();
+        }
+
+        private void ApplyLayout()
+        {
+            int x = S(20), w = S(420) - S(40);
+            int h = _team ? S(340) : S(236);
+            if (IsHandleCreated) Size = new Size(S(420), h); else ClientSize = new Size(S(420), h);
+            _rcSeg = new Rectangle(x, S(46) + S(38), w, S(34));
+            _rcOrg = _team ? new Rectangle(x, S(46) + S(112), w, S(34)) : Rectangle.Empty;
+            _rcProj = _team ? new Rectangle(x, S(46) + S(186), w, S(34)) : Rectangle.Empty;
+            _rcOk = new Rectangle(S(420) - S(20) - S(88), h - S(18) - S(34), S(88), S(34));
+            _rcCancel = new Rectangle(_rcOk.X - S(10) - S(88), _rcOk.Y, S(88), S(34));
+            _txtOrg.Visible = _team;
+            _txtProj.Visible = _team;
+            if (_team)
+            {
+                _txtOrg.Bounds = new Rectangle(_rcOrg.X + S(10), _rcOrg.Y + (S(34) - _txtOrg.PreferredHeight) / 2, _rcOrg.Width - S(20), _txtOrg.PreferredHeight);
+                _txtProj.Bounds = new Rectangle(_rcProj.X + S(10), _rcProj.Y + (S(34) - _txtProj.PreferredHeight) / 2, _rcProj.Width - S(20), _txtProj.PreferredHeight);
+            }
+            Invalidate();
+        }
+
+        private void OnOk()
+        {
+            if (_team && (string.IsNullOrWhiteSpace(_txtOrg.Text) || string.IsNullOrWhiteSpace(_txtProj.Text)))
+            {
+                StyledMsg.Show(this, "提示", "团队版请填写组织 ID 和项目 ID", Pal, Sf);
+                return;
+            }
+            PlanType = _team ? "team" : "personal";
+            Organization = _team ? _txtOrg.Text.Trim() : "";
+            Project = _team ? _txtProj.Text.Trim() : "";
+            DialogResult = DialogResult.OK;
+            Close();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            var g = e.Graphics;
+            DrawFieldLabel(g, "套餐类型", S(46) + S(10));
+            PaintSegmented(g);
+            if (_team)
+            {
+                DrawFieldLabel(g, "组织 ID（bigmodel-organization）", S(46) + S(84));
+                DrawFieldBox(g, _rcOrg, _txtOrg.Focused);
+                DrawFieldLabel(g, "项目 ID（bigmodel-project）", S(46) + S(158));
+                DrawFieldBox(g, _rcProj, _txtProj.Focused);
+            }
+            else
+            {
+                TextRenderer.DrawText(g, "个人版无需填写；团队版请填写控制台请求头里的组织 / 项目 ID",
+                    Fs[2], new Rectangle(S(20), S(140), ClientSize.Width - S(40), S(24)), Pal.Text2,
+                    TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+            }
+            PaintBtn(g, _rcOk, "确认", true, _hotOk);
+            PaintBtn(g, _rcCancel, "取消", false, _hotCancel);
+        }
+
+        private void PaintSegmented(Graphics g)
+        {
+            var r = _rcSeg;
+            int half = r.Width / 2;
+            var rl = new Rectangle(r.X, r.Y, half, r.Height);
+            var rr = new Rectangle(r.X + half, r.Y, r.Width - half, r.Height);
+            using (var path = St.RoundRect(_team ? rr : rl, S(8)))
+            using (var b = new SolidBrush(Pal.Sel))
+                g.FillPath(b, path);
+            using (var path = St.RoundRect(r, S(8)))
+            using (var pen = new Pen(_hotSeg ? Pal.CardHover : Pal.Line))
+                g.DrawPath(pen, path);
+            TextRenderer.DrawText(g, "个人版", Fs[1], rl, !_team ? Pal.Text : Pal.Text2, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+            TextRenderer.DrawText(g, "团队版", Fs[1], rr, _team ? Pal.Text : Pal.Text2, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+        }
+
+        private void DrawFieldLabel(Graphics g, string label, int y)
+        {
+            TextRenderer.DrawText(g, label, Fs[1], new Rectangle(S(20), y, ClientSize.Width - S(40), S(20)), Pal.Text, TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+        }
+
+        private void DrawFieldBox(Graphics g, Rectangle r, bool focused)
+        {
+            using (var path = St.RoundRect(r, S(8)))
+            using (var pen = new Pen(focused ? Pal.Primary : Pal.Line))
+                g.DrawPath(pen, path);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left) return;
+            if (_rcSeg.Contains(e.Location))
+            {
+                bool team = e.X >= _rcSeg.X + _rcSeg.Width / 2;
+                if (team != _team) { _team = team; ActiveControl = null; ApplyLayout(); }
+                return;
+            }
+            if (_rcOk.Contains(e.Location)) { OnOk(); return; }
+            if (_rcCancel.Contains(e.Location)) { Close(); return; }
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            bool hs = _rcSeg.Contains(e.Location), ho = _rcOk.Contains(e.Location), hc = _rcCancel.Contains(e.Location);
+            if (hs != _hotSeg || ho != _hotOk || hc != _hotCancel)
+            {
+                _hotSeg = hs; _hotOk = ho; _hotCancel = hc;
+                Invalidate();
+            }
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            if (_hotSeg || _hotOk || _hotCancel)
+            {
+                _hotSeg = _hotOk = _hotCancel = false;
+                Invalidate();
+            }
+        }
+    }
+
+    // ============================= 控制台 Cookie 获取 =============================
+    // MiMo / 千问 / 百炼都没有能用 API Key 调通的额度接口，鉴权是网页控制台的登录 Cookie。
+    // 「直接读本机浏览器里已登录的会话」这条路，本机实测过三条结论，三条都堵死：
+    //   1) Edge / Chrome 运行期间，Cookies 数据库被独占锁住，任何其它进程都读不了（20 次重试 / 14 秒全失败）；
+    //   2) Chrome 127+ 的 App-Bound 加密（v20）让外部解密不可行，且 136+ 禁止在默认配置目录上开调试端口
+    //      （dsh-ego-local-browser 也记录了这两条，所以他们改用浏览器扩展桥）；
+    //   3) MiMo 的登录态本身还是「会话 Cookie + HttpOnly」——实测把 655KB 的 Cookies 库复制出来，
+    //      xiaomimimo.com 的记录数是 0：它只存在浏览器内存里，复制或重启都拿不到。
+    // 所以只剩一条可靠路径，也是 dsh-subusage 的做法：开一个独立配置目录的窗口，让用户在里面登录一次，
+    // 再从 CDP 读 Cookie。拿到的是快照，之后是否还有效只由接口返回决定（阿里云控制台 Cookie 一般
+    // 能撑几周，MiMo 的会话 Cookie 更短——所以两者都不按时间主动作废）。
+    internal sealed class ConsoleSite
+    {
+        internal readonly string Type;           // 与 ProviderConfig.Type 一致
+        internal readonly string Brand;          // 界面文案里的品牌名
+        internal readonly string HostSuffix;     // CDP 取 Cookie 时按域名后缀筛
+        internal readonly string LoginUrl;       // 登录窗口打开的页面
+        internal readonly string LoginDirName;   // 独立配置目录名（同一家共用，登录一次长期免登录）
+        internal readonly string LogFileName;    // 诊断日志文件名
+        internal readonly string[] CookieNames;  // null = 收该域下全部 Cookie
+
+        internal ConsoleSite(string type, string brand, string hostSuffix, string loginUrl,
+            string loginDirName, string logFileName, string[] cookieNames)
+        {
+            Type = type; Brand = brand; HostSuffix = hostSuffix; LoginUrl = loginUrl;
+            LoginDirName = loginDirName; LogFileName = logFileName; CookieNames = cookieNames;
+        }
+
+        internal string LoginDir { get { return Path.Combine(Config.DataDir, LoginDirName); } }
+        internal string LoginPrompt { get { return "请在浏览器窗口中登录" + Brand + "账号…"; } }
+        internal string WaitingText { get { return "已打开浏览器窗口，" + LoginPrompt; } }
+    }
+
+    internal static class ConsoleBinder
+    {
+        private const int PollMs = 700;
+        private const int LoginSeconds = 300;
+        // 旧窗口收尾完成后才能启动新窗口，避免共用配置目录时误关下一次登录。
+        private static readonly SemaphoreSlim LoginGate = new SemaphoreSlim(1, 1);
+
+        // 千问与百炼共用同一个登录配置目录：两家控制台都是阿里云账号体系，
+        // 在千问平台登录会顺带在 .aliyun.com 上留一份 passport 会话，第二家通常直接免登录
+        internal static readonly ConsoleSite MiMo = new ConsoleSite("mimo", "小米",
+            "xiaomimimo.com", QuotaService.MimoConsoleUrl, "mimo-login", "mimo.log",
+            new string[] { "userId", "api-platform_serviceToken", "api-platform_slh", "api-platform_ph" });
+        internal static readonly ConsoleSite Qwen = new ConsoleSite("qwen", "千问",
+            "qianwenai.com", QuotaService.QwenLoginUrl, "aliyun-login", "aliyun.log", null);
+        internal static readonly ConsoleSite Bailian = new ConsoleSite("bailian", "百炼",
+            "aliyun.com", QuotaService.BailianConsoleUrl, "aliyun-login", "aliyun.log", null);
+
+        internal static ConsoleSite SiteFor(string type)
+        {
+            if (type == "bailian") return Bailian;
+            if (type == "mimo") return MiMo;
+            return Qwen;
+        }
+
+        // worker 线程写、UI 线程读；字段用 volatile 保证可见性
+        internal sealed class Progress
+        {
+            private volatile bool _cancel, _done;
+            private readonly CancellationTokenSource _cancellation = new CancellationTokenSource();
+            private volatile string _message = "", _cookie, _error, _summary;
+            public string Message { get { return _message; } }
+            public string Cookie { get { return _cookie; } }
+            public string Error { get { return _error; } }
+            public string Summary { get { return _summary; } }
+            public bool Done { get { return _done; } }
+            public bool Cancelled { get { return _cancel; } }
+            internal CancellationToken Token { get { return _cancellation.Token; } }
+            public void Cancel() { _cancel = true; _cancellation.Cancel(); }
+            internal void SetMessage(string m) { if (!_cancel) _message = m; }
+            internal void SetResult(string cookie, string error, string summary)
+            { if (!_cancel) { _cookie = cookie; _error = error; _summary = summary; } }
+            internal void Finish() { _done = true; }
+        }
+
+        internal static void AutoFetch(Progress state, ConsoleSite site, string existingCookie)
+        {
+            try
+            {
+                state.Token.ThrowIfCancellationRequested();
+                string cookie = QuotaService.ConsoleCookie(existingCookie);
+                if (ValidCookie(site, cookie))
+                {
+                    state.SetMessage("正在验证已有 Cookie…");
+                    string summary;
+                    if (Probe(site, cookie, out summary, state.Token))
+                    {
+                        state.SetResult(cookie, null, summary);
+                        return;
+                    }
+                    state.SetMessage("已有 Cookie 已失效，正在打开登录窗口…");
+                }
+                state.Token.ThrowIfCancellationRequested();
+                string found;
+                if (OpenLoginWindow(state, site, out found))
+                {
+                    state.SetResult(found, null, "已登录并获取 Cookie");
+                    return;
+                }
+                state.SetResult(null, state.Cancelled ? "已取消" : "没有拿到" + site.Brand + "登录 Cookie", null);
+            }
+            catch (Exception ex)
+            {
+                state.SetResult(null, Unwrap(ex).Message, null);
+            }
+            finally
+            {
+                state.Finish();
+            }
+        }
+
+        // 结构预检：只判"看着像"，真正是否有效一律由 Probe 打接口决定
+        internal static bool ValidCookie(ConsoleSite site, string cookie)
+        {
+            if (string.IsNullOrEmpty(cookie)) return false;
+            if (site.Type == "mimo") return QuotaService.IsMimoCookie(cookie);
+            return QuotaService.IsAliyunCookie(cookie);
+        }
+
+        // 轻量诊断日志：只记步骤和 Cookie 名字，不记 Cookie 值
+        internal static void Log(ConsoleSite site, string message)
+        {
+            try
+            {
+                string path = Path.Combine(Config.DataDir, site.LogFileName);
+                if (File.Exists(path) && new FileInfo(path).Length > 64 * 1024) File.Delete(path);
+                File.AppendAllText(path, DateTime.Now.ToString("HH:mm:ss.fff") + "  " + message + Environment.NewLine, Encoding.UTF8);
+            }
+            catch { }
+        }
+
+        // 可见窗口登录：拿到可用的 Cookie 之前，只有这一条路径
+        private static bool OpenLoginWindow(Progress state, ConsoleSite site, out string cookie)
+        {
+            state.SetMessage("正在准备登录窗口…");
+            LoginGate.Wait(state.Token);
+            try
+            {
+                state.Token.ThrowIfCancellationRequested();
+                return ReadFromProfile(site, site.LoginDir, true, LoginSeconds, state, site.LoginPrompt, out cookie);
+            }
+            finally { LoginGate.Release(); }
+        }
+
+        // 在指定配置目录上起一个浏览器窗口，轮询 CDP 直到拿到目标站点的 Cookie
+        private static bool ReadFromProfile(ConsoleSite site, string dir, bool visible, int seconds,
+            Progress state, string message, out string cookie)
+        {
+            cookie = null;
+            state.Token.ThrowIfCancellationRequested();
+            string cookies = Path.Combine(dir, "Default", "Network", "Cookies");
+            Log(site, "read: dir=" + dir + " visible=" + visible + " db=" + File.Exists(cookies));
+            string exe = FindBrowser();
+            if (exe == null) throw new Exception("未找到 Edge 或 Chrome，无法读取或打开登录页");
+            try { Directory.CreateDirectory(dir); }
+            catch { return false; }
+
+            Process proc = null;
+            int port = 0;
+            try
+            {
+                port = FreePort();
+                state.Token.ThrowIfCancellationRequested();
+                proc = Launch(exe, dir, port, visible, site.LoginUrl);
+                if (!WaitForCdp(port, 25000, state.Token))
+                {
+                    if (!visible) return false;
+                    throw new Exception("浏览器调试端口没有就绪，请关闭残留的登录窗口后重试");
+                }
+                state.SetMessage(site.WaitingText);
+                var deadline = DateTime.UtcNow.AddSeconds(seconds);
+                var started = DateTime.UtcNow;
+                while (DateTime.UtcNow < deadline)
+                {
+                    if (state.Cancelled) return false;
+                    int elapsed = (int)(DateTime.UtcNow - started).TotalSeconds;
+                    state.SetMessage(message + (visible ? "（已等待 " + elapsed + " 秒）" : ""));
+                    string found;
+                    if (TryReadCookie(site, port, out found, state.Token))
+                    {
+                        cookie = found;
+                        return true;
+                    }
+                    Task.Delay(PollMs, state.Token).GetAwaiter().GetResult();
+                }
+                if (visible) throw new Exception("等待登录超时（" + (seconds / 60) + " 分钟）");
+                return false;
+            }
+            finally
+            {
+                CloseBrowser(proc, port);
+            }
+        }
+
+        private static bool TryReadCookie(ConsoleSite site, int port, out string cookie, CancellationToken cancellation)
+        {
+            cookie = null;
+            cancellation.ThrowIfCancellationRequested();
+            var targets = PageTargets(port, cancellation);
+            if (targets.Count == 0) return false;
+            string ws = null;
+            // 尽量连在目标站点那个标签上（getAllCookies 本身与页面无关，这里只是选一个可用上下文）
+            foreach (var t in targets)
+                if (t[0].IndexOf(site.HostSuffix, StringComparison.OrdinalIgnoreCase) >= 0) { ws = t[1]; break; }
+            if (ws == null) ws = targets[0][1];
+
+            string json;
+            try
+            {
+                using (var cdp = new CdpClient(ws, 5000, cancellation))
+                {
+                    cdp.Call("Network.enable", "{}", 4000);
+                    // 返回整个配置目录的 Cookie，与当前标签停在哪个页面无关
+                    json = cdp.Call("Network.getAllCookies", "{}", 6000);
+                }
+            }
+            catch { return false; }
+
+            string header = CookieHeader(site, json);
+            Log(site, "cookies: bytes=" + json.Length + " kept=" + (header.Length == 0 ? 0 : header.Split(';').Length)
+                + " valid=" + ValidCookie(site, header));
+            if (!ValidCookie(site, header)) return false;
+            string summary;
+            if (!Probe(site, header, out summary, cancellation)) return false;   // 有 Cookie 不等于已登录，打一次接口验活
+            cookie = header;
+            return true;
+        }
+
+        // 验活 + 顺手拿到给界面显示的摘要：
+        //   MiMo：/balance → 「余额 ¥x」
+        //   千问 / 百炼：/tool/user/info.json → secToken 存在即已登录，再读一次 usage 拼「本月已用 x%」
+        internal static bool Probe(ConsoleSite site, string cookie, out string summary,
+            CancellationToken cancellation = default(CancellationToken))
+        {
+            summary = null;
+            cancellation.ThrowIfCancellationRequested();
+            if (site.Type == "mimo") return ProbeMimo(cookie, out summary, cancellation);
+            return ProbeAliyun(site, cookie, out summary, cancellation);
+        }
+
+        private static bool ProbeMimo(string cookie, out string summary, CancellationToken cancellation)
+        {
+            summary = null;
+            try
+            {
+                var headers = new Dictionary<string, string>();
+                headers["Cookie"] = cookie;
+                headers["Origin"] = "https://platform.xiaomimimo.com";
+                headers["Referer"] = QuotaService.MimoConsoleUrl;
+                string body = HttpGetText(QuotaService.MimoApiBase + "/balance", 8000, headers, cancellation);
+                var root = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(body);
+                if (root == null || (int)Math.Round(J.D(root, "code")) != 0) return false;
+                Log(MiMo, "probe: code=" + (root == null ? "null" : J.S(root, "code")));
+                var data = root.ContainsKey("data") ? J.Dict(root["data"]) : null;
+                if (data == null) return false;
+                double balance = J.D(data, "balance");
+                summary = "余额 " + QuotaService.MimoCurrencySymbol(J.S(data, "currency")) + St.FmtMoney(balance);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private static bool ProbeAliyun(ConsoleSite site, string cookie, out string summary, CancellationToken cancellation)
+        {
+            summary = null;
+            try
+            {
+                var headers = new Dictionary<string, string>();
+                headers["Cookie"] = cookie;
+                headers["Origin"] = QuotaService.AliyunConsoleOrigin(site.Type);
+                headers["Referer"] = QuotaService.AliyunConsoleUrl(site.Type);
+                headers["User-Agent"] = QuotaService.ConsoleUserAgent;
+                string body = HttpGetText(QuotaService.AliyunInfoUrl(site.Type), 8000, headers, cancellation);
+                var root = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(body);
+                if (root == null) return false;
+                // 未登录时这家回 {"code":"ConsoleNeedLogin","message":"请登录"}，HTTP 仍是 200
+                string code = J.S(root, "code");
+                var data = root.ContainsKey("data") ? J.Dict(root["data"]) : null;
+                if (data == null) { Log(site, "probe: code=" + code + "（无 data）"); return false; }
+                Log(site, "probe: code=" + (code == "" ? "ok" : code));
+                summary = "已登录控制台";
+                // 再读一次 usage，把「本月已用 x%」显示出来；失败不影响验活结论
+                try
+                {
+                    string secToken = J.S(data, "secToken");
+                    string usage = QuotaService.AliyunGatewayRequest(site.Type, cookie, secToken, "usage", cancellation);
+                    var pools = QuotaService.ParseAliyunPlan(usage, null, null, site.Type);
+                    if (pools.Count > 0)
+                        summary = pools[0].Label.Replace("额度", "") + "已用 " + pools[0].Percent + "%";
+                }
+                catch { }
+                return true;
+            }
+            catch { return false; }
+        }
+
+
+        // ---------- 浏览器与配置目录 ----------
+        private static string FindBrowser()
+        {
+            string progId = "";
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(
+                    @"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice"))
+                    if (key != null) progId = (key.GetValue("ProgId") as string) ?? "";
+            }
+            catch { }
+            var edge = EdgePath();
+            var chrome = ChromePath();
+            var list = new List<string>();
+            if (progId.IndexOf("chrome", StringComparison.OrdinalIgnoreCase) >= 0) { list.Add(chrome); list.Add(edge); }
+            else { list.Add(edge); list.Add(chrome); }
+            foreach (var p in list) if (!string.IsNullOrEmpty(p) && File.Exists(p)) return p;
+            return null;
+        }
+
+        private static string EdgePath()
+        {
+            string pf = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+            string pf86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+            string la = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            string[] paths = new string[]
+            {
+                Path.Combine(pf86 ?? "", @"Microsoft\Edge\Application\msedge.exe"),
+                Path.Combine(pf ?? "", @"Microsoft\Edge\Application\msedge.exe"),
+                Path.Combine(la ?? "", @"Microsoft\Edge\Application\msedge.exe")
+            };
+            foreach (var p in paths) if (File.Exists(p)) return p;
+            return "";
+        }
+
+        private static string ChromePath()
+        {
+            string pf = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+            string pf86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+            string la = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            string[] paths = new string[]
+            {
+                Path.Combine(pf ?? "", @"Google\Chrome\Application\chrome.exe"),
+                Path.Combine(pf86 ?? "", @"Google\Chrome\Application\chrome.exe"),
+                Path.Combine(la ?? "", @"Google\Chrome\Application\chrome.exe")
+            };
+            foreach (var p in paths) if (File.Exists(p)) return p;
+            return "";
+        }
+
+        private static int FreePort()
+        {
+            var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            listener.Stop();
+            return port;
+        }
+
+        private static Process Launch(string exe, string dir, int port, bool visible, string url)
+        {
+            // 新配置目录会被 Edge 用系统账号自动登录，同步气泡会挡住登录页，这里一并关掉；
+            // 无头模式则连窗口都没有，用户完全无感
+            string args =
+                (visible ? "" : "--headless=new --disable-gpu ") +
+                "--remote-debugging-port=" + port +
+                " --user-data-dir=\"" + dir + "\"" +
+                " --no-first-run --no-default-browser-check --no-service-autorun" +
+                " --disable-sync --disable-background-networking --disable-component-update" +
+                " --suppress-message-center-popups" +
+                " --disable-features=msEdgeSyncPromo,msImplicitSignin,msEdgeIdentityFRE,EdgeSyncPromo" +
+                " --new-window \"" + url + "\"";
+            return Process.Start(new ProcessStartInfo(exe, args) { UseShellExecute = false });
+        }
+
+        private static bool WaitForCdp(int port, int timeoutMs, CancellationToken cancellation)
+        {
+            var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+            while (DateTime.UtcNow < deadline)
+            {
+                cancellation.ThrowIfCancellationRequested();
+                try
+                {
+                    string body = HttpGetText("http://127.0.0.1:" + port + "/json/version", 2000, null, cancellation);
+                    if (!string.IsNullOrEmpty(body)) return true;
+                }
+                catch { }
+                Task.Delay(300, cancellation).GetAwaiter().GetResult();
+            }
+            return false;
+        }
+
+        private static void CloseBrowser(Process proc, int port)
+        {
+            if (proc == null) return;
+            // 无头实例直接结束；可见窗口走 Browser.close，保证会话/登录态写回配置目录
+            try
+            {
+                if (port > 0)
+                {
+                    string version = HttpGetText("http://127.0.0.1:" + port + "/json/version", 1500);
+                    var root = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(version);
+                    string ws = root == null ? "" : J.S(root, "webSocketDebuggerUrl");
+                    if (ws.Length > 0)
+                        using (var cdp = new CdpClient(ws, 2000))
+                            cdp.Call("Browser.close", "{}", 1500);
+                }
+            }
+            catch { }
+            try { if (!proc.HasExited && !proc.WaitForExit(4000)) proc.Kill(); }
+            catch { }
+        }
+
+        private static Exception Unwrap(Exception ex)
+        {
+            var agg = ex as AggregateException;
+            if (agg != null && agg.InnerExceptions.Count == 1) return Unwrap(agg.InnerExceptions[0]);
+            return ex;
+        }
+
+        // 只收目标站点自己的 Cookie，避免把其它站点的内容写进配置：
+        //   MiMo：只保留平台自己的四个（其它全是无关的埋点）；
+        //   千问 / 百炼：控制台要带整串 passport 与风控 Cookie，只能按域名全收（同名去重）。
+        // 同名取先出现的那个：CDP 按 domain 排序，先出现的通常是更具体的那一条
+        private static string CookieHeader(ConsoleSite site, string cookiesJson)
+        {
+            var parts = new List<string>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                var root = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(cookiesJson);
+                if (root == null) return "";
+                object resultObj;
+                if (!root.TryGetValue("result", out resultObj)) return "";
+                var result = resultObj as Dictionary<string, object>;
+                if (result == null) return "";
+                object cookiesObj;
+                if (!result.TryGetValue("cookies", out cookiesObj)) return "";
+                foreach (var raw in J.Each(cookiesObj))
+                {
+                    var item = raw as Dictionary<string, object>;
+                    if (item == null) continue;
+                    string domain = J.S(item, "domain");
+                    if (domain.IndexOf(site.HostSuffix, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    string name = J.S(item, "name"), value = J.S(item, "value");
+                    if (name.Length == 0 || value.Length == 0) continue;
+                    if (site.CookieNames != null)
+                    {
+                        bool wanted = false;
+                        foreach (var n in site.CookieNames) if (n == name) { wanted = true; break; }
+                        if (!wanted) continue;
+                    }
+                    if (!seen.Add(name)) continue;
+                    parts.Add(name + "=" + value);
+                }
+            }
+            catch { return ""; }
+            return string.Join("; ", parts.ToArray());
+        }
+
+        private static List<string[]> PageTargets(int port, CancellationToken cancellation)
+        {
+            var list = new List<string[]>();
+            string json;
+            try { json = HttpGetText("http://127.0.0.1:" + port + "/json/list", 2500, null, cancellation); }
+            catch { return list; }
+            if (string.IsNullOrEmpty(json)) return list;
+            try
+            {
+                var items = new JavaScriptSerializer().Deserialize<object[]>(json);
+                if (items == null) return list;
+                foreach (var item in items)
+                {
+                    var target = item as Dictionary<string, object>;
+                    if (target == null || J.S(target, "type") != "page") continue;
+                    string ws = J.S(target, "webSocketDebuggerUrl");
+                    if (ws.Length == 0) continue;
+                    list.Add(new string[] { J.S(target, "url"), ws });
+                }
+            }
+            catch { }
+            return list;
+        }
+
+        private static string HttpGetText(string url, int timeoutMs)
+        {
+            return HttpGetText(url, timeoutMs, null);
+        }
+
+        private static string HttpGetText(string url, int timeoutMs, IDictionary<string, string> headers,
+            CancellationToken cancellation = default(CancellationToken))
+        {
+            cancellation.ThrowIfCancellationRequested();
+            var req = (HttpWebRequest)WebRequest.Create(url);
+            req.Method = "GET";
+            req.Timeout = timeoutMs;
+            req.ReadWriteTimeout = timeoutMs;
+            if (req.RequestUri.IsLoopback) req.Proxy = null;   // 只对本机 CDP 绕过代理
+            req.UserAgent = "QuotaWidget/" + AppInfo.Version;
+            if (headers != null)
+                foreach (var header in headers)
+                {
+                    if (string.IsNullOrEmpty(header.Value)) continue;
+                    if (string.Equals(header.Key, "Referer", StringComparison.OrdinalIgnoreCase)) req.Referer = header.Value;
+                    else if (string.Equals(header.Key, "User-Agent", StringComparison.OrdinalIgnoreCase)) req.UserAgent = header.Value;
+                    else req.Headers[header.Key] = header.Value;
+                }
+            using (cancellation.Register(req.Abort))
+            using (var resp = (HttpWebResponse)req.GetResponse())
+            using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                return sr.ReadToEnd();
+        }
+
+        // 极简 CDP 客户端：一条命令一个 JSON 帧，按 id 匹配回包，忽略事件帧
+        private sealed class CdpClient : IDisposable
+        {
+            private readonly ClientWebSocket _ws = new ClientWebSocket();
+            private readonly CancellationTokenRegistration _cancelRegistration;
+            private readonly byte[] _buf = new byte[1 << 16];
+            private int _next;
+
+            public CdpClient(string url, int timeoutMs, CancellationToken cancellation = default(CancellationToken))
+            {
+                cancellation.ThrowIfCancellationRequested();
+                _cancelRegistration = cancellation.Register(_ws.Abort);
+                try
+                {
+                    using (var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellation))
+                    {
+                        cts.CancelAfter(timeoutMs);
+                        _ws.ConnectAsync(new Uri(url), cts.Token).GetAwaiter().GetResult();
+                    }
+                    if (_ws.State != WebSocketState.Open) throw new Exception("浏览器调试接口未就绪");
+                }
+                catch (Exception ex)
+                {
+                    Dispose();
+                    throw new Exception("浏览器调试接口连接失败：" + Unwrap(ex).Message);
+                }
+            }
+
+            public string Call(string method, string paramsJson, int timeoutMs)
+            {
+                int id = ++_next;
+                string message = "{\"id\":" + id + ",\"method\":\"" + method + "\"" +
+                    (paramsJson == null ? "" : ",\"params\":" + paramsJson) + "}";
+                var payload = Encoding.UTF8.GetBytes(message);
+                var cts = new CancellationTokenSource(timeoutMs);
+                try { _ws.SendAsync(new ArraySegment<byte>(payload), WebSocketMessageType.Text, true, cts.Token).Wait(timeoutMs); }
+                catch (Exception ex) { throw new Exception("浏览器调试接口无响应：" + Unwrap(ex).Message); }
+                var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+                while (DateTime.UtcNow < deadline)
+                {
+                    string text = Receive(timeoutMs);
+                    var reply = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(text);
+                    object idObj;
+                    if (reply != null && reply.TryGetValue("id", out idObj) && idObj != null
+                        && (int)Math.Round(Convert.ToDouble(idObj, CultureInfo.InvariantCulture)) == id)
+                        return text;
+                }
+                throw new TimeoutException("浏览器调试接口无响应");
+            }
+
+            private string Receive(int timeoutMs)
+            {
+                var sb = new StringBuilder();
+                var cts = new CancellationTokenSource(timeoutMs);
+                while (true)
+                {
+                    var result = _ws.ReceiveAsync(new ArraySegment<byte>(_buf), cts.Token).Result;
+                    sb.Append(Encoding.UTF8.GetString(_buf, 0, result.Count));
+                    if (result.EndOfMessage) return sb.ToString();
+                }
+            }
+
+            public void Dispose()
+            {
+                _cancelRegistration.Dispose();
+                try { _ws.Dispose(); } catch { }
+            }
+        }
+    }
+
     internal class ProviderEditDialog : StyledDialogBase
     {
         private static readonly string[] TypeItems = new string[]
@@ -4906,20 +6975,35 @@ namespace QuotaWidget
             "GLM 国内版 open.bigmodel.cn", "GLM 国际版 api.z.ai",
             "MiniMax 国内版 minimaxi.com", "MiniMax 国际版 minimax.io",
             "Kimi Code Plan api.kimi.com", "DeepSeek api.deepseek.com",
-            "Claude Pro/Max api.anthropic.com", "Codex (ChatGPT 套餐) chatgpt.com"
+            "Claude Pro/Max api.anthropic.com", "Codex (ChatGPT 套餐) chatgpt.com",
+            "小米 MiMo platform.xiaomimimo.com",
+            "千问 Token Plan platform-home.qianwenai.com", "百炼 Token Plan bailian.console.aliyun.com"
         };
         // 下拉项对应的品牌图标类型（与 TypeItems 一一对应，供 BrandIcons 染色绘制）
-        private static readonly string[] TypeIconTypes = new string[] { "glm", "glm", "mx", "mx", "kimi", "ds", "claude", "codex" };
+        private static readonly string[] TypeIconTypes = new string[] { "glm", "glm", "mx", "mx", "kimi", "ds", "claude", "codex", "mimo", "qwen", "bailian" };
+        // 下拉索引 ↔ 配置里的 type/region；不再用嵌套三元，避免新增接口时改错分支
+        private static readonly string[] TypeKeys = new string[] { "glm", "glm", "mx", "mx", "kimi", "ds", "claude", "codex", "mimo", "qwen", "bailian" };
+        private static readonly string[] TypeRegions = new string[] { "cn", "intl", "cn", "intl", "cn", "cn", "cn", "cn", "cn", "cn", "cn" };
 
         private readonly TextBox _txtKey, _txtName;
         private Rectangle _rcRefresh;
         private int _refreshSec;
-        private readonly Rectangle _rcSelect, _rcKeyBox;
-        private Rectangle _rcSeg, _rcNameBox, _rcOk, _rcCancel;
+        private Rectangle _rcSelect, _rcKeyBox;
+        private Rectangle _rcSeg, _rcNameBox, _rcOk, _rcCancel, _rcGlmMode, _rcGlmContext, _rcAuto;
         private int _typeIndex;
         private bool _showName;                    // 显示方式：false=图标(默认，悬浮窗展示图标+环形进度) true=显示名称
+        private int _glmMode;                      // 仅 GLM：查询内容 0=Coding Plan 套餐 1=钱包余额(¥) 2=钱包余额($)
+        private int _mimoMode;                     // 仅 MiMo：查询内容 0=Token Plan 套餐 1=账号余额
+        private string _glmPlanType = "personal";  // 仅 GLM 套餐：personal / team
+        private string _glmOrg = "", _glmProj = "";
         private readonly bool _providerEnabled;
-        private bool _hotOk, _hotCancel, _hotSelect, _hotSeg;
+        private bool _hotOk, _hotCancel, _hotSelect, _hotSeg, _hotGlmMode, _hotGlmContext, _hotAuto;
+        // 控制台 Cookie 型供应商的自动获取：worker 线程 + 定时器，状态直接写在 Cookie 输入框下方，不弹任何对话框
+        private ConsoleBinder.Progress _mimoState;
+        private System.Windows.Forms.Timer _mimoTimer;
+        private string _mimoStatus;
+        private string _mimoLoginAt;
+        private bool _mimoOk, _mimoFail;
         private SettingsPopupList _popup;
         public ProviderConfig Result { get; private set; }
 
@@ -4952,13 +7036,24 @@ namespace QuotaWidget
                 if (e.KeyCode == Keys.Escape) { e.SuppressKeyPress = true; Close(); }
                 else if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; OnOk(); }
             };
-            FormClosing += delegate { ClosePopup(); };
+            FormClosing += delegate
+            {
+                ClosePopup();
+                CancelMimoFetch();
+            };
+            FormClosed += delegate { if (_mimoTimer != null) { _mimoTimer.Stop(); _mimoTimer.Dispose(); _mimoTimer = null; } };
 
             // 编辑模式：用现有配置预填
             if (existing != null)
             {
                 _typeIndex = ProviderConfig.TypeIndex(existing.Type, existing.Region);
                 _showName = existing.ShowName;
+                _glmMode = existing.EffectiveGlmMode == "wallet" ? (existing.EffectiveGlmCurrency == "USD" ? 2 : 1) : 0;
+                _mimoMode = existing.EffectiveMimoMode == "balance" ? 1 : 0;
+                _mimoLoginAt = existing.MimoLoginAt;
+                _glmPlanType = existing.EffectiveGlmPlanType;
+                _glmOrg = existing.GlmOrganization ?? "";
+                _glmProj = existing.GlmProject ?? "";
                 // 预填解密后的真实 key（输入框本身以 ● 掩码显示）；密文解不开时留空待重填
                 _txtKey.Text = existing.GetKey() ?? "";
                 _txtName.Text = existing.Name;
@@ -4979,29 +7074,147 @@ namespace QuotaWidget
             string t = TypeIconTypes[_typeIndex];
             if (t == "codex") return "留空自动读取本机 Codex 登录凭证";
             if (t == "claude") return "留空自动读取本机 Claude 登录凭证";
+            if (t == "mimo" || t == "qwen" || t == "bailian") return "点「自动获取」或粘贴 Cookie";
             return "请输入 API Key";
         }
 
         // 字段纵向节奏：组间距 12（上组输入框→下组 Label），组内 Label→输入框 8，控件→按钮区 16。
-        // 名称模式追加名称输入组（加高 S(74)）
+        // 名称模式追加名称输入组（加高 S(74)）；GLM / MiMo 追加"查询内容"行（同样加高 S(74)）；
+        // 控制台 Cookie 型（MiMo / 千问 / 百炼）还要在 Cookie 行下面留一行状态（加高 S(26)）。
         private void ApplyLayout()
         {
             int x = S(20), w = S(400) - S(40);
-            int h = S(408) + (_showName ? S(74) : 0);
+            bool console = ConsoleVisible;
+            int modeExtra = ModeVisible ? S(74) : 0;
+            int statusExtra = console ? S(26) : 0;
+            int h = S(408) + statusExtra + modeExtra + (_showName ? S(74) : 0);
             // 本窗口吞掉了 WM_NCCALCSIZE,客户区即整个外框;句柄已创建后再设 ClientSize,
             // WinForms 会按 WS_THICKFRAME 用 AdjustWindowRectEx 补算边框,把窗口撑宽一圈,
             // 故运行期切换显示方式时直接设置外框尺寸(构造期仍走 ClientSize,创建句柄时正好抵消)
             if (IsHandleCreated) Size = new Size(S(400), h); else ClientSize = new Size(S(400), h);
-            _rcSeg = new Rectangle(x, S(46) + S(186), w, S(34));
-            _rcNameBox = _showName ? new Rectangle(x, S(46) + S(260), w, S(34)) : Rectangle.Empty;
+            // 控制台 Cookie 型供应商的凭证是 Cookie：「自动获取」按钮放在输入框左边，点一下静默抓取
+            _rcAuto = console ? new Rectangle(x, S(46) + S(112), S(88), S(34)) : Rectangle.Empty;
+            _rcKeyBox = console
+                ? new Rectangle(x + S(96), S(46) + S(112), w - S(96), S(34))
+                : new Rectangle(x, S(46) + S(112), w, S(34));
+            _txtKey.Bounds = new Rectangle(_rcKeyBox.X + S(10), _rcKeyBox.Y + (S(34) - _txtKey.PreferredHeight) / 2, _rcKeyBox.Width - S(20), _txtKey.PreferredHeight);
+            _rcGlmMode = Rectangle.Empty;
+            _rcGlmContext = Rectangle.Empty;
+            if (ModeVisible)
+            {
+                int modeY = S(46) + S(186) + statusExtra;
+                if (GlmVisible)
+                {
+                    // 套餐模式右侧留一个"个人版/团队版"按钮；钱包模式不需要上下文，下拉占满整行
+                    bool quotaMode = _glmMode == 0;
+                    _rcGlmMode = new Rectangle(x, modeY, quotaMode ? w - S(126) : w, S(34));
+                    _rcGlmContext = quotaMode ? new Rectangle(x + w - S(116), modeY, S(116), S(34)) : Rectangle.Empty;
+                }
+                else _rcGlmMode = new Rectangle(x, modeY, w, S(34));
+            }
+            _rcSeg = new Rectangle(x, S(46) + S(186) + statusExtra + modeExtra, w, S(34));
+            _rcNameBox = _showName ? new Rectangle(x, S(46) + S(260) + statusExtra + modeExtra, w, S(34)) : Rectangle.Empty;
             _rcOk = new Rectangle(S(400) - S(20) - S(88), h - S(18) - S(34), S(88), S(34));
             _rcCancel = new Rectangle(_rcOk.X - S(10) - S(88), _rcOk.Y, S(88), S(34));
             _txtName.Visible = _showName;
             _txtName.Bounds = new Rectangle(_rcNameBox.X + S(10), _rcNameBox.Y + (S(34) - _txtName.PreferredHeight) / 2, _rcNameBox.Width - S(20), _txtName.PreferredHeight);
-            _rcRefresh = new Rectangle(x, S(306) + (_showName ? S(74) : 0), w, S(34));
+            _rcRefresh = new Rectangle(x, S(306) + statusExtra + modeExtra + (_showName ? S(74) : 0), w, S(34));
             UpdateKeyBox();
             Invalidate();
         }
+
+        // 控制台 Cookie 自动获取：按钮 → 后台线程跑 ConsoleBinder.AutoFetch → 定时器把进度写到输入框下方
+        private void StartMimoFetch()
+        {
+            if (_mimoState != null || !ConsoleVisible) return;
+            ClosePopup();
+            ActiveControl = null;
+            _mimoState = new ConsoleBinder.Progress();
+            _mimoStatus = "正在检查已有 Cookie…";
+            _mimoOk = _mimoFail = false;
+            if (_mimoTimer == null)
+            {
+                _mimoTimer = new System.Windows.Forms.Timer { Interval = 200 };
+                _mimoTimer.Tick += delegate { PumpMimoFetch(); };
+            }
+            _mimoTimer.Start();
+            var state = _mimoState;
+            var site = ConsoleBinder.SiteFor(TypeKeys[_typeIndex]);
+            string existing = _txtKey.Text;
+            var worker = new Thread(new ThreadStart(delegate { ConsoleBinder.AutoFetch(state, site, existing); }));
+            worker.IsBackground = true;
+            worker.Start();
+            Invalidate();
+        }
+
+        // 先切断 UI 与旧任务的关联，再取消请求；旧线程即使晚到也不能回填新供应商。
+        private void CancelMimoFetch()
+        {
+            var state = _mimoState;
+            _mimoState = null;
+            if (_mimoTimer != null) _mimoTimer.Stop();
+            _mimoStatus = null;
+            _mimoOk = _mimoFail = false;
+            if (state != null) state.Cancel();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                CancelMimoFetch();
+                if (_mimoTimer != null) { _mimoTimer.Dispose(); _mimoTimer = null; }
+            }
+            base.Dispose(disposing);
+        }
+
+        private void PumpMimoFetch()
+        {
+            var state = _mimoState;
+            if (state == null) return;
+            if (state.Cancelled) { CancelMimoFetch(); Invalidate(); return; }
+            if (!string.IsNullOrEmpty(state.Message)) _mimoStatus = state.Message;
+            if (!state.Done) { Invalidate(); return; }
+
+            _mimoTimer.Stop();
+            _mimoState = null;
+            if (!string.IsNullOrEmpty(state.Cookie))
+            {
+                _txtKey.Text = state.Cookie;
+                UpdateKeyBox();
+                _mimoOk = true; _mimoFail = false;
+                _mimoLoginAt = DateTime.UtcNow.ToString("o");
+                string left = QuotaService.MimoLoginText(_mimoLoginAt);
+                _mimoStatus = "✓ " + (string.IsNullOrEmpty(state.Summary) ? "已获取 Cookie" : state.Summary)
+                    + (string.IsNullOrEmpty(left) ? "" : " · " + left);
+            }
+            else
+            {
+                _mimoOk = false; _mimoFail = true;
+                _mimoStatus = "✗ " + (string.IsNullOrEmpty(state.Error) ? "获取失败" : state.Error);
+            }
+            Invalidate();
+        }
+
+        // "查询内容"只对 GLM / MiMo 有意义：千问、百炼各自只有一个读数，其他接口仍按原布局显示
+        private bool GlmVisible { get { return TypeIconTypes[_typeIndex] == "glm"; } }
+        private bool MimoVisible { get { return TypeIconTypes[_typeIndex] == "mimo"; } }
+        // 凭证是控制台 Cookie 的三家（MiMo / 千问 / 百炼）：共用「自动获取」按钮 + 状态行
+        private bool ConsoleVisible
+        {
+            get
+            {
+                string t = TypeIconTypes[_typeIndex];
+                return t == "mimo" || t == "qwen" || t == "bailian";
+            }
+        }
+        private bool ModeVisible { get { return GlmVisible || MimoVisible; } }
+        // GLM 有 3 档（套餐 / 钱包¥ / 钱包$），MiMo 有 2 档（套餐 / 余额），共用同一行的下拉
+        private string[] ModeLabels { get { return GlmVisible ? GlmModeLabels : MimoModeLabels; } }
+        private int ModeIndex { get { return GlmVisible ? _glmMode : _mimoMode; } }
+
+        // 状态行文案里用的品牌名
+        private string ConsoleBrand { get { return ConsoleBinder.SiteFor(TypeKeys[_typeIndex]).Brand; } }
 
         private void ClosePopup()
         {
@@ -5012,16 +7225,23 @@ namespace QuotaWidget
         private void OpenTypePopup()
         {
             ClosePopup();
-            _popup = new SettingsPopupList(RectangleToScreen(_rcSelect), TypeItems, _typeIndex, Pal, Fs[1], Fs[1], Sf, delegate(int idx)
-            {
-                _typeIndex = idx;
-                // 名称仍为默认名时跟随接口切换（与旧对话框行为一致，手动改过则不动）
-                if (string.IsNullOrWhiteSpace(_txtName.Text) || IsDefaultName(_txtName.Text))
-                    _txtName.Text = ProviderConfig.TypeDefaultNames[idx];
-                ApplyLayout();
-                Invalidate();
-            }, TypeIconTypes);
+            _popup = new SettingsPopupList(RectangleToScreen(_rcSelect), TypeItems, _typeIndex, Pal, Fs[1], Fs[1], Sf, SelectType, TypeIconTypes);
             _popup.Show(this);
+        }
+
+        private void SelectType(int idx)
+        {
+            if (idx == _typeIndex) return;
+            bool differentProvider = TypeKeys[idx] != TypeKeys[_typeIndex];
+            CancelMimoFetch();
+            _mimoLoginAt = null;
+            // 不把上一家的 API Key / Cookie 带进另一家；同品牌切国内/国际仍保留输入。
+            if (differentProvider) _txtKey.Clear();
+            _typeIndex = idx;
+            if (string.IsNullOrWhiteSpace(_txtName.Text) || IsDefaultName(_txtName.Text))
+                _txtName.Text = ProviderConfig.TypeDefaultNames[idx];
+            ApplyLayout();
+            Invalidate();
         }
 
         private static bool IsDefaultName(string n)
@@ -5033,20 +7253,38 @@ namespace QuotaWidget
 
         private void OnOk()
         {
+            int i = _typeIndex;
+            string type = TypeKeys[i];
             // claude/codex 的 Key 可留空：自动读取本机 CLI 登录凭证（.claude/.credentials.json、.codex/auth.json）
-            bool localCreds = TypeIconTypes[_typeIndex] == "claude" || TypeIconTypes[_typeIndex] == "codex";
+            bool localCreds = type == "claude" || type == "codex";
+            bool consoleType = type == "mimo" || type == "qwen" || type == "bailian";
             if (string.IsNullOrWhiteSpace(_txtKey.Text) && !localCreds)
             {
-                StyledMsg.Show(this, "提示", "请填写 API Key（Claude / Codex 可留空自动读取本机登录凭证）", Pal, Sf);
+                StyledMsg.Show(this, "提示", consoleType
+                    ? "请先点「自动获取」抓取 Cookie（也可手动粘贴控制台 Cookie）"
+                    : "请填写 API Key（Claude / Codex 可留空自动读取本机登录凭证）", Pal, Sf);
                 return;
             }
-            int i = _typeIndex;
-            string type = i == 7 ? "codex" : i == 6 ? "claude" : (i == 5 ? "ds" : (i == 4 ? "kimi" : ((i == 2 || i == 3) ? "mx" : "glm")));
-            string region = (i == 1 || i == 3) ? "intl" : "cn";
+            string region = TypeRegions[i];
+            if (type == "glm" && _glmMode == 0 && _glmPlanType == "team" &&
+                (string.IsNullOrWhiteSpace(_glmOrg) || string.IsNullOrWhiteSpace(_glmProj)))
+            {
+                StyledMsg.Show(this, "提示", "团队版请填写组织 ID 和项目 ID", Pal, Sf);
+                return;
+            }
             // 图标模式不展示自定义名，名称固定回默认名；名称模式取输入（空则回默认）
             string name = _showName && !string.IsNullOrWhiteSpace(_txtName.Text) ? _txtName.Text.Trim() : ProviderConfig.TypeDefaultNames[i];
-            var r = new ProviderConfig { Type = type, Region = region, Name = name, ShowName = _showName, Enabled = _providerEnabled, RefreshSec = _refreshSec };
-            r.SetKey(_txtKey.Text.Trim());   // 明文仅存在于输入框与本次加密调用，配置文件里只落 DPAPI 密文
+            var r = new ProviderConfig { Type = type, Region = region, Name = name, ShowName = _showName, Enabled = _providerEnabled, RefreshSec = _refreshSec,
+                GlmMode = type == "glm" && _glmMode > 0 ? "wallet" : "quota",
+                GlmCurrency = type == "glm" && _glmMode == 2 ? "USD" : (type == "glm" && _glmMode == 1 ? "CNY" : null),
+                GlmPlanType = type == "glm" && _glmMode == 0 ? _glmPlanType : null,
+                GlmOrganization = type == "glm" && _glmMode == 0 && _glmPlanType == "team" ? _glmOrg.Trim() : null,
+                GlmProject = type == "glm" && _glmMode == 0 && _glmPlanType == "team" ? _glmProj.Trim() : null,
+                MimoMode = type == "mimo" ? (_mimoMode == 1 ? "balance" : "plan") : null,
+                MimoLoginAt = consoleType && !string.IsNullOrEmpty(_mimoLoginAt) ? _mimoLoginAt : null };
+            // 明文仅存在于输入框与本次加密调用，配置文件里只落 DPAPI 密文；控制台 Cookie 型顺带
+            // 去掉粘贴时带的 "Cookie:" 前缀与换行
+            r.SetKey(consoleType ? QuotaService.ConsoleCookie(_txtKey.Text) : _txtKey.Text.Trim());
             Result = r;
             DialogResult = DialogResult.OK;
             Close();
@@ -5060,18 +7298,46 @@ namespace QuotaWidget
 
             DrawFieldLabel(g, "接口", S(46) + S(10));
             PaintSelectBox(g, _rcSelect, TypeItems[_typeIndex], _hotSelect, TypeIconTypes[_typeIndex]);
-            DrawFieldLabel(g, "API Key", S(46) + S(84));
+            bool console = ConsoleVisible;
+            DrawFieldLabel(g, console ? "登录 Cookie" : "API Key", S(46) + S(84));
             DrawFieldBox(g, _rcKeyBox, _txtKey.Focused);
             // 占位提示：输入框隐藏（空且未聚焦）时才可见，聚焦后由真实输入框覆盖
             if (_txtKey.Text.Length == 0)
                 TextRenderer.DrawText(g, KeyHint(), Fs[1],
                     new Rectangle(_rcKeyBox.X + S(10), _rcKeyBox.Y, _rcKeyBox.Width - S(20), _rcKeyBox.Height),
                     Pal.Text3, TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
-            DrawFieldLabel(g, "显示方式", S(46) + S(158));
+            if (console)
+            {
+                PaintBtn(g, _rcAuto, _mimoState == null ? "自动获取" : "获取中…", false, _hotAuto);
+                // 状态行：成功绿、失败红、进行中/提示灰；不弹对话框，进度都写在这里
+                string status = _mimoStatus;
+                if (string.IsNullOrEmpty(status))
+                {
+                    string left = QuotaService.MimoLoginText(_mimoLoginAt);
+                    status = string.IsNullOrEmpty(left)
+                        ? "点「自动获取」打开登录窗口获取 Cookie"
+                        : "上次获取的 Cookie " + left;
+                }
+                Color color = _mimoOk ? Pal.Green : (_mimoFail ? Pal.Danger : (_mimoState != null ? Pal.Text2 : Pal.Text3));
+                TextRenderer.DrawText(g, status, Fs[2],
+                    new Rectangle(S(20), S(46) + S(154), ClientSize.Width - S(40), S(20)),
+                    color, TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+            }
+            bool mode = ModeVisible;
+            int statusExtra = console ? S(26) : 0;
+            int modeExtra = mode ? S(74) : 0;
+            if (mode)
+            {
+                DrawFieldLabel(g, "查询内容", S(46) + S(158) + statusExtra);
+                PaintSelectBox(g, _rcGlmMode, ModeLabels[ModeIndex], _hotGlmMode, "");
+                if (GlmVisible && _glmMode == 0)
+                    PaintBtn(g, _rcGlmContext, _glmPlanType == "team" ? "团队版" : "个人版", false, _hotGlmContext);
+            }
+            DrawFieldLabel(g, "显示方式", S(46) + S(158) + statusExtra + modeExtra);
             PaintSegmented(g, _rcSeg);
             if (_showName)
             {
-                DrawFieldLabel(g, "显示名称", S(46) + S(232));
+                DrawFieldLabel(g, "显示名称", S(46) + S(232) + statusExtra + modeExtra);
                 DrawFieldBox(g, _rcNameBox, _txtName.Focused);
             }
             DrawFieldLabel(g, "刷新间隔", _rcRefresh.Y - S(28));
@@ -5096,6 +7362,11 @@ namespace QuotaWidget
             TextRenderer.DrawText(g, "图标", Fs[1], rl, !_showName ? Pal.Text : Pal.Text2, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
             TextRenderer.DrawText(g, "名称", Fs[1], rr, _showName ? Pal.Text : Pal.Text2, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
         }
+
+        // GLM 查询内容：套餐与钱包二选一；钱包金额不随接口域名换算，因此币种跟随账户显式选择
+        private static readonly string[] GlmModeLabels = { "Coding Plan 套餐", "钱包余额（¥ 人民币）", "钱包余额（$ 美元）" };
+        // MiMo 查询内容：Token Plan 与账号余额是两个接口，共用同一份控制台 Cookie
+        private static readonly string[] MimoModeLabels = { "Token Plan 套餐", "账号余额" };
 
         private void DrawFieldLabel(Graphics g, string label, int y)
         {
@@ -5150,6 +7421,29 @@ namespace QuotaWidget
                     delegate(int idx) { _refreshSec = values[idx]; Invalidate(); });
                 _popup.Show(this); return;
             }
+            if (_rcGlmContext.Contains(e.Location))
+            {
+                using (var dlg = new GlmTeamContextDialog(_glmPlanType, _glmOrg, _glmProj, Pal, Sf))
+                {
+                    if (dlg.ShowDialog(this) == DialogResult.OK)
+                    {
+                        _glmPlanType = dlg.PlanType;
+                        _glmOrg = dlg.Organization;
+                        _glmProj = dlg.Project;
+                        Invalidate();
+                    }
+                }
+                return;
+            }
+            if (_rcAuto.Contains(e.Location)) { StartMimoFetch(); return; }
+            if (_rcGlmMode.Contains(e.Location))
+            {
+                ClosePopup();
+                var labels = ModeLabels;
+                _popup = new SettingsPopupList(RectangleToScreen(_rcGlmMode), labels, ModeIndex, Pal, Fs[1], Fs[1], Sf,
+                    delegate(int idx) { if (GlmVisible) _glmMode = idx; else _mimoMode = idx; ApplyLayout(); });
+                _popup.Show(this); return;
+            }
             if (_rcSeg.Contains(e.Location))
             {
                 bool toName = e.X >= _rcSeg.X + _rcSeg.Width / 2;
@@ -5177,9 +7471,10 @@ namespace QuotaWidget
         {
             base.OnMouseMove(e);
             bool hs = _rcSelect.Contains(e.Location), ho = _rcOk.Contains(e.Location), hc = _rcCancel.Contains(e.Location), hg = _rcSeg.Contains(e.Location);
-            if (hs != _hotSelect || ho != _hotOk || hc != _hotCancel || hg != _hotSeg)
+            bool hm = _rcGlmMode.Contains(e.Location), hx = _rcGlmContext.Contains(e.Location), hb = _rcAuto.Contains(e.Location);
+            if (hs != _hotSelect || ho != _hotOk || hc != _hotCancel || hg != _hotSeg || hm != _hotGlmMode || hx != _hotGlmContext || hb != _hotAuto)
             {
-                _hotSelect = hs; _hotOk = ho; _hotCancel = hc; _hotSeg = hg;
+                _hotSelect = hs; _hotOk = ho; _hotCancel = hc; _hotSeg = hg; _hotGlmMode = hm; _hotGlmContext = hx; _hotAuto = hb;
                 Invalidate();
             }
         }
@@ -5187,9 +7482,9 @@ namespace QuotaWidget
         protected override void OnMouseLeave(EventArgs e)
         {
             base.OnMouseLeave(e);
-            if (_hotSelect || _hotOk || _hotCancel || _hotSeg)
+            if (_hotSelect || _hotOk || _hotCancel || _hotSeg || _hotGlmMode || _hotGlmContext || _hotAuto)
             {
-                _hotSelect = _hotOk = _hotCancel = _hotSeg = false;
+                _hotSelect = _hotOk = _hotCancel = _hotSeg = _hotGlmMode = _hotGlmContext = _hotAuto = false;
                 Invalidate();
             }
         }
@@ -5238,7 +7533,7 @@ namespace QuotaWidget
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             Color fill = Primary ? _pal.Primary : _pal.Win;
             if (!Enabled) fill = Primary ? SettingsPal.Mix(fill, _pal.Win, 0.7) : _pal.Win;
-            else if (_pressed || _hot) fill = Primary ? SettingsPal.Mix(fill, _pal.Win, _pressed ? 0.24 : 0.12) : (_pressed ? _pal.Sel : _pal.Hover);
+            else if (_pressed || _hot) fill = Primary ? (_pressed ? SettingsPal.Mix(_pal.PrimaryHover, _pal.Text, 0.12) : _pal.PrimaryHover) : (_pressed ? _pal.Sel : _pal.Hover);
             int radius = St.SiF(ApiAppearance.CornerRadius, _scale);
             using (var path = St.RoundRect(new Rectangle(0, 0, Width - 1, Height - 1), radius))
             {
@@ -5335,6 +7630,8 @@ namespace QuotaWidget
         protected override void OnPaint(PaintEventArgs e)
         {
             e.Graphics.Clear(_pal.Win); e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var path = St.RoundRect(new Rectangle(0, 0, Width - 1, Height - 1), S(ApiAppearance.CornerRadius)))
+            using (var brush = new SolidBrush(_pal.Field)) e.Graphics.FillPath(brush, path);
             if (Segmented)
             {
                 int cell = Width / Items.Length;
@@ -5417,7 +7714,7 @@ namespace QuotaWidget
         protected override void OnPaint(PaintEventArgs e)
         {
             e.Graphics.Clear(_pal.Win);
-            using (var pen = new Pen(_pal.Line)) e.Graphics.DrawLine(pen, 0, Height - 1, Width, Height - 1);
+            using (var pen = new Pen(_pal.SectionLine)) e.Graphics.DrawLine(pen, 0, Height - 1, Width, Height - 1);
             for (int i = 0; i < _items.Length; i++)
             {
                 var r = new Rectangle(i * TabWidth, 0, TabWidth, Height - St.SiF(4, _scale));
@@ -5447,9 +7744,100 @@ namespace QuotaWidget
         protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
     }
 
+    // 保留原生文本编辑与键盘操作，滚动位置供外层绘制主题滑块。
+    internal sealed class ApiScrollTextBox : TextBox
+    {
+        private const int EM_GETRECT = 0x00B2, EM_GETLINECOUNT = 0x00BA,
+            EM_LINESCROLL = 0x00B6, EM_GETFIRSTVISIBLELINE = 0x00CE, WM_MOUSEWHEEL = 0x020A;
+        [StructLayout(LayoutKind.Sequential)]
+        private struct TextRect { public int Left, Top, Right, Bottom; }
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern IntPtr SendMessage(IntPtr hwnd, int message, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern IntPtr SendMessage(IntPtr hwnd, int message, IntPtr wParam, ref TextRect lParam);
+        private int _wheelRemainder;
+        public event EventHandler ViewportChanged;
+
+        public void GetViewport(out int first, out int total, out int page)
+        {
+            first = 0; total = page = 1;
+            if (!IsHandleCreated || IsDisposed) return;
+            first = SendMessage(Handle, EM_GETFIRSTVISIBLELINE, IntPtr.Zero, IntPtr.Zero).ToInt32();
+            total = Math.Max(1, SendMessage(Handle, EM_GETLINECOUNT, IntPtr.Zero, IntPtr.Zero).ToInt32());
+            var rect = new TextRect();
+            SendMessage(Handle, EM_GETRECT, IntPtr.Zero, ref rect);
+            int lineHeight = Font.Height;
+            // 原生换行后的实际行高，避免 DPI 缩放时用估算行高漏掉最后一行。
+            if (total > 1)
+            {
+                int line = Math.Min(first, total - 2);
+                int a = GetFirstCharIndexFromLine(line), b = GetFirstCharIndexFromLine(line + 1);
+                if (a >= 0 && b >= 0)
+                {
+                    int measured = GetPositionFromCharIndex(b).Y - GetPositionFromCharIndex(a).Y;
+                    if (measured > 0) lineHeight = measured;
+                }
+            }
+            page = Math.Max(1, (rect.Bottom - rect.Top) / Math.Max(1, lineHeight));
+        }
+
+        public void ScrollToLine(int line)
+        {
+            if (!IsHandleCreated || IsDisposed) return;
+            int first, total, page;
+            GetViewport(out first, out total, out page);
+            int target = Math.Max(0, Math.Min(Math.Max(0, total - page), line));
+            SendMessage(Handle, EM_LINESCROLL, IntPtr.Zero, new IntPtr(target - first));
+        }
+
+        public void ScrollWheel(int delta)
+        {
+            _wheelRemainder += delta;
+            int steps = _wheelRemainder / 120;
+            _wheelRemainder %= 120;
+            if (steps == 0) return;
+            int first, total, page;
+            GetViewport(out first, out total, out page);
+            int lines = SystemInformation.MouseWheelScrollLines;
+            ScrollToLine(first - steps * (lines < 0 ? page : lines));
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            if (ViewportChanged != null) ViewportChanged(this, EventArgs.Empty);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_MOUSEWHEEL && Multiline)
+            {
+                ScrollWheel(unchecked((short)(m.WParam.ToInt64() >> 16)));
+                m.Result = IntPtr.Zero;
+                return;
+            }
+            base.WndProc(ref m);
+            // 绘制、尺寸、文本及光标滚动后同步；查询消息不触发回调，避免重入。
+            if (ViewportChanged != null && (m.Msg == 0x000F || m.Msg == 0x0005 || m.Msg == 0x000C
+                || m.Msg == 0x0030 || m.Msg == 0x0100 || m.Msg == 0x0102 || m.Msg == 0x0115
+                || m.Msg == EM_LINESCROLL || m.Msg == 0x00B7))
+                ViewportChanged(this, EventArgs.Empty);
+        }
+    }
+
     // 自定义接口编辑器：请求一次，树节点、字段预览和额度预览均在内存中计算。
     internal sealed class ApiTextField : Panel
     {
+        private sealed class InputFrame : Panel
+        {
+            public InputFrame()
+            {
+                // 底色、焦点边框和滑块一次提交，避免背景擦除时闪掉边框。
+                SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint
+                    | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            }
+        }
+
         private readonly SettingsPal _pal;
         private readonly float _scale;
         private readonly Panel _frame;
@@ -5457,6 +7845,9 @@ namespace QuotaWidget
         private readonly ToolTip _tip = new ToolTip();
         private bool _dropHot, _hasValue;
         private readonly bool _multiline;
+        private readonly ApiScrollTextBox _scrollInput;
+        private int _scrollFirst, _scrollTotal = 1, _scrollPage = 1, _scrollGrab;
+        private bool _scrollHot, _scrollDragging;
         public readonly TextBox Input;
         public const string PathFormat = "QuotaWidget.JsonFieldPath";
         public ApiTextField(SettingsPal pal, float scale, string label, bool path, int inputHeight = 34)
@@ -5464,18 +7855,49 @@ namespace QuotaWidget
             _pal = pal; _scale = scale; _multiline = inputHeight > 34;
             BackColor = pal.Win; Height = S(28 + inputHeight); Width = S(468);
             _caption = new Label { Text = label, Font = St.FontsForScale(scale)[1], ForeColor = pal.Text, BackColor = pal.Win };
-            _frame = new Panel { BackColor = pal.Win };
+            _frame = new InputFrame { BackColor = pal.Win };
             _value = new ApiValuePreview(pal, scale) { Visible = false };
-            Input = new TextBox { BorderStyle = BorderStyle.None, Font = St.FontsForScale(scale)[1], ForeColor = pal.Text,
-                BackColor = pal.Win, Multiline = _multiline, AcceptsReturn = _multiline, ScrollBars = _multiline ? ScrollBars.Vertical : ScrollBars.None,
-                MaxLength = _multiline ? 1048576 : 4096 };
+            Input = _multiline ? new ApiScrollTextBox() : new TextBox();
+            Input.BorderStyle = BorderStyle.None; Input.Font = St.FontsForScale(scale)[1]; Input.ForeColor = pal.Text;
+            Input.BackColor = pal.Field; Input.Multiline = Input.AcceptsReturn = _multiline;
+            Input.ScrollBars = ScrollBars.None; Input.MaxLength = _multiline ? 1048576 : 4096;
+            _scrollInput = Input as ApiScrollTextBox;
             Controls.Add(_caption); Controls.Add(_frame); Controls.Add(_value); _frame.Controls.Add(Input);
             _frame.Paint += delegate(object sender, PaintEventArgs e)
             {
                 e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
                 using (var shape = St.RoundRect(new Rectangle(0, 0, _frame.Width - 1, _frame.Height - 1), S(ApiAppearance.CornerRadius)))
-                using (var pen = new Pen(_dropHot || Input.Focused ? pal.Primary : pal.Line)) e.Graphics.DrawPath(pen, shape);
+                {
+                    using (var brush = new SolidBrush(pal.Field)) e.Graphics.FillPath(brush, shape);
+                    using (var pen = new Pen(_dropHot || Input.Focused ? pal.Primary : pal.Line)) e.Graphics.DrawPath(pen, shape);
+                }
+                if (_scrollInput != null && _scrollTotal > _scrollPage)
+                {
+                    var thumb = ScrollThumb();
+                    if (thumb.Width > 0 && thumb.Height > 0)
+                        using (var brush = new SolidBrush(_scrollHot || _scrollDragging ? pal.Text2 : pal.Text3))
+                        using (var shape = St.RoundRect(thumb, Math.Max(1, thumb.Width / 2)))
+                            e.Graphics.FillPath(brush, shape);
+                }
             };
+            if (_scrollInput != null)
+            {
+                _scrollInput.ViewportChanged += delegate { SyncScrollbar(); };
+                _frame.MouseDown += ScrollbarMouseDown;
+                _frame.MouseMove += ScrollbarMouseMove;
+                _frame.MouseUp += delegate(object sender, MouseEventArgs e)
+                { if (e.Button == MouseButtons.Left) EndScrollbarDrag(); };
+                _frame.MouseCaptureChanged += delegate
+                { if (!_frame.Capture) EndScrollbarDrag(); };
+                _frame.MouseLeave += delegate
+                { if (_scrollHot) { _scrollHot = false; InvalidateScrollbar(); } };
+                _frame.MouseWheel += delegate(object sender, MouseEventArgs e)
+                {
+                    _scrollInput.ScrollWheel(e.Delta);
+                    var handled = e as HandledMouseEventArgs;
+                    if (handled != null) handled.Handled = true;
+                };
+            }
             Input.GotFocus += delegate { _frame.Invalidate(); }; Input.LostFocus += delegate { _frame.Invalidate(); };
             if (path)
             {
@@ -5501,6 +7923,56 @@ namespace QuotaWidget
             Arrange();
         }
         private int S(int n) { return St.SiF(n, _scale); }
+        private Rectangle ScrollTrack()
+        { return new Rectangle(_frame.Width - S(20), S(7), S(10), Math.Max(0, _frame.Height - S(14))); }
+        private void InvalidateScrollbar()
+        {
+            // 悬停和滚动不涉及焦点状态，只重绘滑块所在的内侧区域。
+            var track = ScrollTrack();
+            if (track.Width > 0 && track.Height > 0) _frame.Invalidate(track);
+        }
+        private void EndScrollbarDrag()
+        {
+            if (!_scrollDragging) return;
+            _scrollDragging = false;
+            _frame.Capture = false;
+            InvalidateScrollbar();
+        }
+        private Rectangle ScrollThumb()
+        {
+            var track = ScrollTrack();
+            int height = Math.Min(track.Height, Math.Max(S(18), (int)((long)track.Height * _scrollPage / _scrollTotal)));
+            int top = track.Top + (int)Math.Round((track.Height - height) * (double)_scrollFirst / Math.Max(1, _scrollTotal - _scrollPage));
+            return new Rectangle(track.Left + S(2), top, Math.Max(1, track.Width - S(4)), height);
+        }
+        private void SyncScrollbar()
+        {
+            if (_scrollInput == null || IsDisposed) return;
+            int first, total, page;
+            _scrollInput.GetViewport(out first, out total, out page);
+            first = Math.Max(0, Math.Min(Math.Max(0, total - page), first));
+            if (_scrollFirst == first && _scrollTotal == total && _scrollPage == page) return;
+            _scrollFirst = first; _scrollTotal = total; _scrollPage = page;
+            if (total <= page) { _scrollHot = false; EndScrollbarDrag(); }
+            InvalidateScrollbar();
+        }
+        private void ScrollbarMouseDown(object sender, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left || _scrollTotal <= _scrollPage || !ScrollTrack().Contains(e.Location)) return;
+            var thumb = ScrollThumb();
+            if (e.Y >= thumb.Top && e.Y < thumb.Bottom)
+            { _scrollGrab = e.Y - thumb.Top; _scrollDragging = true; _frame.Capture = true; InvalidateScrollbar(); }
+            else _scrollInput.ScrollToLine(_scrollFirst + (e.Y < thumb.Top ? -_scrollPage : _scrollPage));
+        }
+        private void ScrollbarMouseMove(object sender, MouseEventArgs e)
+        {
+            bool hot = _scrollTotal > _scrollPage && ScrollTrack().Contains(e.Location);
+            if (hot != _scrollHot) { _scrollHot = hot; InvalidateScrollbar(); }
+            if (!_scrollDragging) return;
+            var track = ScrollTrack();
+            int travel = track.Height - ScrollThumb().Height;
+            if (travel > 0) _scrollInput.ScrollToLine((int)Math.Round((e.Y - track.Top - _scrollGrab) * (double)(_scrollTotal - _scrollPage) / travel));
+        }
         public void SetPreview(bool exists, string text)
         {
             _hasValue = exists; _value.Visible = exists; _value.Text = exists ? text : "";
@@ -5514,8 +7986,10 @@ namespace QuotaWidget
             _caption.Bounds = new Rectangle(0, 0, Width, S(24));
             _frame.Bounds = new Rectangle(0, S(28), Math.Max(S(60), Width - (valueWidth > 0 ? valueWidth + S(8) : 0)), Height - S(28));
             _value.Bounds = new Rectangle(Width - valueWidth, S(28), valueWidth, Height - S(28));
-            Input.Bounds = _multiline ? new Rectangle(S(10), S(7), _frame.Width - S(20), _frame.Height - S(14))
+            // 给细滑块留出固定空隙，显示/隐藏时不改变文本换行。
+            Input.Bounds = _multiline ? new Rectangle(S(10), S(7), Math.Max(1, _frame.Width - S(34)), Math.Max(1, _frame.Height - S(14)))
                 : new Rectangle(S(10), Math.Max(0, (_frame.Height - Input.PreferredHeight) / 2), _frame.Width - S(20), Input.PreferredHeight);
+            SyncScrollbar();
             _frame.Invalidate();
         }
         protected override void OnSizeChanged(EventArgs e) { base.OnSizeChanged(e); Arrange(); }
@@ -5773,7 +8247,7 @@ namespace QuotaWidget
         private DateTime _sampleFetchedUtc, _sampleCooldownUntilUtc;
         private readonly int _globalRefreshSec;
         private const string ExampleHeader = "Authorization: Bearer XXXXXXXXXX";
-        private static readonly string[] IconTypes = { "custom", "codex", "claude", "glm", "mx", "kimi", "ds" };
+        private static readonly string[] IconTypes = { "custom", "codex", "claude", "glm", "mx", "kimi", "ds", "mimo", "qwen", "bailian" };
         public ProviderConfig Result { get; private set; }
 
         public CustomApiDialog(ProviderConfig existing, SettingsPal pal, float scale, int globalRefreshSec = 60)
@@ -5806,7 +8280,7 @@ namespace QuotaWidget
             _intervals = RefreshChoices.Values(_source.RefreshSec, true);
             _interval = Choice(_displayGroup, "刷新间隔", 412, 0, 388, _intervals.ConvertAll(RefreshChoices.Label).ToArray());
             _iconGroup = new Panel { Bounds = new Rectangle(0, S(72), S(800), S(64)), BackColor = pal.Win }; _displayGroup.Controls.Add(_iconGroup);
-            _icon = Choice(_iconGroup, "选择图标", 0, 0, 388, new[] { "通用接口", "Codex", "Claude", "GLM", "MiniMax", "Kimi", "DeepSeek" }); _icon.IconTypes = IconTypes;
+            _icon = Choice(_iconGroup, "选择图标", 0, 0, 388, new[] { "通用接口", "Codex", "Claude", "GLM", "MiniMax", "Kimi", "DeepSeek", "小米 MiMo", "千问", "百炼" }); _icon.IconTypes = IconTypes;
             _nameGroup = new Panel { Bounds = _iconGroup.Bounds, BackColor = pal.Win }; _displayGroup.Controls.Add(_nameGroup);
             Field(_nameGroup, "displayName", "显示名称", 0, 0, 388);
 
@@ -5830,9 +8304,16 @@ namespace QuotaWidget
             _previewLine = new TextBox { Bounds = new Rectangle(S(16), S(30), S(1028), S(24)), ReadOnly = true, Multiline = false, AutoSize = false,
                 ScrollBars = ScrollBars.None, BorderStyle = BorderStyle.None, BackColor = pal.Win, ForeColor = pal.Text, Font = Fs[1] };
             _previewPanel.Controls.Add(_previewLine);
-            _test = ButtonAt(this, "测试与配置", 20, 710, 136, delegate { Test(); });
-            ButtonAt(this, "取消", 868, 710, 96, delegate { Close(); });
-            _ok = ButtonAt(this, "确认", 976, 710, 104, delegate { Confirm(); });
+            // 实际父控件承载底栏背景，按钮清除四角时沿用同一底色。
+            var footer = new Panel { Bounds = new Rectangle(0, S(704), ClientSize.Width, S(56)), BackColor = pal.Side };
+            footer.Paint += delegate(object sender, PaintEventArgs e)
+            {
+                using (var pen = new Pen(pal.SectionLine)) e.Graphics.DrawLine(pen, 0, 0, footer.Width, 0);
+            };
+            Controls.Add(footer);
+            _test = ButtonAt(footer, "测试与配置", 20, 6, 136, delegate { Test(); });
+            ButtonAt(footer, "取消", 868, 6, 96, delegate { Close(); });
+            _ok = ButtonAt(footer, "确认", 976, 6, 104, delegate { Confirm(); });
             _ok.Primary = true;
             _fields["name"].Input.Text = _source.Name;
             _displayNameEdited = !string.IsNullOrWhiteSpace(config.DisplayName);
@@ -6162,18 +8643,17 @@ namespace QuotaWidget
         }
     }
 
-    // ============================= 设置窗口配色（局部预览主题） =============================
-    // 设置窗口自带一套明暗配色（Codex 风格中性色）。与 St.Theme 全局主题分离：
-    // 标题栏 🌙 / 「主题」分段控件实时预览时只改本窗口配色，点「保存」后经 ApplyConfig
-    // 才写入 St.Theme，否则未保存的预览会立刻波及悬浮窗。
+    // ============================= 面板配色 =============================
+    // 柔和蓝灰配色供设置、对话框和详情面板使用，悬浮窗背景也共用 Win。
+    // 标题栏 / 「主题」分段控件切换后自动保存，并同步所有窗口的深浅主题。
     internal struct SettingsPal
     {
-        public Color Win, Side, Text, Text2, Text3, Line, Line2, Hover, Sel, Pill, PillText, Primary, PrimaryText, Track, ToggleOff, CardHover, Danger;
-        public bool Dark;   // 本调色板是否深色（品牌图标等主题资源跟随此值而非全局 St.Theme，保证设置页预览即时切换）
+        public Color Win, Side, Field, Text, Text2, Text3, Line, Line2, SectionLine, Hover, Sel, Pill, PillText, Primary, PrimaryHover, PrimaryText, Track, ToggleOff, CardHover, Danger, Green, GreenBg, Amber;
+        public bool Dark;   // 品牌图标等主题资源跟随当前面板配色。
 
         internal static Color C(int rgb) { return Color.FromArgb((int)(0xFF000000u | (uint)rgb)); }
 
-        // 向背景色靠拢的混合色（主按钮悬停 = 主色向窗底色提亮 12%）
+        // 状态色与按下态共用的颜色插值。
         public static Color Mix(Color a, Color b, double t)
         {
             if (t < 0) t = 0; if (t > 1) t = 1;
@@ -6183,24 +8663,31 @@ namespace QuotaWidget
                 (int)Math.Round(a.B + (b.B - a.B) * t));
         }
 
-        // 对比度方案 A（对照 design/contrast-proposal.html）：
-        // 侧栏与窗口拉开一档 / 分割线提到 ≈13% 黑（GitHub Primer 强度）/ 选中项与悬停分离
+        public Color RemainColor(int remainPct)
+        {
+            remainPct = Math.Max(0, Math.Min(100, remainPct));
+            return remainPct >= 50 ? Mix(Amber, Green, (remainPct - 50) / 50.0) : Mix(Danger, Amber, remainPct / 50.0);
+        }
+
+        // 对照 design/theme-proposal.html：灰白浅色 / 石墨深色，区域分割线独立加深。
         public static SettingsPal For(bool dark)
         {
             SettingsPal p = new SettingsPal { Dark = dark };
             if (dark)
             {
-                p.Win = C(0x1C1C21); p.Side = C(0x141419); p.Text = C(0xF2F2F4); p.Text2 = C(0xA6A6AF);
-                p.Text3 = C(0x6E6E78); p.Line = C(0x3A3A42); p.Line2 = C(0x2E2E36); p.Hover = C(0x26262E);
-                p.Sel = C(0x32323B); p.Pill = C(0x2C2C33); p.PillText = C(0xC9C9D1); p.Primary = C(0xF2F2F4); p.PrimaryText = C(0x18181B);
-                p.Track = C(0x3A3A42); p.ToggleOff = C(0x3F3F46); p.CardHover = C(0x4A4A52); p.Danger = C(0xF87171);
+                p.Win = C(0x2D3032); p.Side = C(0x26292B); p.Field = C(0x333739); p.Text = C(0xD9DCD8); p.Text2 = C(0xA7AFAE);
+                p.Text3 = C(0x929B9A); p.Line = C(0x4B5254); p.Line2 = C(0x3E4546); p.SectionLine = C(0x5A6368); p.Hover = C(0x3A4144);
+                p.Sel = C(0x364853); p.Pill = C(0x344650); p.PillText = C(0x95BDD7); p.Primary = C(0x40739B); p.PrimaryHover = C(0x45789F); p.PrimaryText = C(0xFAFBF9);
+                p.Track = C(0x495152); p.ToggleOff = C(0x4B5254); p.CardHover = C(0x73838B); p.Danger = C(0xD79C91);
+                p.Green = C(0x96BBA2); p.GreenBg = C(0x35483D); p.Amber = C(0xCBA970);
             }
             else
             {
-                p.Win = Color.White; p.Side = C(0xF2F2F4); p.Text = C(0x18181B); p.Text2 = C(0x71717A);
-                p.Text3 = C(0xA1A1AA); p.Line = C(0xD6D6DB); p.Line2 = C(0xD9D9DE); p.Hover = C(0xEBEBEE);
-                p.Sel = C(0xE3E3E8); p.Pill = C(0xF4F4F5); p.PillText = C(0x52525B); p.Primary = C(0x18181B); p.PrimaryText = Color.White;
-                p.Track = C(0xE4E4E7); p.ToggleOff = C(0xD4D4D8); p.CardHover = C(0xC9C9CF); p.Danger = C(0xDC2626);
+                p.Win = C(0xFAFAFA); p.Side = C(0xF0F1F2); p.Field = C(0xF4F5F6); p.Text = C(0x393E41); p.Text2 = C(0x6C7377);
+                p.Text3 = C(0x858C8E); p.Line = C(0xCED3D8); p.Line2 = C(0xE0E3E6); p.SectionLine = C(0xB8BEC6); p.Hover = C(0xEAEDF0);
+                p.Sel = C(0xE3EBEF); p.Pill = C(0xE5EEF2); p.PillText = C(0x356D95); p.Primary = C(0x3E7198); p.PrimaryHover = C(0x346487); p.PrimaryText = C(0xFAFBFC);
+                p.Track = C(0xDCE0E4); p.ToggleOff = C(0xCED3D8); p.CardHover = C(0x9BA9B1); p.Danger = C(0xA5584E);
+                p.Green = C(0x467B60); p.GreenBg = C(0xE8EFE7); p.Amber = C(0x986B2E);
             }
             return p;
         }
@@ -6602,15 +9089,18 @@ namespace QuotaWidget
     internal class SettingsForm : Form
     {
         private readonly AppContext _ctx;
-        private readonly List<ProviderConfig> _editList = new List<ProviderConfig>(); // 编辑副本，保存时才写回
+        private readonly List<ProviderConfig> _editList = new List<ProviderConfig>(); // 独立编辑副本，每次修改自动提交。
+        private bool _providersChanged;
+        private bool _saving;
+        private bool _saveFailed;
 
-        // ---- 待保存设置（纯字段而非控件：跨屏 DPI 重建布局时状态天然保留，无需备份回填） ----
+        // ---- 设置状态（纯字段而非控件：跨屏 DPI 重建布局时状态天然保留，无需备份回填） ----
         private bool _pendIsland;   // 悬浮窗排列：true=条形灵动岛 / false=矩形卡片
         private int _pendInterval;  // 刷新间隔（秒）
         private int _pendOpacity;   // 不透明度 50-100
         private bool _pendTopMost;
         private bool _pendAutoStart;
-        private bool _pendDark;     // 主题预览：仅本窗口配色，保存后经 ApplyConfig 才影响悬浮窗
+        private bool _pendDark;     // 切换后自动保存并同步深浅主题。
 
         // ---- 窗口状态 ----
         private int _page;                    // 0=供应商 1=通用 2=关于
@@ -6646,7 +9136,7 @@ namespace QuotaWidget
         private readonly List<Hot> _hots = new List<Hot>();
         private Rectangle _vp;                // 当前页内容视口
         private int _contentH;                // 当前页内容总高（与滚动无关，>视口高时出现滚动）
-        private Rectangle _rcMoon, _rcClose, _rcAdd, _rcCustom, _rcTest, _rcCancel, _rcSave, _rcOpenDir, _rcUpdate;
+        private Rectangle _rcMoon, _rcClose, _rcAdd, _rcCustom, _rcTest, _rcOpenDir, _rcUpdate, _rcRetrySave;
         private readonly List<Rectangle> _cardRects = new List<Rectangle>();
         private Rectangle _grp1, _grp2;
         private readonly List<int> _visRows = new List<int>();        // 通用页第一组设置行
@@ -6719,9 +9209,15 @@ namespace QuotaWidget
             KeyDown += delegate(object s, KeyEventArgs e)
             {
                 if (e.KeyCode == Keys.Escape) Close();
-                else if (e.KeyCode == Keys.Enter || (e.Control && e.KeyCode == Keys.S)) { e.SuppressKeyPress = true; SaveAndClose(); }
+                else if (e.Control && e.KeyCode == Keys.S) { e.SuppressKeyPress = true; SaveChanges(); }
             };
-            FormClosing += delegate { ClosePopup(); HideTip(); };
+            FormClosing += delegate(object sender, FormClosingEventArgs e)
+            {
+                FinishDrag(false);
+                ClosePopup();
+                HideTip();
+                if (!_ctx.IsExiting && !SaveChanges()) e.Cancel = true;
+            };
             // 行说明气泡：悬停行标题 450ms 后浮现
             _tipTimer = new System.Windows.Forms.Timer { Interval = 450 };
             _tipTimer.Tick += delegate
@@ -6761,8 +9257,8 @@ namespace QuotaWidget
         {
             ClearPageLayout();
             int W = ClientSize.Width, H = ClientSize.Height;
-            int tbH = S(46), footH = S(58), sideW = S(208);
-            _vp = new Rectangle(sideW + S(30), tbH + S(26), W - sideW - S(60), H - tbH - footH - S(26) - S(20));
+            int tbH = S(46), sideW = S(208);
+            _vp = new Rectangle(sideW + S(30), tbH + S(26), W - sideW - S(60), H - tbH - S(26) - S(20));
             AddChromeHots(tbH);
 
             for (int pass = 0; pass < 2; pass++)
@@ -6778,15 +9274,6 @@ namespace QuotaWidget
                 AddChromeHots(tbH);
             }
 
-            // 底部操作栏按钮（取消 / 保存，右对齐）
-            int btnH = S(34);
-            Font[] fs = Fonts(_scale);
-            int saveW = MeasureW("保存", fs[1]) + S(40);
-            int cancelW = MeasureW("取消", fs[1]) + S(36);
-            _rcSave = new Rectangle(W - S(30) - saveW, H - footH + (footH - btnH) / 2, saveW, btnH);
-            _rcCancel = new Rectangle(_rcSave.X - S(10) - cancelW, _rcSave.Y, cancelW, btnH);
-            AddHot(_rcCancel, "btn:cancel");
-            AddHot(_rcSave, "btn:save");
         }
 
         private void ClearPageLayout()
@@ -6802,6 +9289,8 @@ namespace QuotaWidget
         // 标题栏 + 侧栏命中区（滚动收敛重排时需补回）
         private void AddChromeHots(int tbH)
         {
+            _rcRetrySave = new Rectangle(S(20), ClientSize.Height - S(88), S(168), S(28));
+            if (_saveFailed) AddHot(_rcRetrySave, "retry:save");
             int bs = S(32);
             _rcMoon = new Rectangle(ClientSize.Width - S(8) - bs * 2 - S(4), S(7), bs, bs);
             _rcClose = new Rectangle(ClientSize.Width - S(8) - bs, S(7), bs, bs);
@@ -6896,8 +9385,8 @@ namespace QuotaWidget
             int w2 = MeasureW(UpdateButtonText(), fs[1]) + S(36);
             int x = _vp.X + _vp.Width / 2 - (w1 + S(10) + w2) / 2;
             int iconY = _vp.Y + S(24) + S(16);
-            _rcOpenDir = new Rectangle(x, iconY + S(170), w1, S(34));
-            _rcUpdate = new Rectangle(x + w1 + S(10), iconY + S(170), w2, S(34));
+            _rcOpenDir = new Rectangle(x, iconY + S(142), w1, S(34));
+            _rcUpdate = new Rectangle(x + w1 + S(10), iconY + S(142), w2, S(34));
             AddHot(_rcOpenDir, "opendir");
             AddHot(_rcUpdate, "update");
         }
@@ -7001,7 +9490,7 @@ namespace QuotaWidget
             SettingsPal p = P;
             Font[] fs = Fonts(_scale);
             int W = ClientSize.Width, H = ClientSize.Height;
-            int tbH = S(46), footH = S(58), sideW = S(208);
+            int tbH = S(46), sideW = S(208);
 
             using (var b = new SolidBrush(p.Win))
                 g.FillRectangle(b, ClientRectangle);
@@ -7009,14 +9498,13 @@ namespace QuotaWidget
             PaintTitlebar(g, p, fs, W, tbH);
             PaintSidebar(g, p, fs, tbH, sideW, H);
 
-            // 内容区裁剪：滚动时页面内容不侵入标题栏 / 侧栏 / 底栏
-            g.SetClip(new Rectangle(sideW, tbH, W - sideW, H - tbH - footH));
+            // 内容区裁剪：滚动时页面内容不侵入标题栏 / 侧栏。
+            g.SetClip(new Rectangle(sideW, tbH, W - sideW, H - tbH));
             if (_page == 0) PaintProviders(g, p, fs);
             else if (_page == 1) PaintGeneral(g, p, fs);
             else PaintAbout(g, p, fs);
             g.ResetClip();
 
-            PaintFooter(g, p, fs, sideW, footH, H, W);
             PaintScrollbar(g, p);
 
             // 窗口最外圈细边（DWM 阴影之外的补充轮廓，浅色桌面上勾出边界）
@@ -7026,13 +9514,15 @@ namespace QuotaWidget
 
         private void PaintTitlebar(Graphics g, SettingsPal p, Font[] fs, int W, int tbH)
         {
+            using (var b = new SolidBrush(p.Side))
+                g.FillRectangle(b, 0, 0, W, tbH);
             // 应用图标（与托盘 / 任务栏同一枚仪表盘造型）
             var ic = new Rectangle(S(14), (tbH - S(20)) / 2, S(20), S(20));
             IconFactory.DrawGlyph(g, ic);
             using (var b = new SolidBrush(p.Text))
                 TextRenderer.DrawText(g, "设置", fs[1], new Rectangle(ic.Right + S(9), 0, S(80), tbH), p.Text, TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
 
-            // 主题预览按钮：VS Code 同款半圆对比图标（codicon color-mode），点击切换明暗预览
+            // 主题按钮：VS Code 同款半圆对比图标（codicon color-mode），点击切换明暗主题。
             if (_hover == "moon")
                 using (var path = St.RoundRect(_rcMoon, S(8)))
                 using (var b = new SolidBrush(p.Hover))
@@ -7051,7 +9541,7 @@ namespace QuotaWidget
                 g.DrawLine(pen, cx + d, cy - d, cx - d, cy + d);
             }
 
-            using (var pen = new Pen(p.Line2))
+            using (var pen = new Pen(p.SectionLine))
                 g.DrawLine(pen, 0, tbH - 1, W, tbH - 1);
         }
 
@@ -7072,11 +9562,16 @@ namespace QuotaWidget
                     // 选中用 Sel（比 Hover 深两档），悬停仍用 Hover：两个状态不再同色
                     using (var b = new SolidBrush(active ? p.Sel : p.Hover))
                         g.FillPath(b, path);
-                Color c = (active || hot) ? p.Text : p.Text2;
+                Color c = active ? p.PillText : hot ? p.Text : p.Text2;
                 PaintNavIcon(g, i, r.X + S(10), r.Y + (r.Height - S(16)) / 2, c);
                 using (var b = new SolidBrush(c))
                     g.DrawString(names[i], active ? fs[1] : fs[2], b, new RectangleF(r.X + S(35), r.Y, navW - S(35), navH), SFLeftV);
             }
+
+            // 仅写入失败时提供重试入口，保留当前填写内容。
+            if (_saveFailed)
+                TextRenderer.DrawText(g, "保存失败 · 点击重试", fs[4], _rcRetrySave, p.Danger,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
 
             // 侧栏底部：应用名 + 版本
             using (var b = new SolidBrush(p.Text3))
@@ -7100,7 +9595,10 @@ namespace QuotaWidget
             // 工具栏：＋ 添加供应商（主） / 测试全部（次）
             PaintButton(g, p, fs, _rcAdd, "＋ 添加供应商", true, _hover == "add");
             PaintButton(g, p, fs, _rcCustom, "自定义接口", false, _hover == "custom");
-            TextRenderer.DrawText(g, "通用刷新", fs[4], new Rectangle(_rcSelInt.X - S(72), _rcSelInt.Y, S(68), _rcSelInt.Height), p.Text2, TextFormatFlags.VerticalCenter | TextFormatFlags.Right);
+            // 「通用刷新间隔」右对齐贴住下拉框：文案变长后按实际字宽撑开，避免被裁切或压到「测试全部」
+            const string intCap = "通用刷新间隔";
+            int intCapW = MeasureW(intCap, fs[4]) + S(4);
+            TextRenderer.DrawText(g, intCap, fs[4], new Rectangle(_rcSelInt.X - S(4) - intCapW, _rcSelInt.Y, intCapW, _rcSelInt.Height), p.Text2, TextFormatFlags.VerticalCenter | TextFormatFlags.Right);
             PaintSelect(g, p, fs, _rcSelInt, IntervalText(_pendInterval), _hover == "sel:int");
             PaintButton(g, p, fs, _rcTest, _testing ? "测试中…" : "测试全部", false, _hover == "test" && !_testing);
 
@@ -7141,7 +9639,7 @@ namespace QuotaWidget
             int cardH = card.Height;
             using (var path = St.RoundRect(card, S(10)))
             {
-                using (var b = new SolidBrush(p.Win))
+                using (var b = new SolidBrush(p.Field))
                     g.FillPath(b, path);
                 using (var pen = new Pen(hot || elevated ? p.CardHover : p.Line))
                     g.DrawPath(pen, path);
@@ -7364,7 +9862,7 @@ namespace QuotaWidget
         {
             using (var path = St.RoundRect(r, S(8)))
             {
-                using (var b = new SolidBrush(p.Win))
+                using (var b = new SolidBrush(p.Field))
                     g.FillPath(b, path);
                 using (var pen = new Pen(hot ? p.CardHover : p.Line))
                     g.DrawPath(pen, path);
@@ -7410,11 +9908,11 @@ namespace QuotaWidget
         private void PaintToggle(Graphics g, SettingsPal p, Rectangle r, bool on)
         {
             using (var path = St.RoundRect(r, r.Height / 2))
-            using (var b = new SolidBrush(on ? p.Text : p.ToggleOff))
+            using (var b = new SolidBrush(on ? p.Primary : p.ToggleOff))
                 g.FillPath(b, path);
             int d = r.Height - S(4);
             var knob = new Rectangle(on ? r.Right - S(2) - d : r.X + S(2), r.Y + S(2), d, d);
-            using (var b = new SolidBrush(p.Win))
+            using (var b = new SolidBrush(on ? p.PrimaryText : p.Win))
                 g.FillEllipse(b, knob);
         }
 
@@ -7433,10 +9931,7 @@ namespace QuotaWidget
                 g.DrawString("AI 额度工具", fs[0], b, new RectangleF(_vp.X, iconY + S(70), _vp.Width, S(26)), sf);
             using (var sf = new StringFormat { Alignment = StringAlignment.Center })
             using (var b = new SolidBrush(p.Text2))
-            {
                 g.DrawString("v" + AppInfo.Version, fs[3], b, new RectangleF(_vp.X, iconY + S(100), _vp.Width, S(18)), sf);
-                g.DrawString("在桌面悬浮展示 GLM / Kimi / MiniMax / DeepSeek / Claude / Codex 的额度与用量。", fs[3], b, new RectangleF(_vp.X, iconY + S(128), _vp.Width, S(18)), sf);
-            }
             // 配置挪到 AppData 后用户不易找到，提供一键定位（资源管理器选中 config.json）
             PaintButton(g, p, fs, _rcOpenDir, "打开配置目录", false, _hover == "opendir");
             // 发现新版时换主色引导下载；「检查中…」悬停态照常、点击在 OnMouseDown 被忽略
@@ -7455,7 +9950,7 @@ namespace QuotaWidget
             {
                 if (primary)
                 {
-                    using (var b = new SolidBrush(hot ? SettingsPal.Mix(p.Primary, p.Win, 0.12) : p.Primary))
+                    using (var b = new SolidBrush(hot ? p.PrimaryHover : p.Primary))
                         g.FillPath(b, path);
                 }
                 else
@@ -7470,17 +9965,6 @@ namespace QuotaWidget
             // GDI TextRenderer 垂直居中：GDI+ DrawString 的行盒对中文字体含大量内边距，
             // 居中后字形明显偏上；与系统按钮控件观感保持一致
             TextRenderer.DrawText(g, text, fs[1], r, c, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
-        }
-
-        private void PaintFooter(Graphics g, SettingsPal p, Font[] fs, int sideW, int footH, int H, int W)
-        {
-            int top = H - footH;
-            using (var pen = new Pen(p.Line2))
-                g.DrawLine(pen, sideW, top, W, top);
-            using (var b = new SolidBrush(p.Text3))
-                g.DrawString("更改在点击「保存」后生效", fs[4], b, new RectangleF(sideW + S(30), top, W - sideW - S(30), footH), SFLeftV);
-            PaintButton(g, p, fs, _rcCancel, "取消", false, _hover == "btn:cancel");
-            PaintButton(g, p, fs, _rcSave, "保存", true, _hover == "btn:save");
         }
 
         private void PaintScrollbar(Graphics g, SettingsPal p)
@@ -7557,8 +10041,9 @@ namespace QuotaWidget
             string id = Hit(e.Location);
             Point mp = MousePosition;
 
-            if (id == "moon") { _pendDark = !_pendDark; _hover = null; Invalidate(); return; }
+            if (id == "moon") { _pendDark = !_pendDark; _hover = null; SaveChanges(); Invalidate(); return; }
             if (id == "close") { Close(); return; }
+            if (id == "retry:save") { SaveChanges(); return; }
             if (id != null && id.StartsWith("nav:")) { SwitchPage(int.Parse(id.Substring(4))); return; }
 
             // 标题栏空白区拖动窗口（沿用旧版手动拖动：跨屏时实时重建缩放）
@@ -7580,6 +10065,7 @@ namespace QuotaWidget
                 {
                     int idx = int.Parse(id.Substring(8));
                     _editList[idx].Enabled = !_editList[idx].Enabled;
+                    SaveChanges(true);
                     Invalidate();
                     return;
                 }
@@ -7596,10 +10082,10 @@ namespace QuotaWidget
             }
             else if (_page == 1)
             {
-                if (id != null && id.StartsWith("seglayout:")) { _pendIsland = int.Parse(id.Substring(10)) == 0; Invalidate(); return; } // 段位 0=条形灵动岛 / 1=矩形卡片
-                if (id != null && id.StartsWith("segtheme:")) { _pendDark = int.Parse(id.Substring(9)) == 1; Invalidate(); return; }
-                if (id == "tgl:top") { _pendTopMost = !_pendTopMost; Invalidate(); return; }
-                if (id == "tgl:auto") { _pendAutoStart = !_pendAutoStart; Invalidate(); return; }
+                if (id != null && id.StartsWith("seglayout:")) { _pendIsland = int.Parse(id.Substring(10)) == 0; SaveChanges(); Invalidate(); return; } // 段位 0=条形灵动岛 / 1=矩形卡片
+                if (id != null && id.StartsWith("segtheme:")) { _pendDark = int.Parse(id.Substring(9)) == 1; SaveChanges(); Invalidate(); return; }
+                if (id == "tgl:top") { _pendTopMost = !_pendTopMost; SaveChanges(); Invalidate(); return; }
+                if (id == "tgl:auto") { _pendAutoStart = !_pendAutoStart; SaveChanges(); Invalidate(); return; }
                 if (id == "sel:int") { OpenIntervalPopup(); return; }
                 if (id == "sld:op") { _dragSlider = true; Capture = true; SliderSet(e.X); return; }
             }
@@ -7608,9 +10094,6 @@ namespace QuotaWidget
                 if (id == "opendir") { OpenConfigDir(); return; }
                 if (id == "update") { OnUpdateClick(); return; }
             }
-
-            if (id == "btn:cancel") { Close(); return; }
-            if (id == "btn:save") { SaveAndClose(); return; }
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
@@ -7637,10 +10120,23 @@ namespace QuotaWidget
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
+            if (e.Button == MouseButtons.Left) FinishDrag(true);
+        }
+
+        protected override void OnMouseCaptureChanged(EventArgs e)
+        {
+            base.OnMouseCaptureChanged(e);
+            if (!Capture) FinishDrag(true);
+        }
+
+        private void FinishDrag(bool save)
+        {
+            bool changed = _dragSlider || _dragCard >= 0;
             _dragWindow = false;
             _dragSlider = false;
             _dragCard = -1;
             Capture = false;
+            if (save && changed) SaveChanges();
             Invalidate();
         }
 
@@ -7683,11 +10179,16 @@ namespace QuotaWidget
         {
             int v = 50 + (int)Math.Round((mouseX - _rcSlider.X) * 50.0 / Math.Max(1, _rcSlider.Width));
             v = Math.Max(50, Math.Min(100, v));
-            if (v != _pendOpacity) { _pendOpacity = v; Invalidate(); }
+            if (v != _pendOpacity)
+            {
+                _pendOpacity = v;
+                _ctx.Floating.ApplyOpacity(v);
+                Invalidate();
+            }
         }
 
         // 拖拽跟手：被拖卡片以浮层形式跟随鼠标（画在 _dragDrawY），其余卡片让位；
-        // 拖拽卡中心线越过相邻卡中点时实时换位（列表顺序即最终顺序，松手无需再处理）
+        // 拖拽卡中心线越过相邻卡中点时实时换位，松手或失去鼠标捕获时自动提交。
         private void CardDragMove(int mouseY)
         {
             if (_dragCard < 0 || _dragCard >= _cardRects.Count || _cardRects.Count == 0) return;
@@ -7704,6 +10205,7 @@ namespace QuotaWidget
                 _editList.RemoveAt(_dragCard);
                 _editList.Insert(idx, item);
                 _dragCard = idx;
+                _providersChanged = true;
                 LayoutAll();
             }
             Invalidate();
@@ -7735,6 +10237,7 @@ namespace QuotaWidget
             OpenPopup(_rcSelInt, items, sel, delegate(int idx)
             {
                 _pendInterval = vals[idx];
+                SaveChanges();
                 Invalidate();
             });
         }
@@ -7776,7 +10279,7 @@ namespace QuotaWidget
         {
             using (var dialog = new CustomApiDialog(null, P, _scale, _pendInterval))
                 if (dialog.ShowDialog(this) == DialogResult.OK && dialog.Result != null)
-                { _editList.Add(dialog.Result); LayoutAll(); Invalidate(); }
+                { _editList.Add(dialog.Result); SaveChanges(true); LayoutAll(); Invalidate(); }
         }
 
         private void AddProvider()
@@ -7786,6 +10289,7 @@ namespace QuotaWidget
                 if (dlg.ShowDialog(this) == DialogResult.OK && dlg.Result != null)
                 {
                     _editList.Add(dlg.Result);
+                    SaveChanges(true);
                     LayoutAll();
                     Invalidate();
                 }
@@ -7799,7 +10303,7 @@ namespace QuotaWidget
             {
                 using (var custom = new CustomApiDialog(_editList[idx], P, _scale, _pendInterval))
                     if (custom.ShowDialog(this) == DialogResult.OK && custom.Result != null)
-                    { _editList[idx] = custom.Result; LayoutAll(); Invalidate(); }
+                    { _editList[idx] = custom.Result; SaveChanges(true); LayoutAll(); Invalidate(); }
                 return;
             }
             using (var dlg = new ProviderEditDialog(_editList[idx], P, _scale))
@@ -7808,6 +10312,7 @@ namespace QuotaWidget
                 {
                     dlg.Result.RuntimeId = _editList[idx].RuntimeId;
                     _editList[idx] = dlg.Result;
+                    SaveChanges(true);
                     LayoutAll();
                     Invalidate();
                 }
@@ -7818,6 +10323,7 @@ namespace QuotaWidget
         {
             if (idx < 0 || idx >= _editList.Count) return;
             _editList.RemoveAt(idx);
+            SaveChanges(true);
             LayoutAll();
             Invalidate();
         }
@@ -7943,46 +10449,94 @@ namespace QuotaWidget
             base.WndProc(ref m);
         }
 
-        // ============================= 保存 / 测试 =============================
-        private void SaveAndClose()
+        // ============================= 自动保存 / 测试 =============================
+        private bool SaveChanges(bool providersChanged = false)
         {
-            // 先快照旧配置：保存失败时回滚，防止"未保存的新配置"留在内存里被定时刷新
-            // 使用（运行配置 ≠ 磁盘配置），或被后续偶发 Save（拖窗/贴边/开关等）静默落盘
-            var oldProviders = _ctx.Cfg.Providers;
-            int oldRefreshSec = _ctx.Cfg.RefreshSec;
-            int oldOpacityPct = _ctx.Cfg.OpacityPct;
-            bool oldTopMost = _ctx.Cfg.TopMost;
-            bool oldAutoStart = _ctx.Cfg.AutoStart;
-            string oldTheme = _ctx.Cfg.Theme;
-            string oldFloatLayout = _ctx.Cfg.FloatLayout;
-
-            // 拷贝而非直接赋值：保存失败时窗口保持打开，用户继续增删/移动供应商会突变
-            // _editList；若与 Cfg.Providers 共享同一 List，刷新线程池并行遍历会因列表收缩
-            // 抛 ArgumentOutOfRangeException 并终止进程（详见 RefreshData 的 providers[i]）
-            _ctx.Cfg.Providers = new List<ProviderConfig>(_editList);
-            _ctx.Cfg.RefreshSec = _pendInterval;
-            _ctx.Cfg.OpacityPct = _pendOpacity;
-            _ctx.Cfg.TopMost = _pendTopMost;
-            _ctx.Cfg.AutoStart = _pendAutoStart;
-            _ctx.Cfg.Theme = _pendDark ? "dark" : "light";
-            _ctx.Cfg.FloatLayout = _pendIsland ? "island" : "card";
-            // 保存失败（磁盘满/文件被杀软锁定等）不静默关闭窗口：
-            // 否则用户以为已保存，重启后 API Key 全部丢失且无任何自救提示
-            if (!_ctx.Cfg.Save())
+            _providersChanged |= providersChanged;
+            if (_saving) return false;
+            var cfg = _ctx.Cfg;
+            string theme = _pendDark ? "dark" : "light";
+            string layout = _pendIsland ? "island" : "card";
+            bool refreshChanged = cfg.RefreshSec != _pendInterval;
+            bool opacityChanged = cfg.OpacityPct != _pendOpacity;
+            bool startupChanged = cfg.AutoStart != _pendAutoStart;
+            bool appearanceChanged = cfg.TopMost != _pendTopMost || cfg.Theme != theme || cfg.FloatLayout != layout;
+            if (!_providersChanged && !refreshChanged && !opacityChanged && !startupChanged && !appearanceChanged)
             {
-                // 回滚到快照：窗口保持打开期间内存配置与磁盘一致，用户取消/关闭不会留下半提交状态
-                _ctx.Cfg.Providers = oldProviders;
-                _ctx.Cfg.RefreshSec = oldRefreshSec;
-                _ctx.Cfg.OpacityPct = oldOpacityPct;
-                _ctx.Cfg.TopMost = oldTopMost;
-                _ctx.Cfg.AutoStart = oldAutoStart;
-                _ctx.Cfg.Theme = oldTheme;
-                _ctx.Cfg.FloatLayout = oldFloatLayout;
-                StyledMsg.Show(this, "保存失败", "配置保存失败（config.json 写入失败，可能磁盘已满或被其他程序占用）。\n窗口保持打开，请先记录本次填写的 API Key，再重试保存。", P, _scale);
-                return;
+                if (_saveFailed) { _saveFailed = false; LayoutAll(); Invalidate(); }
+                return true;
             }
-            _ctx.ApplyConfig(oldProviders, oldRefreshSec);
-            Close();
+
+            _saving = true;
+            try
+            {
+                // 保存失败时恢复运行配置；编辑内容留在当前窗口，可继续修改或重试。
+                var oldProviders = cfg.Providers;
+                int oldRefreshSec = cfg.RefreshSec, oldOpacityPct = cfg.OpacityPct;
+                bool oldTopMost = cfg.TopMost, oldAutoStart = cfg.AutoStart;
+                string oldTheme = cfg.Theme, oldFloatLayout = cfg.FloatLayout;
+
+                if (_providersChanged)
+                {
+                    // 列表和元素都独立复制，防止后续编辑直接修改运行中的配置。
+                    // 自定义接口刚测试过的响应一并提交，避免确认后立即重复查询。
+                    var providers = new List<ProviderConfig>();
+                    foreach (var source in _editList)
+                    {
+                        var copy = source.Clone();
+                        copy.LastFetchUtc = source.LastFetchUtc;
+                        copy.NextRefreshUtc = source.NextRefreshUtc;
+                        copy.CooldownUntilUtc = source.CooldownUntilUtc;
+                        if (source.LastResults != null)
+                            copy.LastResults = source.LastResults.ConvertAll(st => st.WithConfig(copy));
+                        providers.Add(copy);
+                    }
+                    cfg.Providers = providers;
+                }
+                cfg.RefreshSec = _pendInterval;
+                cfg.OpacityPct = _pendOpacity;
+                cfg.TopMost = _pendTopMost;
+                cfg.AutoStart = _pendAutoStart;
+                cfg.Theme = theme;
+                cfg.FloatLayout = layout;
+                if (!cfg.Save())
+                {
+                    cfg.Providers = oldProviders;
+                    cfg.RefreshSec = oldRefreshSec;
+                    cfg.OpacityPct = oldOpacityPct;
+                    cfg.TopMost = oldTopMost;
+                    cfg.AutoStart = oldAutoStart;
+                    cfg.Theme = oldTheme;
+                    cfg.FloatLayout = oldFloatLayout;
+                    _ctx.Floating.ApplyOpacity(oldOpacityPct);
+                    _saveFailed = true;
+                    LayoutAll();
+                    Invalidate();
+                    StyledMsg.Show(this, "自动保存失败", "config.json 写入失败，可能磁盘已满或被其他程序占用。\n本次修改尚未生效，填写内容已保留在当前窗口。\n处理后点击侧栏「保存失败 · 点击重试」或按 Ctrl+S；关闭窗口时也会重试。", P, _scale);
+                    return false;
+                }
+
+                if (startupChanged) Config.SetAutoStart(cfg.AutoStart);
+                if (_providersChanged || refreshChanged)
+                    _ctx.ApplyConfig(oldProviders, oldRefreshSec, false);
+                else if (appearanceChanged)
+                    _ctx.ApplyFloatingConfig();
+                else if (opacityChanged)
+                    _ctx.Floating.ApplyOpacity(_pendOpacity);
+
+                if (_providersChanged)
+                {
+                    // 已提交的采样结果归运行配置管理，后续提交从最新运行状态继承。
+                    _editList.Clear();
+                    foreach (var provider in cfg.Providers) _editList.Add(provider.Clone());
+                }
+                _providersChanged = false;
+                _saveFailed = false;
+                LayoutAll();
+                Invalidate();
+                return true;
+            }
+            finally { _saving = false; }
         }
 
         // 资源管理器打开 %LOCALAPPDATA%\QuotaWidget 并选中 config.json：
@@ -8191,3 +10745,4 @@ namespace QuotaWidget
         }
     }
 }
+
